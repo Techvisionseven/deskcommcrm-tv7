@@ -1,0 +1,201 @@
+name: deskcomm_iso
+
+x-pilot:
+  supabase_ready: ${PILOT_SUPABASE_READY:-no}
+  schema_release: ${PILOT_SCHEMA_RELEASE:-nao_confirmado}
+
+x-common: &common
+  restart: unless-stopped
+  pull_policy: missing
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# Contrato explícito: o .env inteiro NÃO entra nos containers.
+x-runtime: &runtime
+  NODE_ENV: production
+  NEXT_PUBLIC_APP_URL: http://localhost:18080
+  NEXT_PUBLIC_ADMIN_URL: http://localhost:18080
+  NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:?Preencha NEXT_PUBLIC_SUPABASE_URL}
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:?Preencha NEXT_PUBLIC_SUPABASE_ANON_KEY}
+  SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?Preencha SUPABASE_SERVICE_ROLE_KEY}
+  SUPABASE_DB_URL: ${SUPABASE_DB_URL:?Preencha SUPABASE_DB_URL}
+  SUPABASE_DB_ADMIN_URL: ""
+  SUPABASE_SERVER_URL: ""
+  INTERNAL_SECRET: ${INTERNAL_SECRET:?Preencha INTERNAL_SECRET}
+  INTERNAL_CRON_SECRET: ${INTERNAL_SECRET:?Preencha INTERNAL_SECRET}
+  CPF_ENCRYPTION_KEY: ${CPF_ENCRYPTION_KEY:?Preencha CPF_ENCRYPTION_KEY}
+  AI_CRED_AES_KEY: ${AI_CRED_AES_KEY:?Preencha AI_CRED_AES_KEY}
+  WAHA_BYO_ENCRYPTION_KEY: ${WAHA_BYO_ENCRYPTION_KEY:?Preencha WAHA_BYO_ENCRYPTION_KEY}
+  IMPERSONATE_COOKIE_SECRET: ${IMPERSONATE_COOKIE_SECRET:?Preencha IMPERSONATE_COOKIE_SECRET}
+  LGPD_SIGNING_KEY: ${LGPD_SIGNING_KEY:?Preencha LGPD_SIGNING_KEY}
+  WAHA_API_BASE_URL: http://waha:3000
+  WAHA_WEBHOOK_BASE_URL: http://app:3000
+  WAHA_API_KEY: ${WAHA_API_KEY:?Preencha WAHA_API_KEY}
+  WAHA_HMAC_SECRET: ${WAHA_HMAC_SECRET:?Preencha WAHA_HMAC_SECRET}
+  # WAHA Core desta versão não assina; somente loopback/bridges próprias.
+  WAHA_WEBHOOK_REQUIRE_SIGNATURE: "false"
+  UPSTASH_REDIS_REST_URL: http://srh:80
+  UPSTASH_REDIS_REST_TOKEN: ${SRH_TOKEN:?Preencha SRH_TOKEN}
+  DB_POOL_MAX: "5"
+  SENTRY_DSN: "off"
+  SIGNUP_MODE: so_convite
+  AI_GATEWAY_API_KEY: ${AI_GATEWAY_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+
+services:
+  app:
+    <<: *common
+    # Release 1.60.0; consultar README antes de trocar imagem/schema.
+    image: ghcr.io/melgarafael/deskcommcrm:1.60.0@sha256:30d968f22ed8f6ceb69ad8cd4eb7bc0c217ed80d8da37d97a65a6af2cebe2718
+    platform: linux/amd64
+    mem_limit: 768m
+    cpus: 1.5
+    environment:
+      <<: *runtime
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:18080:3000/tcp"
+    networks: [backend, edge]
+    depends_on:
+      redis: {condition: service_healthy}
+      srh: {condition: service_healthy}
+      waha: {condition: service_healthy}
+    healthcheck:
+      # Liveness TCP oficial; não prova login nem schema. Ver aceite no README.
+      test: ["CMD", "node", "-e", "require('net').connect(3000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  worker:
+    <<: *common
+    image: ghcr.io/melgarafael/deskcomm-worker:1.60.0@sha256:64aa2a021a28018f248c1e6428c8f057e91522443205a91d11d038d83f7890be
+    platform: linux/amd64
+    mem_limit: 512m
+    cpus: 1.0
+    environment: *runtime
+    networks: [backend, edge]
+    depends_on:
+      app: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  scheduler:
+    <<: *common
+    image: ghcr.io/melgarafael/deskcomm-scheduler:1.60.0@sha256:c98929364d40d97cbd1690dca91ce20593b63e6eb661eb5150919e11913ebdfc
+    platform: linux/amd64
+    mem_limit: 128m
+    cpus: 0.25
+    environment:
+      TZ: UTC
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?Preencha INTERNAL_SECRET}
+    networks: [backend]
+    depends_on:
+      app: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep crond >/dev/null || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  waha:
+    <<: *common
+    image: devlikeapro/waha:latest-2026.7.2
+    mem_limit: 1280m
+    cpus: 1.5
+    environment:
+      WAHA_API_KEY: "sha512:${WAHA_API_KEY_SHA512:?Preencha WAHA_API_KEY_SHA512}"
+      WHATSAPP_HOOK_URL: http://app:3000/api/v1/webhooks/waha
+      WHATSAPP_HOOK_EVENTS: message.any,message.ack,message.edited,message.revoked,session.status,state.change
+      WHATSAPP_HOOK_HMAC: ${WAHA_HMAC_SECRET:?Preencha WAHA_HMAC_SECRET}
+      WHATSAPP_DEFAULT_ENGINE: NOWEB
+      WAHA_DASHBOARD_ENABLED: "false"
+      WHATSAPP_RESTART_ALL_SESSIONS: "True"
+    volumes:
+      - waha_data:/app/.sessions
+      - waha_media:/app/.media
+    networks: [backend, edge]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  redis:
+    <<: *common
+    image: redis:7.4.3-alpine
+    mem_limit: 256m
+    cpus: 0.5
+    # Teto dos dados inferior ao teto do container; overhead permanece possível.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    # Sobrepõe VOLUME /data da imagem; não cria volume anônimo persistente.
+    tmpfs: ["/data:size=16m"]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  srh:
+    <<: *common
+    image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
+    mem_limit: 128m
+    cpus: 0.25
+    environment:
+      SRH_MODE: env
+      SRH_TOKEN: ${SRH_TOKEN:?Preencha SRH_TOKEN}
+      SRH_CONNECTION_STRING: redis://redis:6379
+    networks: [backend]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      # API SRH aceita comandos no body, NÃO /ping. BusyBox wget (base Alpine).
+      # Segredo expandido no container, nunca interpolado no teste pelo Compose.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O - --header="Authorization: Bearer $$SRH_TOKEN"
+          --header='Content-Type: application/json' --post-data='["PING"]'
+          http://127.0.0.1:80 | grep -Eq '"result"[[:space:]]*:[[:space:]]*"PONG"'
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  backend:
+    name: deskcomm_iso_backend
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.240.0/24
+          gateway: 172.29.240.1
+  edge:
+    name: deskcomm_iso_edge
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.241.0/24
+          gateway: 172.29.241.1
+
+volumes:
+  waha_data:
+    name: deskcomm_iso_waha_data
+  waha_media:
+    name: deskcomm_iso_waha_media
