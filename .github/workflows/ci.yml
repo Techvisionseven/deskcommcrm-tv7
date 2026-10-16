@@ -245,14 +245,23 @@ jobs:
       # em segundos; dentro da suíte longa, o mesmo vermelho chegava aos 7–12
       # minutos. Rodam UMA vez: o passo de unit abaixo pula o projeto `cercas`.
       # Seleção e medições: o bloco `projects` de vitest.config.ts.
-      # Na parte 3, junto do kit bash: o porquê e a conta estão no cabeçalho do job.
+      # Na parte 4 neste fork, junto do kit bash: com quatro partes, a 3 é a mais pesada no
+      # `--shard` (medido em 16/10/2026: 498 s de unit e 688 s no job, contra
+      # 294 s e 413 s da 4), e as cercas (~150 s) a deixavam a 1 min do
+      # orçamento de 12.
       - name: Cercas estruturais
-        if: matrix.parte == 3
+        if: matrix.parte == 4
         run: pnpm cercas
 
       - name: Typecheck
         if: matrix.parte == 1
         run: pnpm typecheck
+        env:
+          # O heap default do Node é ~1/4 da RAM: no runner de 7 GB deste fork
+          # privado, ~1,75 GB. O `tsc` usa ~1,6 GB de heap (medido com
+          # `--extendedDiagnostics` em 16/10/2026) e morria com `JavaScript
+          # heap out of memory` no pico. 4 GB é o mesmo teto do Dockerfile.
+          NODE_OPTIONS: --max-old-space-size=4096
 
       # Na parte 2, não na 1: o porquê e a conta estão no cabeçalho do job.
       - name: Lint
@@ -345,7 +354,8 @@ jobs:
       #
       # A QUARTA PARTE ENTROU NESTE FORK em 16/10/2026, pelo runner de 2 vCPU
       # (ver o passo do worker acima): com três, a parte 3 levava 14 e 15 min
-      # contra o orçamento de 12. A 4 roda só unit e o kit bash, que saiu da 3.
+      # contra o orçamento de 12. A 4 roda unit, as cercas e o kit bash, que
+      # saíram da 3.
       - name: Unit tests (parte ${{ matrix.parte }}/4)
         run: pnpm test:unit --project produto --shard=${{ matrix.parte }}/4
 
