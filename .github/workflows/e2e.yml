@@ -31,11 +31,18 @@ name: e2e
 # O job falha honestamente: a primeira versão usava `continue-on-error: true` no
 # job inteiro e reportou VERDE com o `supabase start` quebrado e zero teste
 # executado. Verde que não distingue "passou" de "nem rodou" é pior que vermelho.
+#
+# NESTE FORK O E2E RODA SÓ QUANDO ALGUÉM PEDE (botão "Run workflow" na aba
+# Actions), desde 16/10/2026. O repositório é privado, e o
+# runner de repositório privado tem 2 vCPU e 7 GB, contra 4 vCPU e 16 GB do
+# público do projeto original, para o qual as partes foram dimensionadas.
+# Medido no PR #6 do fork: as quatro partes de navegador foram cortadas aos
+# 28 min com ~60% dos casos rodados, e os vermelhos eram esperas de 5 a 30 s
+# estouradas pela máquina lenta. Rodar em todo PR custaria horas de máquina
+# paga por push para um vermelho que não mede o PR. Para voltar a rodar em
+# todo PR, devolva `pull_request` e `push` abaixo.
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 # O GITHUB_TOKEN deste job serve a `actions/checkout` (clone) e a
 # `actions/setup-node` (manifest de `actions/node-versions`, repo público).
@@ -1574,6 +1581,11 @@ jobs:
         run: pnpm e2e:build
         env:
           NEXT_TELEMETRY_DISABLED: "1"
+          # Sem a checagem de tipos dentro do `next build` (next.config.ts):
+          # no runner de 2 vCPU e 7 GB deste fork privado ela não cabe ao lado
+          # do Supabase local, e o build morria por memória. Os tipos seguem
+          # checados no `verify` e no build da imagem.
+          BUILD_SEM_TYPECHECK: "1"
           # `off`, NÃO vazio. Vazio seleciona o Sentry DA COMUNIDADE — está
           # escrito em lib/sentry/dsn.ts:8-10, e é o default de propósito num
           # produto self-host. Só "off" desliga.

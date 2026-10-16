@@ -38,6 +38,12 @@ jobs:
         run: pnpm build
         env:
           NEXT_TELEMETRY_DISABLED: "1"
+          # O mesmo heap do Dockerfile. O default do Node é ~1/4 da RAM, e no
+          # runner de repositório privado (7 GB, como neste fork) isso dá ~2 GB:
+          # o passo "Running TypeScript" do `next build` morria com `JavaScript
+          # heap out of memory` (16/10/2026). Aqui não há Supabase de pé, então
+          # os 4 GB cabem, como cabem no build da imagem.
+          NODE_OPTIONS: --max-old-space-size=4096
           # "off", não vazio: vazio seleciona o Sentry DA COMUNIDADE
           # (lib/sentry/dsn.ts:8-10). A intenção aqui sempre foi desligar, e
           # com aspas vazias ela não era alcançada — o build seguia com o DSN

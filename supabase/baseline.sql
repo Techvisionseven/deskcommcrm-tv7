@@ -41180,6 +41180,94 @@ create trigger trg_redigir_b2b_ao_anonimizar
   when (new.is_anonymized is true and old.is_anonymized is distinct from true)
   execute function public.fn_redigir_b2b_do_contato_anonimizado();
 
+-- ---- custo de IA pelo catálogo quando o motor não sabe o preço (migration 0676) ----
+-- Linha de llm_calls que chega com cost_cents nulo (modelo fora do pricing.ts:
+-- toda a OpenRouter e modelo que entrou no catálogo antes do código) ganha o
+-- custo pelo ai_models/ai_pricing. Custo enviado pelo motor sempre vence; modelo
+-- sem preço e chamada com erro seguem nulos. O backfill é UPDATE e não infla o
+-- contador do mês. Racional completo no cabeçalho da migration 0676.
+create or replace function public.fn_custo_de_ia_pelo_catalogo(
+  p_provider text,
+  p_model text,
+  p_input bigint,
+  p_output bigint,
+  p_cache_read bigint,
+  p_cache_write bigint
+) returns numeric
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  with preco as (
+    select m.input_price_per_million_cents::numeric as entrada,
+           m.output_price_per_million_cents::numeric as saida,
+           1 as ordem
+      from public.ai_models m
+     where m.provider = p_provider
+       and m.model_id = p_model
+       and m.input_price_per_million_cents is not null
+       and m.output_price_per_million_cents is not null
+    union all
+    select p.prompt_cents_per_million_tokens, p.completion_cents_per_million_tokens, 2
+      from public.ai_pricing p
+     where p.model = p_model
+       and p.superseded_at is null
+       and p.prompt_cents_per_million_tokens is not null
+       and p.completion_cents_per_million_tokens is not null
+     order by ordem
+     limit 1
+  )
+  select (
+           greatest(0, coalesce(p_input, 0) - coalesce(p_cache_read, 0) - coalesce(p_cache_write, 0)) * entrada
+         + coalesce(p_cache_read, 0) * entrada * 0.1
+         + coalesce(p_cache_write, 0) * entrada
+             * (case when p_provider = 'anthropic' or p_model like 'anthropic/%' then 2.0 else 1.0 end)
+         + coalesce(p_output, 0) * saida
+         ) / 1000000.0
+    from preco;
+$$;
+
+revoke execute on function public.fn_custo_de_ia_pelo_catalogo(text, text, bigint, bigint, bigint, bigint)
+  from public, anon, authenticated;
+
+create or replace function public.fn_llm_calls_custo_pelo_catalogo()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.cost_cents is null and new.status = 'ok' and new.model is not null then
+    begin
+      new.cost_cents := public.fn_custo_de_ia_pelo_catalogo(
+        new.provider, new.model,
+        new.input_tokens, new.output_tokens, new.cache_read_tokens, new.cache_write_tokens
+      );
+    exception when others then
+      new.cost_cents := null;
+    end;
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.fn_llm_calls_custo_pelo_catalogo()
+  from public, anon, authenticated;
+
+drop trigger if exists trg_llm_calls_custo_pelo_catalogo on public.llm_calls;
+create trigger trg_llm_calls_custo_pelo_catalogo
+  before insert on public.llm_calls
+  for each row execute function public.fn_llm_calls_custo_pelo_catalogo();
+
+update public.llm_calls c
+   set cost_cents = public.fn_custo_de_ia_pelo_catalogo(
+         c.provider, c.model, c.input_tokens, c.output_tokens, c.cache_read_tokens, c.cache_write_tokens)
+ where c.cost_cents is null
+   and c.status = 'ok'
+   and c.model is not null
+   and public.fn_custo_de_ia_pelo_catalogo(
+         c.provider, c.model, c.input_tokens, c.output_tokens, c.cache_read_tokens, c.cache_write_tokens) is not null;
+
 -- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
 --
 -- ⚠️ DE PROPÓSITO, NENHUMA FUNÇÃO É CRIADA DEPOIS DESTE BLOCO. Apêndice que cria
@@ -42310,3 +42398,172 @@ alter table public.platform_branding add constraint platform_branding_favicon_pa
 comment on column public.platform_branding.favicon_path is
   'Ícone da aba do navegador, subido pela tela. Caminho em brand-logos; null mantém o ícone desenhado (cor + inicial).';
 
+-- ---- Gemini 3.5 Flash-Lite no catálogo Google (migration 0599) ----
+-- manifest: Gemini 3.5 Flash-Lite no catálogo Google, com preço Standard em ambas as tabelas.
+-- Fonte (06/10/2026): https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite
+-- Preço: https://ai.google.dev/gemini-api/docs/pricing
+-- O sincronizador automático só consulta a OpenRouter; modelos Google são curados.
+
+insert into public.ai_models
+  (provider, model_id, display_name, description, context_window,
+   input_price_per_million_cents, output_price_per_million_cents,
+   supports_tools, supports_vision, is_default_for_provider, deprecated_at)
+values
+  ('google', 'gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite',
+   'Modelo Google de baixa latência para atendimento com ferramentas; aceita texto, imagem, áudio, vídeo e PDF.',
+   1048576, 30, 250, true, true, false, null)
+on conflict (provider, model_id) do update set
+  display_name = excluded.display_name,
+  description = excluded.description,
+  context_window = excluded.context_window,
+  input_price_per_million_cents = excluded.input_price_per_million_cents,
+  output_price_per_million_cents = excluded.output_price_per_million_cents,
+  supports_tools = excluded.supports_tools,
+  supports_vision = excluded.supports_vision,
+  deprecated_at = null;
+
+insert into public.ai_pricing
+  (model, prompt_cents_per_million_tokens, completion_cents_per_million_tokens, notes)
+values
+  ('gemini-3.5-flash-lite', 30, 250,
+   'catálogo 0599 — Google Gemini API Standard, 06/10/2026; cache e armazenamento cobrados à parte')
+on conflict (model) do update set
+  prompt_cents_per_million_tokens = excluded.prompt_cents_per_million_tokens,
+  completion_cents_per_million_tokens = excluded.completion_cents_per_million_tokens,
+  notes = excluded.notes,
+  superseded_at = null;
+-- ---- catálogo: Gemini 3.x adicionais (migration 0600) ----
+-- O dump --schema-only não traz seed pós-snapshot. Sem este apêndice, clones
+-- novos (install.sh) e clones atualizando (update.sh reaplica baseline.sql)
+-- ficam sem os modelos 3.1 Flash-Lite e 3.6/3.7/3.8 Flash no
+-- seletor do agente. As DUAS tabelas (ai_models = tela; ai_pricing = orçamento)
+-- com os MESMOS números, senão o invariante catálogo×preço reprova e o gasto
+-- é somado com preço de outro modelo. Não mexe no default (segue gemini-3.5-flash).
+insert into public.ai_models
+  (provider, model_id, display_name, description,
+   input_price_per_million_cents, output_price_per_million_cents, supports_tools)
+values
+  ('google', 'gemini-3.1-flash-lite', 'Gemini 3.1 Flash-Lite',
+   'Barato e rápido da linha 3.1.', 25, 150, true),
+  ('google', 'gemini-3.6-flash', 'Gemini 3.6 Flash', null, 75, 375, true),
+  ('google', 'gemini-3.7-flash', 'Gemini 3.7 Flash', null, 75, 375, true),
+  ('google', 'gemini-3.8-flash', 'Gemini 3.8 Flash',
+   'Preço promocional de introdução ($0,75/$3,75) até 31/12/2026.', 75, 375, true)
+on conflict (provider, model_id) do update set
+  display_name = excluded.display_name,
+  description = excluded.description,
+  input_price_per_million_cents = excluded.input_price_per_million_cents,
+  output_price_per_million_cents = excluded.output_price_per_million_cents,
+  supports_tools = excluded.supports_tools,
+  deprecated_at = null;
+
+insert into public.ai_pricing
+  (model, prompt_cents_per_million_tokens, completion_cents_per_million_tokens, notes)
+values
+  ('gemini-3.1-flash-lite', 25, 150, 'catálogo 0600'),
+  ('gemini-3.6-flash',      75, 375, 'catálogo 0600 — promo até 31/12/2026'),
+  ('gemini-3.7-flash',      75, 375, 'catálogo 0600 — promo até 31/12/2026'),
+  ('gemini-3.8-flash',      75, 375, 'catálogo 0600 — promo até 31/12/2026')
+on conflict (model) do update set
+  prompt_cents_per_million_tokens = excluded.prompt_cents_per_million_tokens,
+  completion_cents_per_million_tokens = excluded.completion_cents_per_million_tokens,
+  notes = excluded.notes,
+  superseded_at = null;
+
+-- ---- catálogo: GPT-6 Luna, GPT-6.1 Sol e GPT-6 Astra (migration 0646) ----
+-- O dump --schema-only não traz seed pós-snapshot. Sem este apêndice, clones
+-- novos (install.sh) e clones atualizando (update.sh reaplica baseline.sql)
+-- ficam sem a geração 6 da OpenAI em Provedores de IA e no seletor do agente.
+-- As DUAS tabelas com os MESMOS números (invariante catálogo×preço). Não mexe
+-- no padrão (segue gpt-5.6-terra). Racional e fonte dos preços no cabeçalho
+-- da migration.
+insert into public.ai_models
+  (provider, model_id, display_name, description, context_window,
+   input_price_per_million_cents, output_price_per_million_cents, supports_tools)
+values
+  ('openai', 'gpt-6-luna', 'GPT-6 Luna',
+   'O mais barato da linha 6, para atendimento de alto volume e classificação.',
+   1050000, 10, 50, true),
+  ('openai', 'gpt-6.1-sol', 'GPT-6.1 Sol',
+   'Equilíbrio de custo e capacidade da linha 6.',
+   1050000, 200, 1000, true),
+  ('openai', 'gpt-6-astra', 'GPT-6 Astra',
+   'O mais capaz da OpenAI; custo alto.',
+   1050000, 1000, 5000, true)
+on conflict (provider, model_id) do update set
+  display_name = excluded.display_name,
+  description = excluded.description,
+  context_window = excluded.context_window,
+  input_price_per_million_cents = excluded.input_price_per_million_cents,
+  output_price_per_million_cents = excluded.output_price_per_million_cents,
+  supports_tools = excluded.supports_tools,
+  deprecated_at = null;
+
+-- ---------------------------------------------------------------------------
+-- 2. contabilidade de custo — a MESMA lista, mesmos números (senão o gasto é
+--    somado com preço de outro modelo, ou não é somado e some do orçamento).
+-- ---------------------------------------------------------------------------
+insert into public.ai_pricing
+  (model, prompt_cents_per_million_tokens, completion_cents_per_million_tokens, notes)
+values
+  ('gpt-6-luna',     10,   50, 'catálogo 0646 — acima de 272k tokens de entrada, 20/75'),
+  ('gpt-6.1-sol',   200, 1000, 'catálogo 0646 — acima de 272k tokens de entrada, 400/1500'),
+  ('gpt-6-astra',  1000, 5000, 'catálogo 0646 — acima de 272k tokens de entrada, 2000/7500')
+on conflict (model) do update set
+  prompt_cents_per_million_tokens = excluded.prompt_cents_per_million_tokens,
+  completion_cents_per_million_tokens = excluded.completion_cents_per_million_tokens,
+  notes = excluded.notes,
+  superseded_at = null;
+
+-- ---- catálogo: Claude Haiku/Sonnet/Opus 5.5 (migration 0675) ----
+-- O dump --schema-only não traz seed pós-snapshot. Sem este apêndice, clones
+-- novos (install.sh) e clones atualizando (update.sh reaplica baseline.sql)
+-- ficam sem a geração 5.5 da Anthropic em Provedores de IA e no seletor do
+-- agente. As DUAS tabelas com os MESMOS números (invariante catálogo×preço).
+-- Não mexe no padrão (segue claude-sonnet-5). Racional e fonte dos preços no
+-- cabeçalho da migration.
+insert into public.ai_models
+  (provider, model_id, display_name, description, context_window, released_at,
+   input_price_per_million_cents, output_price_per_million_cents, supports_tools)
+values
+  ('anthropic', 'claude-haiku-5-5', 'Claude Haiku 5.5',
+   'O mais rápido e barato da Anthropic, para alto volume e classificação. Acima de 100 mil tokens de entrada numa chamada o preço sobe para $0,50/$2,50 por milhão.',
+   1000000, '2026-10-07', 10, 50, true),
+  ('anthropic', 'claude-sonnet-5-5', 'Claude Sonnet 5.5',
+   'Equilíbrio de velocidade e capacidade; sucessor do Sonnet 5, pelo mesmo preço.',
+   1000000, '2026-09-28', 200, 1000, true),
+  ('anthropic', 'claude-opus-5-5', 'Claude Opus 5.5',
+   'O Opus atual, para trabalho agêntico complexo; custa menos que o Opus 5.',
+   1000000, '2026-09-22', 400, 2000, true)
+on conflict (provider, model_id) do update set
+  display_name = excluded.display_name,
+  description = excluded.description,
+  context_window = excluded.context_window,
+  released_at = excluded.released_at,
+  input_price_per_million_cents = excluded.input_price_per_million_cents,
+  output_price_per_million_cents = excluded.output_price_per_million_cents,
+  supports_tools = excluded.supports_tools,
+  deprecated_at = null;
+
+-- O Opus 5 deixou de ser "o mais capaz", e o Sonnet 5 não volta a $3/$15: a
+-- Anthropic tornou $2/$10 o preço padrão e cancelou o aumento de 01/09/2026.
+update public.ai_models set description = 'Geração anterior do Opus.'
+ where provider = 'anthropic' and model_id = 'claude-opus-5';
+update public.ai_models set description = 'Geração anterior do Sonnet.'
+ where provider = 'anthropic' and model_id = 'claude-sonnet-5';
+
+-- ---------------------------------------------------------------------------
+-- 2. contabilidade de custo — a MESMA lista, mesmos números (senão o gasto é
+--    somado com preço de outro modelo, ou não é somado e some do orçamento).
+-- ---------------------------------------------------------------------------
+insert into public.ai_pricing
+  (model, prompt_cents_per_million_tokens, completion_cents_per_million_tokens, notes)
+values
+  ('claude-haiku-5-5',   10,   50, 'catálogo 0675 — acima de 100k tokens de entrada, 50/250'),
+  ('claude-sonnet-5-5', 200, 1000, 'catálogo 0675'),
+  ('claude-opus-5-5',   400, 2000, 'catálogo 0675')
+on conflict (model) do update set
+  prompt_cents_per_million_tokens = excluded.prompt_cents_per_million_tokens,
+  completion_cents_per_million_tokens = excluded.completion_cents_per_million_tokens,
+  notes = excluded.notes,
+  superseded_at = null;

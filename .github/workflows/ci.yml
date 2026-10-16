@@ -135,6 +135,14 @@ jobs:
     # Executor próprio para trabalho nosso quando EXECUTOR_PROPRIO=ligado; o
     # porquê e a guarda contra fork: comentário do e2e-parte no e2e.yml.
     runs-on: ${{ vars.EXECUTOR_PROPRIO == 'ligado' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'deskcomm-proprio' || 'ubuntu-latest' }}
+    # `pull-requests: read` é do passo "A prévia deste PR mediu a main de
+    # agora?", que lista os arquivos do PR por `gh api pulls/N/files`. Em
+    # repositório PÚBLICO a leitura passa com qualquer token; em repositório
+    # PRIVADO (como este fork) o token só com `contents: read` recebe 403, o
+    # pipe com `pipefail` falha e a parte 1 morria em 11 s sem rodar teste.
+    permissions:
+      contents: read
+      pull-requests: read
     concurrency:
       group: ${{ github.workflow }}-verify-parte${{ matrix.parte }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'pull_request' && github.run_attempt != '1' && format('-reentrada-{0}', github.event.pull_request.head.sha) || '' }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -142,12 +150,25 @@ jobs:
       # Sem fail-fast: um vermelho numa parte não esconde o da outra.
       fail-fast: false
       matrix:
-        parte: [1, 2, 3]
+        parte: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
 
       - name: Marcar o início (o orçamento de tempo mede no fim do job)
         run: echo "VERIFY_INICIO=$(date +%s)" >> "$GITHUB_ENV"
+
+      # UM WORKER DO VITEST POR CPU, e não CPU − 1 (o default do `vitest run`).
+      #
+      # Neste fork o repositório é PRIVADO, e o `ubuntu-latest` de repositório
+      # privado tem 2 vCPU e 7 GB, contra 4 vCPU e 16 GB do repositório público
+      # do projeto original. Com o default, 2 vCPU viram UM worker: a suíte
+      # rodava em série e a parte 3 estourava o teto de 15 min (16/10/2026:
+      # `Unit tests (parte 3/3)` 708 s, `Cercas estruturais` 177 s). O worker
+      # tira o jsdom e o import do caminho crítico, que é onde o tempo mora
+      # (ver o cabeçalho deste job). O Vitest lê `VITEST_MAX_WORKERS`, então
+      # vale para as cercas e para os unit sem mexer nos comandos.
+      - name: Um worker do Vitest por CPU do runner
+        run: echo "VITEST_MAX_WORKERS=$(nproc)" >> "$GITHUB_ENV"
 
       # ── O VERDE DESTE PR É DE QUAL ÁRVORE? ────────────────────────────────
       #
@@ -224,14 +245,23 @@ jobs:
       # em segundos; dentro da suíte longa, o mesmo vermelho chegava aos 7–12
       # minutos. Rodam UMA vez: o passo de unit abaixo pula o projeto `cercas`.
       # Seleção e medições: o bloco `projects` de vitest.config.ts.
-      # Na parte 3, junto do kit bash: o porquê e a conta estão no cabeçalho do job.
+      # Na parte 4 neste fork, junto do kit bash: com quatro partes, a 3 é a mais pesada no
+      # `--shard` (medido em 16/10/2026: 498 s de unit e 688 s no job, contra
+      # 294 s e 413 s da 4), e as cercas (~150 s) a deixavam a 1 min do
+      # orçamento de 12.
       - name: Cercas estruturais
-        if: matrix.parte == 3
+        if: matrix.parte == 4
         run: pnpm cercas
 
       - name: Typecheck
         if: matrix.parte == 1
         run: pnpm typecheck
+        env:
+          # O heap default do Node é ~1/4 da RAM: no runner de 7 GB deste fork
+          # privado, ~1,75 GB. O `tsc` usa ~1,6 GB de heap (medido com
+          # `--extendedDiagnostics` em 16/10/2026) e morria com `JavaScript
+          # heap out of memory` no pico. 4 GB é o mesmo teto do Dockerfile.
+          NODE_OPTIONS: --max-old-space-size=4096
 
       # Na parte 2, não na 1: o porquê e a conta estão no cabeçalho do job.
       - name: Lint
@@ -318,11 +348,16 @@ jobs:
           echo "OK — ${total} migrations na árvore, nenhum NNNN nem timestamp repetido."
 
       # `--project produto` é o `pnpm test:unit` MENOS as cercas, que já
-      # rodaram acima; `--shard` divide os arquivos entre as três partes. Juntos
-      # são a suíte inteira, uma vez só. Localmente o comando continua sendo
-      # `pnpm test:unit`, sem recorte.
-      - name: Unit tests (parte ${{ matrix.parte }}/3)
-        run: pnpm test:unit --project produto --shard=${{ matrix.parte }}/3
+      # rodaram acima; `--shard` divide os arquivos entre as quatro partes.
+      # Juntos são a suíte inteira, uma vez só. Localmente o comando continua
+      # sendo `pnpm test:unit`, sem recorte.
+      #
+      # A QUARTA PARTE ENTROU NESTE FORK em 16/10/2026, pelo runner de 2 vCPU
+      # (ver o passo do worker acima): com três, a parte 3 levava 14 e 15 min
+      # contra o orçamento de 12. A 4 roda unit, as cercas e o kit bash, que
+      # saíram da 3.
+      - name: Unit tests (parte ${{ matrix.parte }}/4)
+        run: pnpm test:unit --project produto --shard=${{ matrix.parte }}/4
 
       # O ACERVO DE `.changes/` CABE NA TELA DA VPS? — e por que fora de PR.
       #
@@ -368,7 +403,7 @@ jobs:
       # escolher OpenRouter travava o instalador num laço, escolher OpenAI
       # deixava o .env pela metade — passaram por todos os checks verdes. 15s.
       - name: Kit self-host (bash)
-        if: matrix.parte == 3
+        if: matrix.parte == 4
         run: pnpm test:shell
 
       - name: Orçamento de tempo do verify-parte
@@ -437,11 +472,11 @@ jobs:
             exit 0
           fi
           decorrido=$(( ($(date +%s) - VERIFY_INICIO) / 60 ))
-          echo "verify parte ${{ matrix.parte }}/3: ${decorrido} min (orçamento ${ORCAMENTO_MIN} min, teto de travamento 15 min)"
+          echo "verify parte ${{ matrix.parte }}/4: ${decorrido} min (orçamento ${ORCAMENTO_MIN} min, teto de travamento 15 min)"
           if [ "$decorrido" -le "${ORCAMENTO_MIN}" ]; then
             exit 0
           fi
-          echo "::error::A parte ${{ matrix.parte }}/3 do verify levou ${decorrido} min contra um orçamento de ${ORCAMENTO_MIN} min."
+          echo "::error::A parte ${{ matrix.parte }}/4 do verify levou ${decorrido} min contra um orçamento de ${ORCAMENTO_MIN} min."
           echo "::error::Isto NÃO é defeito do seu PR: a suíte unitária cresceu. Em 18/09/2026, \`Unit tests\` já era 10,3 dos 13,2 min do job."
           echo "::error::O conserto é mais uma parte em \`verify-parte\` (matrix + --shard), não subir este número."
           exit 1
