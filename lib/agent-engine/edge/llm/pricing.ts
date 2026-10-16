@@ -4,9 +4,10 @@
  *
  * Fontes: https://platform.claude.com/docs/en/about-claude/pricing (Anthropic) e
  * https://developers.openai.com/api/docs/pricing (OpenAI, tabela Standard, conferida em
- * 23/09/2026). Cache da Anthropic: leitura = 0.1× a entrada; gravação = 1.25× no TTL de 5 minutos e 2× no de
- * 1 hora — os dois TTLs que o knob `LLM_CACHE_TTL` aceita (`lib/agent-engine/env.ts`),
- * e é por isso que `costCents` recebe o TTL em vigor em vez de supor a doutrina.
+ * 23/09/2026). Cache da Anthropic: leitura = 0.1× a entrada (0.05× no Sonnet 5.5 e no Opus 5.5);
+ * gravação = 1.25× no TTL de 5 minutos e 2× no de 1 hora — os dois TTLs que o knob `LLM_CACHE_TTL`
+ * aceita (`lib/agent-engine/env.ts`), e é por isso que `costCents` recebe o TTL em vigor em vez de
+ * supor a doutrina.
  *
  * Modelo fora da tabela → custo NULL (desconhecido): mais honesto que inventar 0 —
  * o budget soma coalesce(cost_cents, 0), então modelo sem preço não consome teto;
@@ -46,6 +47,13 @@ interface Preco {
 
 /** USD por MILHÃO de tokens, por id EXATO de modelo (o sufixo de data é tolerado). */
 const USD_PER_MTOK: Record<string, Preco> = {
+  // Família 5.5, conferida em platform.claude.com/docs/en/about-claude/pricing em 11/10/2026.
+  // Fora da tabela: o Haiku 5.5 cobra 5× (0.5 / 2.5, cache 0.05 / 0.625 / 1) quando o prompt
+  // de UMA requisição passa de 100 mil tokens. O `usage` que chega aqui soma os passos do laço
+  // de ferramentas, então não diz o tamanho de cada requisição — a faixa não é calculável aqui.
+  'claude-haiku-5-5': { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite5m: 0.125, cacheWrite1h: 0.2 },
+  'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.1, cacheWrite5m: 2.5, cacheWrite1h: 4 },
+  'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.2, cacheWrite5m: 5, cacheWrite1h: 8 },
   'claude-sonnet-5': { input: 2, output: 10, cacheRead: 0.2, cacheWrite5m: 2.5, cacheWrite1h: 4 },
   'claude-sonnet-4-6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite5m: 3.75, cacheWrite1h: 6 },
   'claude-sonnet-4-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite5m: 3.75, cacheWrite1h: 6 },
@@ -61,13 +69,19 @@ const USD_PER_MTOK: Record<string, Preco> = {
   'claude-opus-4-1': { input: 15, output: 75, cacheRead: 1.5, cacheWrite5m: 18.75, cacheWrite1h: 30 },
   'claude-opus-4': { input: 15, output: 75, cacheRead: 1.5, cacheWrite5m: 18.75, cacheWrite1h: 30 },
 
-  // OpenAI — gpt-4o, gpt-4o-mini e linha 5.x do catálogo (issue #1478). Valores da
-  // tabela Standard de developers.openai.com/api/docs/pricing, conferida em 23/09/2026.
-  // Cache de leitura: 0.5× a entrada no gpt-4o; 0.1× na linha 5.x; os `-pro` e o
-  // snapshot gpt-4o-2024-05-13 não têm desconto (cacheRead = entrada).
-  // Gravação de cache: só a linha 5.6 cobra, a 1.25× a entrada; nas demais é 1×.
+  // OpenAI — gpt-4o, gpt-4o-mini e linhas 5.x e 6 do catálogo (issue #1478). Valores da
+  // tabela Standard de developers.openai.com/api/docs/pricing, conferida em 23/09/2026
+  // (linha 6 em 11/10/2026).
+  // Cache de leitura: 0.5× a entrada no gpt-4o; 0.1× nas linhas 5.x e 6, exceto o
+  // gpt-6.1-sol (0.05×); os `-pro` e o snapshot gpt-4o-2024-05-13 não têm desconto
+  // (cacheRead = entrada).
+  // Gravação de cache: as linhas 5.6 e 6 cobram 1.25× a entrada; nas demais é 1×.
   // A OpenAI não distingue TTL na gravação, então 5m e 1h têm o mesmo valor.
-  // Fora da tabela: a faixa de contexto longo (> 272K tokens, preço 2×) da 5.4/5.5/5.6.
+  // Fora da tabela: a faixa de contexto longo (> 272K tokens, preço 2×) da 5.4/5.5/5.6,
+  // e a da linha 6 (2× a entrada e o cache, 1.5× a saída).
+  'gpt-6-astra': { input: 10, output: 50, cacheRead: 1, cacheWrite5m: 12.5, cacheWrite1h: 12.5 },
+  'gpt-6.1-sol': { input: 2, output: 10, cacheRead: 0.1, cacheWrite5m: 2.5, cacheWrite1h: 2.5 },
+  'gpt-6-luna': { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite5m: 0.125, cacheWrite1h: 0.125 },
   'gpt-4o-mini': { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite5m: 0.15, cacheWrite1h: 0.15 },
   'gpt-4o': { input: 2.5, output: 10, cacheRead: 1.25, cacheWrite5m: 2.5, cacheWrite1h: 2.5 },
   // Snapshot com preço PRÓPRIO: sem esta linha a tolerância ao sufixo de data o
