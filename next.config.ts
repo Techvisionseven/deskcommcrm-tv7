@@ -76,6 +76,22 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   // typedRoutes moved out of experimental in Next 15.5+
   typedRoutes: true,
+  /**
+   * `BUILD_SEM_TYPECHECK=1` pula a checagem de tipos DENTRO do `next build`. Só
+   * o job `e2e-parte` liga, e nunca o build da imagem: lá ela continua.
+   *
+   * Por quê: no runner de repositório privado (2 vCPU, 7 GB), o passo "Running
+   * TypeScript" precisa de ~3 GB de heap, e o job do e2e já tem o Supabase
+   * local de pé na mesma máquina. Medido em 16/10/2026: duas partes morreram
+   * com `JavaScript heap out of memory` e a terceira derrubou o runner.
+   *
+   * A cobertura de tipos não cai: `pnpm typecheck` (verify) checa o mesmo
+   * código e os testes, e o build da imagem (`imagem-do-app-sobe`) roda o
+   * `next build` inteiro, com os tipos de rota gerados.
+   */
+  typescript: {
+    ignoreBuildErrors: process.env.BUILD_SEM_TYPECHECK === "1",
+  },
   experimental: {
     optimizePackageImports: ["@phosphor-icons/react", "lucide-react", "date-fns"],
   },

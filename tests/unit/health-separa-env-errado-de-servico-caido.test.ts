@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 /**
@@ -51,21 +51,42 @@ describe("GET /api/v1/health — o motivo aponta para o que precisa ser feito", 
     vi.doUnmock("@/lib/env");
   });
 
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("⭐ `.env` com as aspas sobrando: o motivo é a CONFIGURAÇÃO, e o serviço nem é procurado", async () => {
     // A forma exata que um heredoc de instalador produz.
     comEnv('"https://fila-do-cliente.exemplo:80"', "token-de-teste");
+    // Toda ida à rede é ANOTADA e recusada na hora. O que se mede é a AUSÊNCIA
+    // da tentativa contra a fila, então ela é observada direto, não inferida
+    // pelo relógio. A versão anterior cronometrava o `GET` inteiro contra 2 s,
+    // e o `GET` roda em paralelo o check do Supabase, que fazia um `fetch` de
+    // verdade com timeout de 3 s: no runner do CI ele estourou (3.014 ms em
+    // 16/10/2026) e o teste reprovou o Redis por culpa do Supabase.
+    const idas: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (alvo: string | URL | Request) => {
+        idas.push(alvo instanceof Request ? alvo.url : String(alvo));
+        throw new TypeError("fetch failed");
+      }),
+    );
     const { GET } = await import("@/app/api/v1/health/route");
 
-    const t0 = Date.now();
     const { data } = await (await GET(pedido())).json();
-    const decorrido = Date.now() - t0;
 
     expect(data.checks.redis.reason).toBe("configuracao_invalida");
     expect(data.checks.redis.status).toBe("down");
+    // Controle do instrumento: o check do Supabase passou pelo `fetch` anotado.
+    // Sem isto, um `fetch` que a rota não usasse deixaria a lista vazia e o
+    // teste verde sem medir nada.
+    expect(idas.some((u) => u.includes("projeto-do-cliente.supabase.co"))).toBe(true);
     // Sem ida à rede: um endereço que não é endereço não tem o que ser tentado.
-    // O número é folgado de propósito — o que se mede é a AUSÊNCIA da tentativa,
-    // não a latência.
-    expect(decorrido, "houve ida à rede para um endereço malformado").toBeLessThan(2_000);
+    expect(
+      idas.filter((u) => u.includes("fila-do-cliente")),
+      "houve ida à rede para um endereço malformado",
+    ).toEqual([]);
   });
 
   it("⭐ configuração BEM formada e serviço inalcançável: o motivo volta a ser de alcance", async () => {

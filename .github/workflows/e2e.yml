@@ -1574,6 +1574,11 @@ jobs:
         run: pnpm e2e:build
         env:
           NEXT_TELEMETRY_DISABLED: "1"
+          # Sem a checagem de tipos dentro do `next build` (next.config.ts):
+          # no runner de 2 vCPU e 7 GB deste fork privado ela não cabe ao lado
+          # do Supabase local, e o build morria por memória. Os tipos seguem
+          # checados no `verify` e no build da imagem.
+          BUILD_SEM_TYPECHECK: "1"
           # `off`, NÃO vazio. Vazio seleciona o Sentry DA COMUNIDADE — está
           # escrito em lib/sentry/dsn.ts:8-10, e é o default de propósito num
           # produto self-host. Só "off" desliga.
