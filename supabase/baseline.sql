@@ -41180,6 +41180,94 @@ create trigger trg_redigir_b2b_ao_anonimizar
   when (new.is_anonymized is true and old.is_anonymized is distinct from true)
   execute function public.fn_redigir_b2b_do_contato_anonimizado();
 
+-- ---- custo de IA pelo catálogo quando o motor não sabe o preço (migration 0676) ----
+-- Linha de llm_calls que chega com cost_cents nulo (modelo fora do pricing.ts:
+-- toda a OpenRouter e modelo que entrou no catálogo antes do código) ganha o
+-- custo pelo ai_models/ai_pricing. Custo enviado pelo motor sempre vence; modelo
+-- sem preço e chamada com erro seguem nulos. O backfill é UPDATE e não infla o
+-- contador do mês. Racional completo no cabeçalho da migration 0676.
+create or replace function public.fn_custo_de_ia_pelo_catalogo(
+  p_provider text,
+  p_model text,
+  p_input bigint,
+  p_output bigint,
+  p_cache_read bigint,
+  p_cache_write bigint
+) returns numeric
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  with preco as (
+    select m.input_price_per_million_cents::numeric as entrada,
+           m.output_price_per_million_cents::numeric as saida,
+           1 as ordem
+      from public.ai_models m
+     where m.provider = p_provider
+       and m.model_id = p_model
+       and m.input_price_per_million_cents is not null
+       and m.output_price_per_million_cents is not null
+    union all
+    select p.prompt_cents_per_million_tokens, p.completion_cents_per_million_tokens, 2
+      from public.ai_pricing p
+     where p.model = p_model
+       and p.superseded_at is null
+       and p.prompt_cents_per_million_tokens is not null
+       and p.completion_cents_per_million_tokens is not null
+     order by ordem
+     limit 1
+  )
+  select (
+           greatest(0, coalesce(p_input, 0) - coalesce(p_cache_read, 0) - coalesce(p_cache_write, 0)) * entrada
+         + coalesce(p_cache_read, 0) * entrada * 0.1
+         + coalesce(p_cache_write, 0) * entrada
+             * (case when p_provider = 'anthropic' or p_model like 'anthropic/%' then 2.0 else 1.0 end)
+         + coalesce(p_output, 0) * saida
+         ) / 1000000.0
+    from preco;
+$$;
+
+revoke execute on function public.fn_custo_de_ia_pelo_catalogo(text, text, bigint, bigint, bigint, bigint)
+  from public, anon, authenticated;
+
+create or replace function public.fn_llm_calls_custo_pelo_catalogo()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.cost_cents is null and new.status = 'ok' and new.model is not null then
+    begin
+      new.cost_cents := public.fn_custo_de_ia_pelo_catalogo(
+        new.provider, new.model,
+        new.input_tokens, new.output_tokens, new.cache_read_tokens, new.cache_write_tokens
+      );
+    exception when others then
+      new.cost_cents := null;
+    end;
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.fn_llm_calls_custo_pelo_catalogo()
+  from public, anon, authenticated;
+
+drop trigger if exists trg_llm_calls_custo_pelo_catalogo on public.llm_calls;
+create trigger trg_llm_calls_custo_pelo_catalogo
+  before insert on public.llm_calls
+  for each row execute function public.fn_llm_calls_custo_pelo_catalogo();
+
+update public.llm_calls c
+   set cost_cents = public.fn_custo_de_ia_pelo_catalogo(
+         c.provider, c.model, c.input_tokens, c.output_tokens, c.cache_read_tokens, c.cache_write_tokens)
+ where c.cost_cents is null
+   and c.status = 'ok'
+   and c.model is not null
+   and public.fn_custo_de_ia_pelo_catalogo(
+         c.provider, c.model, c.input_tokens, c.output_tokens, c.cache_read_tokens, c.cache_write_tokens) is not null;
+
 -- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
 --
 -- ⚠️ DE PROPÓSITO, NENHUMA FUNÇÃO É CRIADA DEPOIS DESTE BLOCO. Apêndice que cria
