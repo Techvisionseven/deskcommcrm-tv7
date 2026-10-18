@@ -273,6 +273,16 @@ describe("a régua: outro turno já viu e respondeu a última mensagem do client
     expect(await m.regua.ultimaInboundJaRespondida(pool, alvo(crypto.randomUUID()))).toBe(false);
   });
 
+  it("re-run que anotou a mensagem nova não cala o turno dela com envios da tentativa anterior", async () => {
+    // O caso de 2026-10-16: a 1ª tentativa respondeu à pergunta e o fechamento
+    // falhou; o re-run regravou a anotação já com o "Sim", mas tudo o que esse job
+    // tem no ledger saiu ANTES do "Sim" existir — não é resposta a ele.
+    await inbound("Quero saber do plano de duas aulas", T("09:50"));
+    await inbound("Sim", T("10:21"));
+    await turnoTerminado({ vistoAte: T("10:21"), envio: { status: "accepted", em: T("10:00") } });
+    expect(await m.regua.ultimaInboundJaRespondida(pool, alvo(crypto.randomUUID()))).toBe(false);
+  });
+
   it("turno que viu a mensagem mas não enviou (veto ou falha) não cala o seguinte", async () => {
     await inbound("365,00 2x na semana", T("04:04"));
     await turnoTerminado({ vistoAte: T("04:04"), envio: { status: "vetoed", em: T("04:26") } });
@@ -357,6 +367,16 @@ describe("a porta: o handler real de inbound_turn", () => {
 
     expect(modeloChamado).toBe(0);
     expect(enviados).toBe(0);
+  });
+
+  it("o 'Sim' anotado por um re-run cujos envios são anteriores a ele: o turno do 'Sim' roda", async () => {
+    await inbound("Quero saber do plano de duas aulas", T("09:50"));
+    const sim = await inbound("Sim", T("10:21"));
+    await turnoTerminado({ vistoAte: T("10:21"), envio: { status: "accepted", em: T("10:00") } });
+
+    await rodaHandler(sim);
+
+    expect(modeloChamado).toBeGreaterThan(0);
   });
 
   it("controle: sem resposta anterior, o turno roda e anota no próprio job o que viu", async () => {

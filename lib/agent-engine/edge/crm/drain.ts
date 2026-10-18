@@ -480,8 +480,9 @@ async function processEvent(
   // Coalescência: já existe job PENDING futuro deste contato → esta mensagem
   // entra de carona (o turno lê o histórico completo). Evento vira done.
   //
-  // A janela e a exclusão do job em HOLD (`held_run_after` no payload — a lição
-  // do #830) moram em ./debounce.ts, com teste próprio.
+  // A janela e as exclusões — job em HOLD (`held_run_after` no payload, a lição
+  // do #830) e job que já tentou enviar (linha no `send_ledger`) — moram em
+  // ./debounce.ts, com teste próprio.
   const rajada = await decidirRajada(
     pool,
     { organizationId: event.organization_id, contactId: p.contact_id },

@@ -66,6 +66,29 @@ it('job em hold não recebe carona — a consulta precisa excluir held_run_after
   expect(decisao).toEqual({ tipo: 'enfileirar', runAfter: new Date(AGORA + 500) });
 });
 
+/**
+ * Job que já tentou enviar não recebe carona (2026-10-16).
+ *
+ * `pending` com `run_after` no futuro é também o job que espera o backoff do
+ * retry. O re-run dele reaproveita (job, seq) dos envios da tentativa anterior,
+ * e a resposta à mensagem de carona volta `already_sent` sem sair — o "Sim" do
+ * cliente ficou sem resposta exatamente assim. O pool falso devolve esse job
+ * SE a consulta não o excluir pelo `send_ledger`; tirar o predicado deixa este
+ * teste vermelho.
+ */
+it('job que já tentou enviar não recebe carona — a mensagem abre o próprio turno', async () => {
+  const chamadas: string[] = [];
+  const pool = poolFalso(
+    (sql) => (/not exists \(\s*select 1 from send_ledger/.test(sql) ? [] : [{ id: 'job-esperando-retry' }]),
+    chamadas,
+  );
+
+  const decisao = await decidirRajada(pool, alvo, 500, AGORA);
+
+  expect(chamadas[0]).toMatch(/s\.job_id = job_queue\.id/);
+  expect(decisao).toEqual({ tipo: 'enfileirar', runAfter: new Date(AGORA + 500) });
+});
+
 it('janelaDeRajada: sem debounce não há janela; com debounce a janela é agora + janela', () => {
   expect(janelaDeRajada(0, AGORA)).toBeUndefined();
   expect(janelaDeRajada(750, AGORA)?.getTime()).toBe(AGORA + 750);

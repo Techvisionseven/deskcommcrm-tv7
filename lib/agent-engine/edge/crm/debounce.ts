@@ -9,7 +9,8 @@
  * Contrato:
  *   - mensagem que chega enquanto há job PENDING **do mesmo contato** com a
  *     janela ainda aberta (`run_after > now()`) viaja de carona nele: o turno lê
- *     o histórico completo e responde a todas as mensagens do lote;
+ *     o histórico completo e responde a todas as mensagens do lote — desde que
+ *     ele ainda não tenha tentado enviar nada (ver `SQL_JOB_PARA_COALESCER`);
  *   - mensagem que chega fora da janela abre janela nova;
  *   - `debounceMs = 0` desliga a coalescência: job imediato, zero consulta.
  *
@@ -34,11 +35,25 @@ import type pg from 'pg';
  * saía "done" sem erro nenhum, e nenhum turno rodava. Medido em produção
  * (2026-09-14): 6 mensagens ao longo de 7h, zero resposta, zero job novo — só o
  * coalescing silencioso repetido no mesmo job com `held_run_after` no payload.
+ *
+ * ⚠️ Pelo mesmo motivo de fundo, job que JÁ TENTOU ENVIAR não recebe carona. Um
+ * job `pending` com `run_after` no futuro não é só a janela de debounce: é também
+ * o job que falhou e espera o backoff do retry (`failJob`), ou que foi reagendado.
+ * Se ele já tem linha no `send_ledger`, o re-run reaproveita a identidade
+ * (job, seq) dos envios da tentativa anterior: a resposta à mensagem de carona
+ * sai como `already_sent` e não chega ao cliente. Medido em produção
+ * (2026-10-16): o "Sim" do cliente pegou carona no job que esperava o retry do
+ * fechamento, o modelo respondeu, a cadeia aprovou duas vezes — e nada saiu. A
+ * mensagem ganha o próprio job, que roda depois na lane do contato; quem decide
+ * se ainda há o que responder é `ultimaInboundJaRespondida`.
  */
 const SQL_JOB_PARA_COALESCER = `select id from job_queue
  where organization_id = $1 and contact_id = $2
    and kind = 'inbound_turn' and status = 'pending' and run_after > now()
    and not (payload ? 'held_run_after')
+   and not exists (
+     select 1 from send_ledger s
+      where s.organization_id = job_queue.organization_id and s.job_id = job_queue.id)
  limit 1`;
 
 /** O que fazer com a mensagem que acabou de chegar. */

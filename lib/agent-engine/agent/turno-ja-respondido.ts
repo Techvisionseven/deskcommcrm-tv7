@@ -30,6 +30,21 @@
  * turno que viu a mensagem e decidiu não enviar (veto, handoff, erro) não conta,
  * e o turno seguinte responde normalmente. Só `inbound_turn` entra na régua —
  * follow-up de retomada não é resposta à pergunta do cliente.
+ *
+ * ## E o envio tem de ter saído DEPOIS da mensagem
+ *
+ * A anotação é regravada a cada execução do job, e o `send_ledger` guarda os
+ * envios de TODAS as execuções. Um job re-tentado depois de já ter respondido
+ * anotava a mensagem nova do cliente e, junto, apresentava as bolhas da
+ * tentativa anterior — mandadas antes de ela existir — como "a resposta". O
+ * re-run, por sua vez, não entrega nada nas posições (job, seq) que já saíram
+ * (`already_sent`): o turno da mensagem nova calava, e o cliente ficava sem
+ * resposta nenhuma. Medido em produção (2026-10-16): o "Sim" das 18:10:21 ficou
+ * anotado num job cujos três envios eram das 18:09:59–18:10:04.
+ *
+ * Resposta a uma mensagem é escrita depois de lida, e lida depois de existir:
+ * `o.created_at > u.em` vale em todo caso legítimo e só corta o envio que não
+ * podia responder a ela.
  */
 import type pg from 'pg';
 
@@ -61,7 +76,8 @@ export async function anotarUltimaInboundVista(db: Queryable, alvo: AlvoDoTurno)
 
 /**
  * `true` quando OUTRO turno de resposta deste contato, nesta conversa, viu a
- * inbound mais nova do cliente e enviou resposta. Sem inbound na conversa, `false`.
+ * inbound mais nova do cliente e enviou resposta depois dela. Sem inbound na
+ * conversa, `false`.
  */
 export async function ultimaInboundJaRespondida(
   db: Queryable,
@@ -86,6 +102,7 @@ export async function ultimaInboundJaRespondida(
           and o.conversation_id = $2
           and u.em is not null
           and (j.payload->>'ultima_inbound_vista_em')::timestamptz >= u.em
+          and o.created_at > u.em
      ) as respondida`,
     [alvo.organizationId, alvo.conversationId, alvo.contactId, alvo.jobId],
   );
