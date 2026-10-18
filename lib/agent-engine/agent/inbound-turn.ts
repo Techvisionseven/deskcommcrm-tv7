@@ -106,6 +106,7 @@ import { podeExporScheduleFollowup } from '@/lib/followup/callback-policy';
 import {
   avisarLeadDaEscalacao,
   avisarLeadLendoOContato,
+  criarFalaDoTurno,
   type AvisoDeEscalacaoIds,
   type AvisoDeEscalacaoOpts,
   type DesfechoDoAviso,
@@ -2588,6 +2589,9 @@ async function executarTurnoDoAgente(
   // turno com dois vetos ficaria mudo por mais de 20 segundos: o conserto do
   // "rápido demais" viraria o defeito simétrico, mais caro que o original.
   let jaEsperouComoHumano = false;
+  // As falas do modelo EM CURSO neste turno — o que o piso do aviso de
+  // `request_human_handoff` espera antes de ler `seq`. Ver `criarFalaDoTurno`.
+  const falaDoTurno = criarFalaDoTurno();
   // Cap de envio (warm-up/diário) vetado neste turno — capturado aqui porque o veto
   // não empurra outcome nenhum a `outcomes` (ver comentário no ponto de captura, mais
   // abaixo). Diferente da janela horária (checada ANTES do modelo rodar, linha ~1233):
@@ -3506,6 +3510,12 @@ async function executarTurnoDoAgente(
           // em cima seria o robô dizendo duas vezes a mesma coisa, com palavras
           // diferentes. Confiamos na fala dele e registramos que o piso não foi
           // preciso.
+          //
+          // "Já falou" inclui a fala que corre EM PARALELO, no mesmo passo: o SDK
+          // executa as ferramentas do passo juntas, e `seq` só anda no fim da
+          // cadeia. Sem `assentar`, a passagem lia 0 com a fala do agente ainda
+          // na cadeia, e o cliente recebia as duas (produção, 2026-10-16).
+          await falaDoTurno.assentar();
           const aviso =
             seq === 0
               ? await avisarLeadDaEscalacao(pool, avisoDaEscalacao().ids, {
@@ -3622,6 +3632,20 @@ async function executarTurnoDoAgente(
   // determinística de pedido de humano continua ativa — guardrail nunca sai).
   if (agentConfig !== null && !agentConfig.handoffToolEnabled) {
     delete rawTools.request_human_handoff;
+  }
+
+  // As ferramentas que FALAM com o lead entram no registro de falas em curso:
+  // é por ele que o piso do aviso, acima, enxerga a fala do mesmo passo. Mesmo
+  // padrão de embrulho do marcador de agenda das tools MCP, mais abaixo.
+  for (const nome of ['send_message', 'send_template'] as const) {
+    const ferramenta = rawTools[nome];
+    if (typeof ferramenta?.execute !== 'function') continue;
+    rawTools[nome] = {
+      ...ferramenta,
+      execute: falaDoTurno.acompanhar(
+        ferramenta.execute.bind(ferramenta),
+      ) as typeof ferramenta.execute,
+    };
   }
 
   // Spec 15: snapshot mínimo do contexto disponível pro humano que for atender o
