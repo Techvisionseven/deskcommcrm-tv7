@@ -180,7 +180,7 @@ import { loadChannelProvider, nomesDasFerramentas, runBeforeSend } from '../guar
 import { isStatusSendable } from '../../channels/meta/template-binding';
 import { capabilitiesOf } from '@/lib/channels/capabilities';
 import { renderTemplateBody } from '@/lib/channels/meta/render-template';
-import { acenderDigitando, esperarComoHumano } from './atraso-humano';
+import { acenderDigitando, criarPausaEntreBolhas, esperarComoHumano } from './atraso-humano';
 import { instrucaoDeBolhas, sendInBubbles, splitForSend } from './split-message';
 import type { DisclosureMode } from '../guardrails/disclosure/template';
 import { decidePromise } from '../guardrails/promise/engine';
@@ -2589,6 +2589,9 @@ async function executarTurnoDoAgente(
   // turno com dois vetos ficaria mudo por mais de 20 segundos: o conserto do
   // "rápido demais" viraria o defeito simétrico, mais caro que o original.
   let jaEsperouComoHumano = false;
+  // A digitação de cada bolha SEGUINTE, com o saldo do turno — por turno pelo
+  // mesmo motivo do flag acima. Ver `criarPausaEntreBolhas`.
+  const pausaEntreBolhas = criarPausaEntreBolhas();
   // As falas do modelo EM CURSO neste turno — o que o piso do aviso de
   // `request_human_handoff` espera antes de ler `seq`. Ver `criarFalaDoTurno`.
   const falaDoTurno = criarFalaDoTurno();
@@ -3164,7 +3167,9 @@ async function executarTurnoDoAgente(
                     jitter,
                     // A pausa humana do turno NÃO mora mais aqui: ela subiu para
                     // `esperaForaDoLock` (paga antes de o guardrail tomar o lock do número) —
-                    // issue #654. Neste ponto fica só o jitter anti-ban entre bolhas.
+                    // issue #654. Neste ponto fica o jitter anti-ban entre bolhas, esticado
+                    // até a digitação da bolha seguinte (o maior dos dois, com teto por turno).
+                    entreBolhas: pausaEntreBolhas,
                     send: (bubble) => enviar(bubble),
                   }),
               });

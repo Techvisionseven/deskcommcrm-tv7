@@ -88,6 +88,27 @@ describe("o atraso humano NÃO substitui o throttle anti-ban entre bolhas", () =
     expect(sleep).not.toHaveBeenCalled();
   });
 
+  it("a digitação da bolha seguinte estica o jitter, nunca o encurta — nem com gancho sabotado", async () => {
+    // `entreBolhas` (a digitação da bolha, 2026-10-16) entra NA MESMA pausa do
+    // jitter. O laço dorme o maior dos dois; um gancho que devolvesse menos que
+    // o anti-ban — ou zero — não pode afrouxar o throttle do número.
+    const sleep = vi.fn(async () => undefined);
+    const send = vi.fn(async () => ({ kind: "sent", messageId: "m" }));
+    const texto = "Bolha um aqui.\n\nBolha dois aqui.\n\nBolha três aqui.";
+
+    await sendInBubbles(texto, {
+      enabled: true,
+      maxChars: 20,
+      send,
+      sleep,
+      jitter: () => 1500,
+      entreBolhas: () => 0,
+    });
+
+    const bolhas = send.mock.calls.length;
+    expect(sleep.mock.calls).toEqual(Array.from({ length: bolhas - 1 }, () => [1500]));
+  });
+
   it("sem o atraso ligado, o jitter é exatamente o de antes — nenhum chamador regride", async () => {
     const sleep = vi.fn(async () => undefined);
     const send = vi.fn(async () => ({ kind: "sent", messageId: "m" }));
