@@ -28,6 +28,8 @@ import { currentExecutionBoundary, guardServiceEffect } from '@/lib/atendimento/
  *      SOMENTE o JSON do checkpoint, validado por Zod e persistido — mecanismo
  *      escolhido por ser imposto pelo runtime (tool update_checkpoint dependeria
  *      de o modelo lembrar de chamá-la; a chamada de fechamento sempre acontece).
+ *      Se ela falha DEPOIS de o cliente receber a resposta, o turno termina sem
+ *      checkpoint em vez de re-rodar (`fecharDepoisDaEntrega`).
  *
  * Falhas: transporte/tool do CRM viram mensagem de ensino pro modelo no meio do
  * run (padrão F2-08) E erro do job no fim (retry da fila com o ledger segurando
@@ -92,12 +94,14 @@ import {
 // não pode quebrar com a extração.
 import {
   CHECKPOINT_INSTRUCTION,
+  CheckpointInvalidoError,
   checkpointContentSchema,
   insertCheckpoint,
   parseCheckpointText,
   type CheckpointContent,
   type LeadCheckpointRow,
 } from "./abertura/checkpoint";
+import { StaleServiceBoundaryError } from '@/lib/atendimento/fronteira';
 import { buildOpeningMessage, ritualBlocks } from "./abertura/ritual";
 import { applySaveLeadNote, buildNotesIndexBlock, getLeadNoteBody } from './lead-notes';
 import { buildCompromissosBlock } from './compromissos-do-contato';
@@ -509,6 +513,96 @@ export const DEFAULT_MAX_SENDS_PER_TURN = 3;
  */
 export class JobSettledError extends Error {
   override readonly name = 'job_settled';
+}
+
+/** Chamadas de fechamento num turno que já entregou: a original e UMA repetição. */
+const TENTATIVAS_DO_FECHAMENTO_ENTREGUE = 2;
+
+/**
+ * O FECHAMENTO QUE FALHA DEPOIS DE O CLIENTE JÁ TER A RESPOSTA NÃO RE-RODA O TURNO.
+ *
+ * Medido em produção (2026-10-16): o turno respondeu em três bolhas (18:09:59 a
+ * 18:10:04) e o fechamento devolveu JSON inválido. A exceção subia, a fila
+ * re-rodava o turno INTEIRO e, no intervalo do retry, o cliente escreveu "Sim"
+ * (18:10:21). O drain pôs o "Sim" de carona no job que esperava o retry; o
+ * re-run leu o "Sim", o modelo escreveu a resposta, a cadeia aprovou — e o envio
+ * voltou `already_sent`, porque a identidade do envio é (job, seq) e a bolha 1 do
+ * re-run colidiu com a bolha 1 já aceita na primeira tentativa. O modelo ouviu
+ * "enviada"; o cliente não recebeu nada e, três minutos depois, pediu um humano.
+ * O erro do provedor no fechamento ("Invalid `signature` in `thinking` block")
+ * fazia o mesmo: 14 minutos sem resposta. 8 de 22 turnos daquela tarde
+ * re-rodaram por um dos dois.
+ *
+ * Re-rodar só servia para refazer o checkpoint, e o re-run não entrega nada — o
+ * ledger engole por desenho, porque envio em dobro é pior que nenhum. Então, com
+ * a resposta entregue:
+ *   - falha de FORMATO (`CheckpointInvalidoError`) ganha mais uma chamada, só do
+ *     fechamento — é o que o retry da fila acabava fazendo, sem o turno junto;
+ *   - falha do PROVEDOR não ganha: o SDK já re-tentou a que era re-tentável, e um
+ *     400 se repete igual;
+ *   - desistindo, o turno termina SEM checkpoint, com o motivo no log e no
+ *     `last_error` do job. O Operador já roda sem a declaração deste turno
+ *     ("fechamento incompleto", em `operator-turn.ts`), e o turno seguinte lê o
+ *     checkpoint anterior e o histórico, onde estão as bolhas.
+ *
+ * Sem entrega vale o contrato de antes: o erro sobe e a fila re-roda um turno
+ * que não tem o que engolir. E o erro que a fila NÃO re-tenta sobe sempre — o de
+ * orçamento é o que `comHandoffSeOrcamentoAcabar` precisa ver para passar a
+ * conversa a uma pessoa.
+ *
+ * `registrarFalha` é best-effort: o cliente já foi atendido, e um banco instável
+ * não pode transformar a anotação do motivo num re-run.
+ */
+export async function fecharDepoisDaEntrega<T>(
+  fechar: () => Promise<T>,
+  ctx: {
+    /** O cliente já recebeu mensagem deste job (enviada, já aceita ou retida pelo canal)? */
+    entregou: boolean;
+    log: Pick<Logger, 'error'>;
+    registrarFalha: (motivo: string) => Promise<void>;
+  },
+): Promise<T | null> {
+  let ultimoErro: unknown;
+  for (let tentativa = 1; tentativa <= TENTATIVAS_DO_FECHAMENTO_ENTREGUE; tentativa += 1) {
+    try {
+      return await fechar();
+    } catch (err) {
+      if (!ctx.entregou || filaNaoRetenta(err)) throw err;
+      ultimoErro = err;
+      if (!(err instanceof CheckpointInvalidoError)) break;
+    }
+  }
+  const erro = resumoDoErroDoFechamento(ultimoErro);
+  ctx.log.error('checkpoint não gravado: o fechamento falhou depois de o cliente receber a resposta', {
+    error: erro,
+  });
+  try {
+    await ctx.registrarFalha(
+      `fechamento sem checkpoint depois da entrega — turno concluído sem re-rodar (${erro})`,
+    );
+  } catch (err) {
+    ctx.log.error('motivo do fechamento sem checkpoint não foi gravado no job (segue)', {
+      error: (err instanceof Error ? err.message : String(err)).slice(0, 120),
+    });
+  }
+  return null;
+}
+
+/**
+ * O que a fila NÃO re-tenta — mesma régua do worker (`workers/agent-worker/main.ts`):
+ * fronteira de atendimento vencida e erro que se declara `terminal`.
+ */
+function filaNaoRetenta(err: unknown): boolean {
+  return (
+    err instanceof StaleServiceBoundaryError ||
+    (typeof err === 'object' && err !== null && (err as { terminal?: unknown }).terminal === true)
+  );
+}
+
+/** Primeira linha, sem a promessa de retry que deixou de valer. Nunca texto do modelo. */
+function resumoDoErroDoFechamento(err: unknown): string {
+  const mensagem = err instanceof Error ? err.message : String(err);
+  return (mensagem.split('\n', 1)[0] ?? '').replace(/ — run re-tentado pela fila$/u, '').slice(0, 200);
 }
 
 // Shape que o drain (F2-05) grava no payload do job — organization/lead vêm da
@@ -4220,6 +4314,10 @@ async function executarTurnoDoAgente(
     // a manda — pela MESMA cadeia de guardrails, dentro do teto de envios. Roda
     // mesmo com o teto cheio: registrar que o MODELO fez a pergunta é o que a
     // torna "a pergunta atual" no turno seguinte.
+    //
+    // A pergunta do roteiro não entra em `outcomes`; o fechamento precisa saber
+    // dela mesmo assim, porque também é resposta entregue (`fecharDepoisDaEntrega`).
+    let roteiroEntregou = false;
     if (roteiro !== null) {
       await garantirPerguntaDoRoteiro(
         { pool, log: runLog },
@@ -4264,7 +4362,11 @@ async function executarTurnoDoAgente(
                 });
               },
             });
-            return chain.status !== 'vetoed' && (chain.outcome.kind === 'sent' || chain.outcome.kind === 'already_sent');
+            const saiu =
+              chain.status !== 'vetoed' &&
+              (chain.outcome.kind === 'sent' || chain.outcome.kind === 'already_sent');
+            if (saiu) roteiroEntregou = true;
+            return saiu;
           },
         },
       );
@@ -4305,43 +4407,66 @@ async function executarTurnoDoAgente(
       avisarSemCandidato(preview);
       return;
     }
-    const closing = await runModelCall(
-      pool,
-      deps.llmCfg,
-      {
-        tenantId,
-        leadId: leadId || null,
-        jobId: job?.id,
-        purpose: 'checkpoint',
-        ...(agentConfig !== null
-          ? {
-              model: agentConfig.model,
-              llmOverride: {
-                provider: agentConfig.provider,
-                credentialId: agentConfig.credentialId,
-              },
-            }
-          : {}),
-        system,
-        messages: [
-          // prune: o checkpoint reusa a abertura só como texto — a mídia nativa (cara) já
-          // fez seu trabalho na 1ª chamada e não precisa ir de novo.
-          ...openingTextOnly,
-          ...responseMessages,
-          { role: 'user', content: CHECKPOINT_INSTRUCTION },
-        ],
+    // Depois de o cliente receber a resposta, a falha do fechamento não re-roda o
+    // turno: ver `fecharDepoisDaEntrega`. `null` = turno entregue sem checkpoint.
+    const fechamento = await fecharDepoisDaEntrega(
+      async () => {
+        const closing = await runModelCall(
+          pool,
+          deps.llmCfg,
+          {
+            tenantId,
+            leadId: leadId || null,
+            jobId: job?.id,
+            purpose: 'checkpoint',
+            ...(agentConfig !== null
+              ? {
+                  model: agentConfig.model,
+                  llmOverride: {
+                    provider: agentConfig.provider,
+                    credentialId: agentConfig.credentialId,
+                  },
+                }
+              : {}),
+            system,
+            messages: [
+              // prune: o checkpoint reusa a abertura só como texto — a mídia nativa (cara) já
+              // fez seu trabalho na 1ª chamada e não precisa ir de novo.
+              ...openingTextOnly,
+              ...responseMessages,
+              { role: 'user', content: CHECKPOINT_INSTRUCTION },
+            ],
+          },
+          { registry: deps.registry, log: runLog },
+        );
+        const content = parseCheckpointText(
+          closing.result.text.replace(
+            /https:\/\/meet\.google\.com\/[a-zA-Z0-9-]+/g,
+            '[link da reunião disponível na Agenda]',
+          ),
+        );
+        return { callId: closing.callId, content };
       },
-      { registry: deps.registry, log: runLog },
-    );
-    const content = parseCheckpointText(
-      closing.result.text.replace(
-        /https:\/\/meet\.google\.com\/[a-zA-Z0-9-]+/g,
-        '[link da reunião disponível na Agenda]',
-      ),
+      {
+        entregou:
+          !preview &&
+          (roteiroEntregou ||
+            outcomes.some(
+              (o) => o.kind === 'sent' || o.kind === 'already_sent' || o.kind === 'queued',
+            )),
+        log: runLog,
+        registrarFalha: async (motivo) => {
+          await pool.query(
+            'update job_queue set last_error = $3 where organization_id = $1 and id = $2',
+            [tenantId, liveJob().id, motivo.slice(0, 300)],
+          );
+        },
+      },
     );
 
     if (preview) {
-      preview.result.checkpoint = content;
+      // Prévia nunca "entregou": sem checkpoint o erro já subiu acima.
+      if (fechamento !== null) preview.result.checkpoint = fechamento.content;
       avisarSemCandidato(preview);
       return;
     }
@@ -4351,7 +4476,14 @@ async function executarTurnoDoAgente(
     // tela com "a IA pensou" e enterraria a única linha que muda o que alguém
     // faria a seguir.
     const checkpointAnterior = await latestCheckpoint(pool, tenantId, leadId);
-    await insertCheckpoint(pool, { tenantId, leadId, jobId: liveJob().id, content });
+    if (fechamento !== null) {
+      await insertCheckpoint(pool, {
+        tenantId,
+        leadId,
+        jobId: liveJob().id,
+        content: fechamento.content,
+      });
+    }
 
     // ── O TURNO DO OPERADOR (spec 16 §3.2) ─────────────────────────────────────
     //
@@ -4363,6 +4495,10 @@ async function executarTurnoDoAgente(
     // Depois do checkpoint porque a declaração É o insumo do Operador; enfileirar
     // antes criaria uma corrida em que ele leria o checkpoint do turno ANTERIOR e
     // agiria sobre um turno que não é o seu.
+    //
+    // Sem checkpoint (`fechamento === null`) ele é enfileirado do mesmo jeito: lê
+    // pela chave DESTE job, não acha nada e roda como "fechamento incompleto" —
+    // verifica o estado do lead em vez de deixar sem dono o que foi prometido.
     //
     // Fire-and-forget: falha ao enfileirar NÃO derruba um turno que já respondeu
     // ao cliente. O `sourceEventId` é o job do Conversador, então o retry da fila
@@ -4403,7 +4539,7 @@ async function executarTurnoDoAgente(
         //
         // Só quando HÁ promessa: sem ela o Operador teria decidido "nada a fazer", e
         // item sem ação é ruído — ruído ensina a ignorar a Central.
-        const promessas = promessasEmAberto(content.declaracao ?? null);
+        const promessas = promessasEmAberto(fechamento?.content.declaracao ?? null);
         if (promessas.length > 0) {
           try {
             await insertInboxItem(
@@ -4434,19 +4570,23 @@ async function executarTurnoDoAgente(
       }
     }
 
-    const mudanca = diffCheckpoint(
-      checkpointAnterior
-        ? {
-            commitments: (checkpointAnterior.commitments ?? []) as string[],
-            objections: (checkpointAnterior.objections ?? []) as string[],
-            next_action: checkpointAnterior.next_action ?? null,
-            rolling_summary: checkpointAnterior.rolling_summary ?? null,
-          }
-        : null,
-      content,
-    );
+    // Sem checkpoint não há diff: a timeline não ganha linha de um fechamento que não houve.
+    const mudanca =
+      fechamento === null
+        ? null
+        : diffCheckpoint(
+            checkpointAnterior
+              ? {
+                  commitments: (checkpointAnterior.commitments ?? []) as string[],
+                  objections: (checkpointAnterior.objections ?? []) as string[],
+                  next_action: checkpointAnterior.next_action ?? null,
+                  rolling_summary: checkpointAnterior.rolling_summary ?? null,
+                }
+              : null,
+            fechamento.content,
+          );
 
-    if (mudanca.emit) {
+    if (mudanca?.emit) {
       try {
         const r = await emitAgentActivityForContact({
           pool,
@@ -4458,7 +4598,7 @@ async function executarTurnoDoAgente(
           // O lastro é a chamada de modelo que PRODUZIU este checkpoint
           // (llm_calls.id). Sem ele a linha entraria como 'system' e perderia a
           // autoria justamente no evento mais "de IA" que existe.
-          ...(closing.callId ? { evidence: { llm_call_ids: [closing.callId] } } : {}),
+          ...(fechamento?.callId ? { evidence: { llm_call_ids: [fechamento.callId] } } : {}),
           ...(agentConfig?.agentId ? { agentId: agentConfig.agentId } : {}),
           reason: mudanca.reason,
           payload: {

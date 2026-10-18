@@ -3,7 +3,8 @@
  *
  * Saiu de `inbound-turn.ts` byte a byte (a única linha nova é o `export` de
  * `insertCheckpoint`, que era privado lá): mesmas strings, mesmo Zod, mesma
- * instrução de fechamento — portanto mesmo comportamento.
+ * instrução de fechamento — portanto mesmo comportamento. Depois disso ganhou
+ * `CheckpointInvalidoError`, que só dá nome à falha de parse (mesmas mensagens).
  *
  * O que mora aqui é o DADO do checkpoint: o schema que o Zod valida na chamada
  * de fechamento, a ROW do `lead_checkpoints`, a instrução fixa (com o
@@ -133,21 +134,37 @@ export async function insertCheckpoint(
 }
 
 /**
+ * O modelo RESPONDEU ao fechamento, mas não com o JSON pedido.
+ *
+ * Classe própria porque o fechamento precisa separar esta falha das do provedor
+ * (`fecharDepoisDaEntrega`, em `inbound-turn.ts`): pedir de novo resolve esta —
+ * a saída do modelo varia de uma chamada para outra —, e não resolve um 400 do
+ * provedor, que o SDK já re-tentou quando era re-tentável. A mensagem continua a
+ * mesma de antes, e continua SEM o texto do modelo (pode carregar PII).
+ */
+export class CheckpointInvalidoError extends Error {
+  override readonly name = 'checkpoint_invalido';
+}
+
+/**
  * Extrai e valida o JSON do fechamento. Tolerante a cerca de código e prosa em
  * volta (pega do primeiro '{' ao último '}'); inválido → erro SEM o texto do
- * modelo na mensagem (pode carregar PII da conversa) — o job re-tenta.
+ * modelo na mensagem (pode carregar PII da conversa) — o job re-tenta, se o
+ * turno ainda não falou com o cliente (ver `fecharDepoisDaEntrega`).
  */
 export function parseCheckpointText(text: string): CheckpointContent {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start === -1 || end <= start) {
-    throw new Error('fechamento do turno sem JSON de checkpoint — run re-tentado pela fila');
+    throw new CheckpointInvalidoError(
+      'fechamento do turno sem JSON de checkpoint — run re-tentado pela fila',
+    );
   }
   let raw: unknown;
   try {
     raw = JSON.parse(text.slice(start, end + 1));
   } catch {
-    throw new Error(
+    throw new CheckpointInvalidoError(
       'JSON de checkpoint inválido no fechamento do turno — run re-tentado pela fila',
     );
   }
@@ -156,7 +173,7 @@ export function parseCheckpointText(text: string): CheckpointContent {
     const issues = parsed.error.issues
       .map((i) => `${i.path.join('.') || '(raiz)'}: ${i.code}`)
       .join('; ');
-    throw new Error(
+    throw new CheckpointInvalidoError(
       `checkpoint do fechamento com shape inválido (${issues}) — run re-tentado pela fila`,
     );
   }
