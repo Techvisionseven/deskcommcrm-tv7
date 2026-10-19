@@ -54,9 +54,12 @@
  * 18:09:59, 18:10:01, 18:10:04. Ninguém digita 187 caracteres em 1,9s.
  *
  * `criarPausaEntreBolhas` dá a cada bolha seguinte o tempo de DIGITÁ-LA, na
- * mesma taxa (`MS_POR_CARACTERE`) e sem o `NOTAR`: quem escreve em bolhas não
- * relê a conversa entre uma e outra. A pausa é o MAIOR dos dois — anti-ban ou
- * digitação —, nunca a soma: o anti-ban vira piso, intacto, e o cliente não
+ * mesma taxa da 1ª e sem o `NOTAR`: quem escreve em bolhas não relê a conversa
+ * entre uma e outra. "A mesma taxa" é a EFETIVA da conexão — os knobs de
+ * `channel_knobs` (0499), com o default deste módulo onde não há valor —, e o
+ * mesmo vale para o piso e para o teto: uma conexão que configurou outro ritmo
+ * o recebe em toda bolha, não só na 1ª. A pausa é o MAIOR dos dois — anti-ban
+ * ou digitação —, nunca a soma: o anti-ban vira piso, intacto, e o cliente não
  * espera duas vezes na mesma pausa.
  *
  * Esta pausa dorme onde o jitter já dormia: dentro do `send` da cadeia, com o
@@ -113,28 +116,33 @@ export function calcularAtrasoHumano(texto: string, knobs?: AtrasoHumanoKnobs): 
 }
 
 /**
- * Teto da digitação de UMA bolha seguinte (≈227 caracteres na taxa acima).
+ * Teto da digitação de UMA bolha seguinte (≈227 caracteres na taxa default).
  * Abaixo do teto da 1ª: entre bolhas o cliente acabou de receber uma, e um
- * silêncio longo depois dela lê como "parou no meio".
+ * silêncio longo depois dela lê como "parou no meio". Conexão com teto
+ * configurado MENOR que este (`atraso_maximo_ms`) usa o dela.
  */
 export const ATRASO_ENTRE_BOLHAS_MAXIMO_MS = 5000;
 
 /**
  * Quanto as bolhas seguintes de um turno podem esperar, SOMADAS, além do
  * jitter anti-ban. É o teto do que esta pausa acrescenta à posse do lock do
- * número (ver o cabeçalho).
+ * número (ver o cabeçalho) — por isso NÃO é knob da conexão: um ritmo lento
+ * configurado não pode virar lock do número segurado por mais tempo.
  */
 export const ATRASO_EXTRA_ENTRE_BOLHAS_POR_TURNO_MS = 4000;
 
 /**
  * O tempo de digitar uma bolha seguinte, em ms. Pura. Sem o `NOTAR` (ver o
- * cabeçalho) e com o mesmo piso anti-ban da 1ª.
+ * cabeçalho), na taxa e com o piso EFETIVOS da conexão — os mesmos da 1ª —, e
+ * com o teto de bolha (o menor entre `ATRASO_ENTRE_BOLHAS_MAXIMO_MS` e o teto
+ * da conexão). `knobs` omitido = os defaults do módulo.
  */
-export function calcularDigitacaoDaBolha(texto: string): number {
+export function calcularDigitacaoDaBolha(texto: string, knobs?: AtrasoHumanoKnobs): number {
+  const ef = atrasoHumanoEfetivo(knobs);
   const comprimento = (texto ?? '').trim().length;
   return Math.min(
-    ATRASO_ENTRE_BOLHAS_MAXIMO_MS,
-    Math.max(ATRASO_MINIMO_MS, MS_POR_CARACTERE * comprimento),
+    Math.min(ATRASO_ENTRE_BOLHAS_MAXIMO_MS, ef.atrasoMaximoMs),
+    Math.max(ef.atrasoMinimoMs, ef.msPorCaractere * comprimento),
   );
 }
 
@@ -143,16 +151,20 @@ export function calcularDigitacaoDaBolha(texto: string): number {
  * como `jaEsperouComoHumano`: um turno pode chamar `send_message` mais de uma
  * vez, e o teto vale para a soma.
  *
+ * `knobs` são os do atraso humano da CONEXÃO (os mesmos que `esperarComoHumano`
+ * recebe para a 1ª bolha); omitidos, valem os defaults.
+ *
  * Recebe a bolha que vai sair e o jitter anti-ban sorteado para aquela pausa;
  * devolve quanto esperar: o anti-ban, esticado até a digitação da bolha
  * enquanto houver saldo. Nunca menos que o anti-ban.
  */
 export function criarPausaEntreBolhas(
+  knobs?: AtrasoHumanoKnobs,
   tetoExtraMs: number = ATRASO_EXTRA_ENTRE_BOLHAS_POR_TURNO_MS,
 ): (bolha: string, antiBanMs: number) => number {
   let saldo = Math.max(0, tetoExtraMs);
   return (bolha, antiBanMs) => {
-    const extra = Math.min(saldo, Math.max(0, calcularDigitacaoDaBolha(bolha) - antiBanMs));
+    const extra = Math.min(saldo, Math.max(0, calcularDigitacaoDaBolha(bolha, knobs) - antiBanMs));
     saldo -= extra;
     return antiBanMs + extra;
   };

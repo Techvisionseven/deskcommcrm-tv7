@@ -3035,8 +3035,10 @@ async function executarTurnoDoAgente(
     atrasoMaximoMs: pacingDoTurno?.knobs.atrasoMaximoMs,
   };
   // A digitação de cada bolha SEGUINTE, com o saldo do turno — por turno pelo
-  // mesmo motivo do flag acima. Ver `criarPausaEntreBolhas`.
-  const pausaEntreBolhas = criarPausaEntreBolhas();
+  // mesmo motivo do flag acima, e com os knobs EFETIVOS da conexão (taxa por
+  // caractere, piso e teto): o ritmo configurado vale para toda bolha, não só
+  // para a 1ª. Ver `criarPausaEntreBolhas`.
+  const pausaEntreBolhas = criarPausaEntreBolhas(knobsDeAtrasoHumano);
   // As falas do modelo EM CURSO neste turno — o que o piso do aviso de
   // `request_human_handoff` espera antes de ler `seq`. Ver `criarFalaDoTurno`.
   const falaDoTurno = criarFalaDoTurno();
