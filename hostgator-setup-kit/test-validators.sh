@@ -55,7 +55,17 @@ fail=0
 # `SUPABASE_ACCESS_TOKEN=` já faz por chamada lá embaixo.
 # O passo do CI não exporta chave de IA (env: só VERIFY_INICIO e PNPM_HOME) e o
 # mesmo SHA passou na re-execução: isto hermetiza a suíte para quem roda com
-# chave no terminal, mas não é a causa da intermitência da #1570, que segue aberta.
+# chave no terminal, mas NÃO é a causa da intermitência da #1570.
+# A causa medida é o cano das asserções. Com `set -o pipefail` (topo do
+# arquivo), `printf '%s' "$saida" | grep -q X` reprova quando o `grep -q` acha a
+# frase e sai ANTES de o `printf` terminar de escrever: o `printf` leva SIGPIPE
+# (status 141), o pipefail faz o pipeline inteiro falhar, e o `!` lê isso como
+# "a frase não está lá". Medido em 02/10/2026 (ubuntu:24.04, bash 5.2, 1 CPU),
+# sobre a SAÍDA REAL deste caso: taxas baixas e variáveis pelo cano (de 1 a 6
+# em 6000, conforme a asserção), sempre com status 141/0, e zero em 6000 com
+# here-string.
+# Por isso toda asserção `grep -q` deste arquivo lê a variável por `<<<"$var"`
+# — sem cano, não há quem leve SIGPIPE. Não volte ao `printf | grep -q`.
 export ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY= AI_GATEWAY_API_KEY=
 
 # ── Sandbox: a suíte NÃO pode escrever no crontab da máquina de quem a roda ──
@@ -77,13 +87,11 @@ crontab -l >"$CRONTAB_REAL_ANTES" 2>/dev/null || : >"$CRONTAB_REAL_ANTES"
 
 # dublar_uname_amd64 <diretório bin do sandbox>
 #
-# O `_common.sh` recusa, logo que é carregado, todo install.sh/update.sh que não
-# roda em amd64 — a imagem publicada é só linux/amd64. Os cenários que executam
-# esses scripts de verdade medem o INSTALADOR, não o processador de quem roda a
-# suíte: sem este dublê, num Mac Apple Silicon (`arm64`) todos eles paravam na
-# guarda (medido: 22 asserções vermelhas, a maioria "inconclusivo"). A recusa de
-# ARM tem prova própria em tests/shell/arquitetura-kit.test.sh. Só `uname -m` é
-# dublado; qualquer outro uso vai ao `uname` real.
+# Os cenários abaixo medem o instalador, não o processador de quem roda a
+# suíte. Fixamos o ambiente em x86_64 para que os fixtures e valores de imagem
+# desses casos permaneçam determinísticos; a aceitação de ARM64 tem prova
+# própria em tests/shell/arquitetura-kit.test.sh. Só `uname -m` é dublado;
+# qualquer outro uso vai ao `uname` real.
 UNAME_REAL="$(command -v uname)"
 dublar_uname_amd64() {
   cat > "$1/uname" <<STUB
@@ -111,7 +119,7 @@ ok() {
   if [ $rc -eq 0 ]; then
     printf '  ✗ %s  (esperava rejeitar, aceitou)\n' "$desc"; fail=1; return
   fi
-  if [ -n "$want" ] && ! printf '%s' "$out" | grep -qi -- "$want"; then
+  if [ -n "$want" ] && ! grep -qi -- "$want" <<<"$out"; then
     printf '  ✗ %s  (rejeitou, mas pelo motivo errado)\n     esperava falar de: %s\n     disse: %s\n' \
       "$desc" "$want" "$(printf '%s' "$out" | head -1)"; fail=1; return
   fi
@@ -146,7 +154,7 @@ echo "URL do Supabase: a da nuvem E a de um Supabase próprio"
 # recria o mesmo beco em prosa.
 #
 # FRONTEIRA (o cabeçalho deste arquivo): aqui se mede só o `case` de formato. A
-# chamada a /auth/v1/health é dublada, porque prender esta suíte a DNS é trocar
+# chamada a /auth/v1/verify é dublada, porque prender esta suíte a DNS é trocar
 # um teste por um oráculo. O que aquela chamada prova de fato — e o que ela NÃO
 # prova — é medição de instalação real; ver o relatório da triagem.
 sburl_ok() {  # sburl_ok <descrição> <pass|reject> <url> [trecho esperado]...
@@ -155,8 +163,9 @@ sburl_ok() {  # sburl_ok <descrição> <pass|reject> <url> [trecho esperado]...
   out="$(bash -c '
       INSTALL_SH_LIB=1 . ./install.sh
       set +e
-      # Só o formato está sob teste: para o dublê, a rede responde 200 a todos.
-      curl() { printf 200; }
+      # Só o formato está sob teste: para o dublê, todo host é um GoTrue (o
+      # JSON que /auth/v1/verify devolve sem parâmetros, como medido).
+      curl() { printf '\''{"msg":"Verify requires a verification type"}\n400'\''; }
       v_supabase_url "$1"' _ "$url" 2>&1)"; rc=$?
   if [ "$expect" = pass ]; then
     if [ $rc -eq 0 ]; then printf '  ✓ %s\n' "$desc"
@@ -165,7 +174,7 @@ sburl_ok() {  # sburl_ok <descrição> <pass|reject> <url> [trecho esperado]...
   fi
   if [ $rc -eq 0 ]; then printf '  ✗ %s  (esperava rejeitar, aceitou)\n' "$desc"; fail=1; return; fi
   for want in "$@"; do
-    if ! printf '%s' "$out" | grep -qi -- "$want"; then
+    if ! grep -qi -- "$want" <<<"$out"; then
       printf '  ✗ %s  (rejeitou, mas a mensagem não fala de: %s)\n     disse: %s\n' \
         "$desc" "$want" "$(printf '%s' "$out" | head -1)"; fail=1; return
     fi
@@ -185,6 +194,92 @@ sburl_ok "rejeita http:// (sem TLS)"               reject "http://db-crm.exemplo
 # migraria do `case` para a prosa, onde não há catraca nenhuma.
 sburl_ok "a recusa ensina o caso da NUVEM"         reject "meu-supabase" "supabase.co"
 sburl_ok "a recusa ensina o caso do Supabase PRÓPRIO" reject "meu-supabase" "servidor"
+
+echo "URL do Supabase: quem responde tem de ser o GoTrue, não qualquer servidor"
+# O validador aceitava QUALQUER código HTTP diferente de 000. Medido numa VPS
+# com Coolify (PR 4, E7 Passo 1): a 127.0.0.1:8000 é o PAINEL do Coolify e
+# responde 302 — e teria passado como "o Supabase local". A 8001 (o Envoy do
+# Supabase) é a certa.
+#
+# O dublê reproduz o que foi MEDIDO, sem chave (a URL é perguntada antes das
+# chaves, então o validador não tem apikey para mandar):
+#   - Envoy self-hosted e gateway da nuvem: /auth/v1/health → 401 (o gateway
+#     exige apikey; ninguém do GoTrue respondeu ainda); /auth/v1/verify é rota
+#     ABERTA (link de e-mail) e quem responde é o GoTrue: 400 com o JSON dele.
+#   - Coolify na 8000: 302 com HTML de redirecionamento para /login, em tudo.
+#   - Um site qualquer: 200 com HTML.
+# O dublê imita `-o` e `-w` do curl de verdade, para não amarrar o teste à
+# forma da chamada — só ao que o servidor responde.
+gotrue_curl_duble() {
+  curl() {
+    local a prev="" url="" fmt="" so_codigo=0 body code
+    for a; do
+      case "$prev" in -w) fmt="$a";; -o) so_codigo=1;; esac
+      case "$a" in http://*|https://*) url="$a";; esac
+      prev="$a"
+    done
+    case "$url" in
+      http://127.0.0.1:8001/auth/v1/verify*|https://*.supabase.co/auth/v1/verify*|https://db-crm.exemplo.com.br/auth/v1/verify*)
+        body='{"code":400,"error_code":"validation_failed","msg":"Verify requires a verification type"}'; code=400;;
+      http://127.0.0.1:8001/*|https://*.supabase.co/*|https://db-crm.exemplo.com.br/*)
+        body='Unauthorized'; code=401;;
+      https://api.exemplo.com.br/*)
+        # Uma API qualquer que devolve JSON com "msg" e 200: o corpo sozinho
+        # não separa ela do GoTrue; o código separa.
+        body='{"ok":true,"msg":"pong"}'; code=200;;
+      http://127.0.0.1:8000/*)
+        body='<!DOCTYPE html><html><head><title>Redirecting to http://127.0.0.1:8000/login</title></head></html>'; code=302;;
+      *)
+        body='<!DOCTYPE html><html><body>Bem-vindo</body></html>'; code=200;;
+    esac
+    [ "$so_codigo" = 1 ] || printf '%s' "$body"
+    [ -z "$fmt" ] || { fmt="${fmt//%\{http_code\}/$code}"; printf "$fmt"; }
+    return 0
+  }
+}
+gotrue_ok() {  # gotrue_ok <descrição> <pass|reject> <url> <single-server: 0|1> <url interna> [trecho esperado]...
+  local desc="$1" expect="$2" url="$3" ss="$4" interna="$5" out rc want
+  shift 5
+  out="$(bash -c "
+      INSTALL_SH_LIB=1 . ./install.sh
+      set +e
+      $(declare -f gotrue_curl_duble)
+      gotrue_curl_duble
+      SINGLE_SERVER=\"\$2\" SUPABASE_INTERNAL_URL=\"\$3\"
+      v_supabase_url \"\$1\"" _ "$url" "$ss" "$interna" 2>&1)"; rc=$?
+  if [ "$expect" = pass ]; then
+    if [ $rc -eq 0 ]; then printf '  ✓ %s\n' "$desc"
+    else printf '  ✗ %s  (esperava aceitar, rejeitou: %s)\n' "$desc" "$(printf '%s' "$out" | head -1)"; fail=1; fi
+    return
+  fi
+  if [ $rc -eq 0 ]; then printf '  ✗ %s  (esperava rejeitar, aceitou)\n' "$desc"; fail=1; return; fi
+  for want in "$@"; do
+    if ! grep -qi -- "$want" <<<"$out"; then
+      printf '  ✗ %s  (rejeitou, mas a mensagem não fala de: %s)\n     disse: %s\n' \
+        "$desc" "$want" "$(printf '%s' "$out" | head -1)"; fail=1; return
+    fi
+  done
+  printf '  ✓ %s\n' "$desc"
+}
+# O caso medido: single-server apontando para a porta do painel do Coolify.
+gotrue_ok "single-server: painel do Coolify (302) é RECUSADO" reject \
+  "https://crm.exemplo.com.br" 1 "http://127.0.0.1:8000" "não é o Supabase" "127.0.0.1:8000"
+# O caso certo da mesma VPS: o Envoy do Supabase na 8001.
+gotrue_ok "single-server: o Envoy do Supabase (GoTrue) é ACEITO" pass \
+  "https://crm.exemplo.com.br" 1 "http://127.0.0.1:8001"
+# Sem quebrar a nuvem: o gateway dela também deixa /auth/v1/verify aberto.
+gotrue_ok "nuvem: projeto .supabase.co é ACEITO" pass \
+  "https://abcdefghijklmnop.supabase.co" 0 ""
+gotrue_ok "Supabase próprio atrás de domínio é ACEITO" pass \
+  "https://db-crm.exemplo.com.br" 0 ""
+# O mesmo defeito fora do single-server: a URL do SITE da empresa no lugar da
+# do Supabase respondia 200 e passava.
+gotrue_ok "um site qualquer (200 HTML) é RECUSADO" reject \
+  "https://www.exemplo.com.br" 0 "" "não é o Supabase"
+# "msg" no corpo não basta: o GoTrue devolve 400 ali (medido no GoTrue do kit,
+# v2.196.0). Uma API que responda 200 com "msg" não é o Supabase.
+gotrue_ok "200 com 'msg' no corpo é RECUSADO" reject \
+  "https://api.exemplo.com.br" 0 "" "não é o Supabase" "HTTP 200"
 
 echo "chaves do Supabase (formato/papel/projeto)"
 ok "rejeita service_role no campo anon" reject v_anon    "$(mkjwt service_role abcdefghijklmnop)" "preciso da 'anon'"
@@ -240,7 +335,7 @@ db_ok() {  # db_ok <descrição> <pass|reject> <NEXT_PUBLIC_SUPABASE_URL> <strin
     return
   fi
   if [ $rc -eq 0 ]; then printf '  ✗ %s  (esperava rejeitar, aceitou)\n' "$desc"; fail=1; return; fi
-  if [ -n "$want" ] && ! printf '%s' "$out" | grep -qi -- "$want"; then
+  if [ -n "$want" ] && ! grep -qi -- "$want" <<<"$out"; then
     printf '  ✗ %s  (rejeitou, mas pelo motivo errado)\n     disse: %s\n' "$desc" "$(printf '%s' "$out" | head -1)"; fail=1; return
   fi
   if [ "$tocou" = sim ]; then
@@ -327,7 +422,7 @@ rede_morta() {  # rede_morta <descrição> <pass|reject> <validador> <valor> [tr
     printf '  ✗ %s  (esperava barrar, seguiu)\n' "$desc"; fail=1; return
   fi
   for want in "$@"; do
-    if ! printf '%s' "$out" | grep -qi -- "$want"; then
+    if ! grep -qi -- "$want" <<<"$out"; then
       printf '  ✗ %s  (a mensagem não fala de: %s)\n     disse: %s\n' \
         "$desc" "$want" "$(printf '%s' "$out" | head -1)"; fail=1; return
     fi
@@ -356,6 +451,53 @@ rede_morta "chave anon correta SEGUE com aviso"         pass v_anon \
 rede_morta "chave Anthropic segue pelo ramo 000"  pass v_anthropic  "sk-ant-abc123" "não consegui checar"
 rede_morta "chave OpenRouter segue pelo ramo 000" pass v_openrouter "sk-or-abc123"  "não consegui checar"
 rede_morta "chave OpenAI segue pelo ramo 000"     pass v_openai     "sk-abc123"     "não consegui checar"
+
+# ── A prova da chave, no single-server, bate no Supabase LOCAL ────────────────
+# Defeito medido numa instalação real (10/10/2026; single-server com o domínio
+# atrás de Cloudflare no modo proxy): a fase 2 provava a chave contra
+# NEXT_PUBLIC_SUPABASE_URL, mas quem serve essa URL é o Caddy DESTA instalação,
+# que só sobe DEPOIS desta fase — o proxy devolve 521 e a instalação PARA
+# mandando conferir uma chave que está certa. O `curl` abaixo é o juiz: ele
+# registra QUAL endereço foi chamado e responde por host (a pública, 521 ou 200
+# conforme o caso; o gateway local do Supabase, sempre 200).
+prova_no_local() {  # prova_no_local <descrição> <SINGLE_SERVER> <resposta da pública> <url esperada>
+  local desc="$1" single="$2" publica="$3" esperada="$4" log chamadas rc
+  log="$(mktemp)"
+  SINGLE_DO_CASO="$single" PUBLICA_DO_CASO="$publica" CURL_LOG="$log" \
+  JWT_DO_CASO="$(mkjwt anon abcdefghijklmnop)" bash -c '
+      INSTALL_SH_LIB=1 . ./install.sh
+      set +e
+      NEXT_PUBLIC_SUPABASE_URL="https://abcdefghijklmnop.supabase.co"
+      SUPABASE_INTERNAL_URL="http://127.0.0.1:8000"
+      SINGLE_SERVER="$SINGLE_DO_CASO"
+      curl() {
+        local a url=""
+        for a in "$@"; do case "$a" in http://*|https://*) url="$a";; esac; done
+        printf "%s\n" "$url" >> "$CURL_LOG"
+        case "$url" in
+          http://127.0.0.1:8000/*) printf 200;;
+          *) printf "%s" "$PUBLICA_DO_CASO";;
+        esac
+        return 0
+      }
+      v_anon "$JWT_DO_CASO"' >/dev/null 2>&1
+  rc=$?
+  chamadas="$(cat "$log" 2>/dev/null)"
+  if [ -n "$chamadas" ] && [ "$chamadas" != "$esperada" ]; then
+    printf '  ✗ %s  (chamou o endereço errado)\n     esperava: %s\n     chamou:   %s\n' \
+      "$desc" "$esperada" "$chamadas"; fail=1
+  elif [ $rc -ne 0 ]; then
+    printf '  ✗ %s  (a chave CERTA foi recusada)\n' "$desc"; fail=1
+  else
+    printf '  ✓ %s\n' "$desc"
+  fi
+  rm -f "$log"
+}
+
+prova_no_local "single-server com o proxy no caminho: a chave certa SEGUE (prova no Supabase local)" \
+  1 521 "http://127.0.0.1:8000/auth/v1/settings"
+prova_no_local "fora do single-server: a prova continua na URL pública que o operador deu" \
+  0 200 "https://abcdefghijklmnop.supabase.co/auth/v1/settings"
 
 echo "leitura do .env (load_env)"
 . ./_common.sh
@@ -428,9 +570,29 @@ TMP3="$(mktemp -d)"
 (
   MARCA="$TMP3/executou"
   mkdir -p "$TMP3/bin" "$TMP3/proj"
-  cp install.sh _common.sh _i18n.sh "$TMP3/"
+  cp install.sh _common.sh _manifestos.sh _i18n.sh "$TMP3/"
   : > "$TMP3/proj/docker-compose.prod.yml"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP3/bin/docker"; chmod +x "$TMP3/bin/docker"
+  cat > "$TMP3/bin/docker" <<'STUBDOCKER'
+#!/usr/bin/env bash
+if [ "${1:-}" = buildx ] && [ "${2:-}" = imagetools ] && [ "${3:-}" = inspect ]; then
+  case " $* " in
+    *' --raw '*) printf '%s' '{"schemaVersion":2,"manifests":[{"platform":{"os":"linux","architecture":"amd64"}}]';;
+    *) printf 'linux/amd64\n';;
+  esac
+fi
+exit 0
+STUBDOCKER
+  chmod +x "$TMP3/bin/docker"
+  cat > "$TMP3/bin/curl" <<'STUBCURL'
+#!/usr/bin/env bash
+case "$*" in
+  *releases/latest*) printf '%s' '{"tag_name":"v1.66.1"}' ;;
+  *ghcr.io/token*) printf '%s' '{"token":"teste"}' ;;
+  *ghcr.io/v2/*) printf 200 ;;
+  *) printf 200 ;;
+esac
+STUBCURL
+  chmod +x "$TMP3/bin/curl"
   dublar_uname_amd64 "$TMP3/bin"
   cat > "$TMP3/supabase-provision.sh" <<'PROV'
 #!/usr/bin/env bash
@@ -445,13 +607,16 @@ PROV
 
   saida="$(cd "$TMP3/proj" && env PATH="$TMP3/bin:$PATH" MARCA="$MARCA" \
     SUPABASE_ACCESS_TOKEN=fake NEXT_PUBLIC_SUPABASE_URL= \
+    DESKCOMM_RELEASES_LATEST_URL=https://example.invalid/releases/latest \
     bash "$TMP3/install.sh" --yes 2>&1 || true)"
 
   # Sem esta checagem o teste passaria por VACUIDADE: se o install.sh morresse
   # antes do bloco (stub quebrado, refactor movendo o trecho), nada executaria o
   # veneno e o silêncio seria lido como aprovação.
-  if ! printf '%s' "$saida" | grep -q "credenciais entraram sozinhas"; then
-    printf '  ✗ o install.sh não chegou ao bloco do Supabase — teste inconclusivo, não verde\n'; exit 1
+  if ! grep -q "credenciais entraram sozinhas" <<<"$saida"; then
+    printf '  ✗ o install.sh não chegou ao bloco do Supabase — teste inconclusivo, não verde\n'
+    printf '%s\n' "$saida" | tail -12
+    exit 1
   fi
   if [ -e "$MARCA" ]; then
     printf '  ✗ o install.sh INTERPRETOU a saída do provisionamento (eval/source no ponto de chamada?)\n'; exit 1
@@ -880,7 +1045,7 @@ CRONTAB_VIZINHO='0 8 * * * /root/trend-radar/run_full_vps.sh
 cron_ok() {  # cron_ok <descrição> <esperado_no_resultado> <marcador> <legado> <linha_nova>
   local desc="$1" espera="$2" marcador="$3" legado="$4" nova="$5" out
   out="$(printf '%s\n' "$CRONTAB_VIZINHO" | cron_merge "$marcador" "$legado" "$nova")"
-  if printf '%s' "$out" | grep -qF -e "$espera"; then printf '  ✓ %s\n' "$desc"
+  if grep -qF -e "$espera" <<<"$out"; then printf '  ✓ %s\n' "$desc"
   else printf '  ✗ %s\n     sumiu do crontab: %s\n' "$desc" "$espera"; fail=1; fi
 }
 NOVO_TAG='# deskcomm:/root/instalacao-nova'
@@ -993,7 +1158,7 @@ echo "provisionamento do Supabase: senha do banco"
 saida="$(SUPABASE_ACCESS_TOKEN=token-invalido-de-teste SUPABASE_ORG_ID=org-de-teste \
          SUPABASE_PROVISION_STATE="$SUITE_TMP/senha-do-teste.env" \
          bash ./supabase-provision.sh "Projeto de Teste" sa-east-1 2>&1 || true)"
-if printf '%s' "$saida" | grep -q 'Criando o projeto'; then
+if grep -q 'Criando o projeto' <<<"$saida"; then
   printf '  ✓ o script passa da geração da senha e chega ao passo de criar\n'
 else
   printf '  ✗ o script MORREU antes de criar o projeto (o defeito voltou)\n'
@@ -1201,14 +1366,14 @@ if [ $rc_me -ne 0 ]; then
 else
   printf '  ✓ sem token: sai 0 (a instalação continua)\n'
 fi
-if printf '%s' "$saida_me" | grep -q 'SUPABASE_ACCESS_TOKEN'; then
+if grep -q 'SUPABASE_ACCESS_TOKEN' <<<"$saida_me"; then
   printf '  ✓ sem token: diz qual é a chave que falta\n'
 else
   printf '  ✗ sem token: a mensagem não nomeia SUPABASE_ACCESS_TOKEN\n'; fail=1
 fi
 # O passo manual tem de ensinar `&`. Foi um `?` nesta mesma receita (na doc de
 # deploy) que gravou o link quebrado no projeto de produção.
-if printf '%s' "$saida_me" | grep -q '{{ .RedirectTo }}&token_hash'; then
+if grep -q '{{ .RedirectTo }}&token_hash' <<<"$saida_me"; then
   printf '  ✓ sem token: o passo manual ensina o separador & (nunca ?)\n'
 else
   printf '  ✗ sem token: o passo manual não mostra o link com &\n'; fail=1
@@ -1218,7 +1383,7 @@ fi
 #     o certo é ensinar o caminho do GoTrue, não tentar um PATCH que não existe.
 saida_me="$(SUPABASE_ACCESS_TOKEN=sbp_de_teste NEXT_PUBLIC_SUPABASE_URL=https://supabase.meucliente.com.br \
             bash ./marca-emails.sh --env /dev/null 2>&1)"; rc_me=$?
-if [ $rc_me -eq 0 ] && printf '%s' "$saida_me" | grep -q 'GOTRUE_MAILER_TEMPLATES'; then
+if [ $rc_me -eq 0 ] && grep -q 'GOTRUE_MAILER_TEMPLATES' <<<"$saida_me"; then
   printf '  ✓ Supabase próprio: sai 0 e manda para o caminho do GoTrue\n'
 else
   printf '  ✗ Supabase próprio: rc=%s, mensagem sem GOTRUE_MAILER_TEMPLATES\n' "$rc_me"; fail=1
@@ -1490,7 +1655,16 @@ rt_ok() {  # rt_ok <descrição> <esperado> <netmode> <redes do contêiner> <bri
 # devolve o nome dela nos dois campos; modo host devolve "host" nos dois.
 rt_ok "Traefik em bridge própria → a rede DELE"  coolify    coolify    "coolify "        crm_proxy
 rt_ok "Traefik na bridge default → bridge"       bridge     bridge     "bridge "         crm_proxy
-rt_ok "Traefik em 2 redes → a primeira"          coolify    coolify    "coolify web "    crm_proxy
+rt_ok "Traefik em 2 redes com a coolify → coolify" coolify    coolify    "coolify web "    crm_proxy
+# O docker devolve as redes em ORDEM ALFABÉTICA (o template percorre um mapa), e
+# "a primeira" era a rede que vence o sorteio do alfabeto, não a que o painel usa
+# para os sites. Medido numa VPS com Coolify: com uma rede "aaa-simulado"
+# pendurada no coolify-proxy, a descoberta devolveu aaa-simulado.
+rt_ok "2 redes, coolify NÃO é a primeira → coolify" coolify coolify   "aaa-simulado coolify " crm_proxy
+# Sem a coolify entre elas não há como saber qual é a do proxy: vazio, e quem
+# chama recusa mandando declarar TRAEFIK_NETWORK. Chutar pode ligar o CRM à rede
+# de outro projeto, ou a uma rede `internal` que derruba o `up -d`.
+rt_ok "2 redes sem a coolify → não escolhe (vazio)" ''      rede-a     "rede-a rede-b "  crm_proxy
 # ESTE é o defeito da issue #139: em modo host `.NetworkSettings.Networks` devolve
 # a string "host", que é uma rede de driver `host` — gravá-la em TRAEFIK_NETWORK
 # mata o `up -d` com "network host declared as external, but could not be found".
@@ -1669,6 +1843,45 @@ STUB
 npm_rede_e2e "rede do NPM presente: install/update seguem"        segue 0
 npm_rede_e2e "rede do NPM sumiu (prune/down -v): morre explicando" morre 1
 
+echo "proxy reverso: Cloudflare Tunnel (atrás de NAT)"
+# Como o NPM, o cloudflared é sempre declarado à mão no .env — não há nada para
+# detectar. O que se prova é o CALL SITE (dc()/dc_files() entram o override) e
+# que garantir_rede_do_proxy NÃO exige rede externa: o cloudflared sobe na rede
+# interna do próprio compose.
+if REVERSE_PROXY=cloudflared dc_files | grep -q 'docker-compose.cloudflared.yml'; then
+  printf '  ✓ dc_files() entra o docker-compose.cloudflared.yml com REVERSE_PROXY=cloudflared\n'
+else
+  printf '  ✗ dc_files() não entrou o docker-compose.cloudflared.yml (deu: %s)\n' \
+    "$(REVERSE_PROXY=cloudflared dc_files)"; fail=1
+fi
+if REVERSE_PROXY=caddy dc_files | grep -q 'docker-compose.cloudflared.yml'; then
+  printf '  ✗ dc_files() entrou o override do Cloudflare SEM REVERSE_PROXY=cloudflared (vacuidade)\n'; fail=1
+else
+  printf '  ✓ REVERSE_PROXY=caddy (default): dc_files() não menciona o override do Cloudflare\n'
+fi
+# garantir_rede_do_proxy com cloudflared não pode nem olhar rede externa: não há
+# nenhuma. O dublê responde "inexistente" para qualquer inspect — se a função
+# tentasse conferir, morreria pedindo TRAEFIK_NETWORK.
+_cloudflared_rede() {  # → segue | morre
+  local dir real kit="$PWD"
+  dir="$(mktemp -d)"; mkdir -p "$dir/bin"
+  cat > "$dir/bin/docker" <<STUB
+#!/usr/bin/env bash
+exit 1
+STUB
+  chmod +x "$dir/bin/docker"
+  if (cd "$dir" && env PATH="$dir/bin:$PATH" REVERSE_PROXY=cloudflared PROJECT_DIR="$dir" \
+        bash -c '. "$1/_common.sh"; garantir_rede_do_proxy' _ "$kit") >/dev/null 2>&1
+  then real=segue; else real=morre; fi
+  rm -rf "$dir"
+  printf '%s' "$real"
+}
+if [ "$(_cloudflared_rede)" = segue ]; then
+  printf '  ✓ cloudflared não exige rede externa: garantir_rede_do_proxy segue sem tocar o Docker\n'
+else
+  printf '  ✗ cloudflared tentou conferir rede externa e morreu (não usa nenhuma)\n'; fail=1
+fi
+
 echo "proxy reverso: quanta confiança a eleição merece"
 # A eleição por porta publicada traz a evidência (a coluna Ports diz ':80->'); a
 # varredura por modo host não traz nenhuma — em modo host a coluna é vazia para
@@ -1726,11 +1939,30 @@ montar_vps() {
   # topo, igual ao `_common.sh`. Sem eles aqui, o script morre na LINHA 21 — antes
   # de qualquer mensagem — e todo cenario reporta "o update.sh nao chegou ao
   # banco / ao fim / ao up -d", que le como defeito do produto e e cenario faltando.
-  cp install.sh update.sh backup.sh _common.sh _i18n.sh marca-emails.sh manutencao.sh "$raiz/"
+  cp install.sh update.sh backup.sh _common.sh _manifestos.sh _i18n.sh marca-emails.sh manutencao.sh "$raiz/"
   cp -R manutencao "$raiz/"
   : > "$VPS_PROJ/docker-compose.prod.yml"
   cat > "$raiz/bin/docker"
-  # Só o v_supabase_url exige resposta online (000 reprova); os outros toleram.
+  # O corpo fornecido por cada cenário continua cuidando de compose/exec.
+  # O wrapper só dublê o registry OCI que o preflight novo consulta.
+  mv "$raiz/bin/docker" "$raiz/bin/docker-inner"
+  cat > "$raiz/bin/docker" <<'STUBOCI'
+#!/usr/bin/env bash
+if [ "${1:-}" = buildx ] && [ "${2:-}" = imagetools ] && [ "${3:-}" = inspect ]; then
+  case " $* " in
+    *' --raw '*)
+      if [ -n "${DUBLE_MANIFEST:-}" ]; then printf '%s' "$DUBLE_MANIFEST"
+      else printf '%s' '{"schemaVersion":2,"manifests":[{"platform":{"os":"linux","architecture":"amd64"}},{"platform":{"os":"linux","architecture":"arm64"}}]}'
+      fi ;;
+    *) printf 'linux/amd64\nlinux/arm64\n' ;;
+  esac
+  exit 0
+fi
+exec "$(dirname "$0")/docker-inner" "$@"
+STUBOCI
+  chmod +x "$raiz/bin/docker-inner"
+  # Só o v_supabase_url exige resposta online (000 reprova, e quem responde tem
+  # de ser o GoTrue — o ramo `*auth/v1/verify*`); os outros toleram.
   #
   # O dublê fala DOIS protocolos porque o install.sh passou a sondar o GHCR
   # antes de pinar as imagens (`ghcr_status`/`trio_publicado` no _common.sh): o
@@ -1744,8 +1976,11 @@ montar_vps() {
   cat > "$raiz/bin/curl" <<'STUBCURL'
 #!/usr/bin/env bash
 case "$*" in
+  *releases/latest*) printf '{"tag_name":"%s"}' "${DUBLE_RELEASE_TAG:-v1.66.1}" ;;
   *ghcr.io/token*) printf '{"token":"dublê"}' ;;
   *ghcr.io/v2/*)   printf '%s' "${DUBLE_GHCR:-200}" ;;
+  # O v_supabase_url exige o GoTrue: o JSON de /auth/v1/verify sem parâmetros.
+  *auth/v1/verify*) printf '{"msg":"Verify requires a verification type"}\n400' ;;
   *)               printf 200 ;;
 esac
 STUBCURL
@@ -1801,16 +2036,18 @@ STUB
 # partir de um .env de mentira. O cenário declara o próprio ambiente.
 rodar() {
   local script="$1" flags="$2"
+  local -a release_env=()
+  [ "$script" = install.sh ] && release_env=(DESKCOMM_RELEASES_LATEST_URL=https://api.github.com/repos/exemplo/releases/latest)
   printf '%s\n%s\n' "$BASE_ENV" "${3-}" > "$VPS_PROJ/.env"
   : > "$VPS_LOG"
   if [ $# -ge 4 ]; then
     printf '%s' "$4" > "$VPS_RAIZ/respostas.txt"
     (cd "$VPS_PROJ" && env PATH="$VPS_RAIZ/bin:$PATH" DOCKER_LOG="$VPS_LOG" CRONTAB_SANDBOX="$CRONTAB_SANDBOX" \
-      SUPABASE_ACCESS_TOKEN= \
+      SUPABASE_ACCESS_TOKEN= "${release_env[@]}" \
       bash "$VPS_RAIZ/$script" $flags <"$VPS_RAIZ/respostas.txt" 2>&1 || true) | sed -E 's/\x1b\[[0-9;]*m//g'
   else
     (cd "$VPS_PROJ" && env PATH="$VPS_RAIZ/bin:$PATH" DOCKER_LOG="$VPS_LOG" CRONTAB_SANDBOX="$CRONTAB_SANDBOX" \
-      SUPABASE_ACCESS_TOKEN= \
+      SUPABASE_ACCESS_TOKEN= "${release_env[@]}" \
       bash "$VPS_RAIZ/$script" $flags 2>&1 || true) | sed -E 's/\x1b\[[0-9;]*m//g'
   fi
 }
@@ -1821,6 +2058,7 @@ rodar() {
 chegou_na_deteccao() {
   grep -q -- '-p 80:80' "$VPS_LOG" && return 0
   printf '  ✗ o install.sh não chegou a testar a porta 80 — teste inconclusivo, não verde\n'
+  printf '     causas: %s\n' "$(printf '%s\n' "${saida:-}" | grep -E '✖|Manifesto|Registro|WAHA_IMAGE|release' | head -5 | tr '\n' ' ')"
   return 1
 }
 # As RESPOSTAS do modo interativo, na ordem em que o instalador pergunta: o
@@ -2112,8 +2350,9 @@ esac
 exit 0
 STUB
   export REPO_URL="$origem"
+  export DUBLE_RELEASE_TAG=v1.10.0
   rodar install.sh --yes >/dev/null
-  unset REPO_URL
+  unset REPO_URL DUBLE_RELEASE_TAG
 
   for par in "APP_IMAGE:deskcommcrm" "WORKER_IMAGE:deskcomm-worker" "SCHEDULER_IMAGE:deskcomm-scheduler"; do
     chave="${par%%:*}"; repo="${par##*:}"
@@ -2172,7 +2411,7 @@ STUB
   saida="$(rodar install.sh --yes)"
   unset DUBLE_GHCR REPO_URL
 
-  if ! printf '%s' "$saida" | grep -q "construídas neste servidor"; then
+  if ! grep -q "construídas neste servidor" <<<"$saida"; then
     printf '  ✗ com as imagens inalcançáveis, o instalador não avisou que ia construir aqui\n'
     printf '     silêncio aqui é o defeito: o dono não descobre que duas peças saíram do fonte local.\n'
     exit 1
@@ -2227,7 +2466,7 @@ STUB
     saida="$(cd "$raiz/crmia" && env PATH="$raiz/bin:$PATH" DOCKER_LOG="$raiz/docker.log" \
       CRONTAB_SANDBOX="$CRONTAB_SANDBOX" bash "$raiz/install.sh" --yes 2>&1 || true \
       | sed -E 's/\x1b\[[0-9;]*m//g')"
-    if printf '%s' "$saida" | grep -q 'comando não encontrado\|command not found'; then
+    if grep -q 'comando não encontrado\|command not found' <<<"$saida"; then
       printf '  ✗ %s — o instalador chamou um comando que não existe:\n' "$desc"
       printf '%s\n' "$saida" | grep 'comando não encontrado\|command not found' | head -2 | sed 's/^/       /'
       exit 1
@@ -2301,20 +2540,21 @@ STUB
     : > "$VPS_LOG"
     (cd "$VPS_PROJ" && env PATH="$VPS_RAIZ/bin:$PATH" DOCKER_LOG="$VPS_LOG" \
       CRONTAB_SANDBOX="$CRONTAB_SANDBOX" SUPABASE_ACCESS_TOKEN= \
+      ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY= AI_GATEWAY_API_KEY= \
       bash "$VPS_RAIZ/install.sh" --yes 2>&1 || true) | sed -E 's/\x1b\[[0-9;]*m//g'
   }
 
   saida="$(rodar_sem_ia)"
 
   # A marca do defeito: com o campo obrigatório, o instalador morre aqui.
-  if printf '%s' "$saida" | grep -q 'exige .env preenchido'; then
+  if grep -q 'exige .env preenchido' <<<"$saida"; then
     printf '  ✗ o instalador ainda morre sem chave de IA — o campo do provedor não é `opcional`\n'
     printf '     %s\n' "$(printf '%s' "$saida" | grep -m1 'exige .env preenchido')"
     exit 1
   fi
   # CONTROLE POSITIVO: "não morreu" só significa alguma coisa se a instalação
   # chegou ao fim; sem esta âncora, um install que parasse antes passaria.
-  if ! printf '%s' "$saida" | grep -q 'Instalação concluída'; then
+  if ! grep -q 'Instalação concluída' <<<"$saida"; then
     printf '  ✗ a instalação sem chave de IA não chegou à tela final — cenário inconclusivo, não verde\n'
     printf '     última linha: %s\n' "$(printf '%s' "$saida" | grep -v '^$' | tail -1)"
     exit 1
@@ -2340,13 +2580,29 @@ STUB
   # "Instalação concluída"), como no caso do Site URL: é a única tela que a
   # pessoa lê inteira, e um aviso no meio do log de dez minutos não conta.
   rabo="${saida##*Instalação concluída}"
-  if ! printf '%s' "$rabo" | grep -q 'A IA ainda não atende'; then
-    printf '  ✗ a tela final não avisa que a IA ainda não atende\n'; exit 1
+  if ! grep -q 'A IA ainda não atende' <<<"$rabo"; then
+    printf '  ✗ a tela final não avisa que a IA ainda não atende\n'
+    printf '     últimas linhas da saída:\n'
+    printf '%s\n' "$saida" | grep -v '^$' | tail -15 | sed 's/^/       /'
+    exit 1
   fi
-  if ! printf '%s' "$rabo" | grep -q 'IA › Credenciais'; then
+  if ! grep -q 'IA › Credenciais' <<<"$rabo"; then
     printf '  ✗ o aviso da tela final não diz ONDE cadastrar a chave (IA › Credenciais)\n'; exit 1
   fi
   printf '  ✓ sem chave de IA: instala, .env inteiro, e a tela final dá o caminho de volta\n'
+
+  # O MESMO rabo lembra o caminho do ENVIO de e-mail (issue #1110): sem Resend
+  # nem SMTP, o convite e o PDF de LGPD não saem, e a tela final diz onde ligar.
+  if ! grep -q 'O envio de e-mail ainda não funciona' <<<"$rabo"; then
+    printf '  ✗ a tela final não avisa que o envio de e-mail ainda não funciona\n'
+    printf '     últimas linhas da saída:\n'
+    printf '%s\n' "$saida" | grep -v '^$' | tail -15 | sed 's/^/       /'
+    exit 1
+  fi
+  if ! grep -q 'Admin → E-mail' <<<"$rabo"; then
+    printf '  ✗ o aviso da tela final não diz ONDE configurar o envio (Admin → E-mail)\n'; exit 1
+  fi
+  printf '  ✓ sem Resend/SMTP: a tela final dá o caminho do envio de e-mail\n'
 
   # ── O outro lado: com a chave, o aviso NÃO aparece ────────────────────────
   # Sem isto, um `pendencia_da_ia` que imprimisse sempre passaria no caso acima
@@ -2354,15 +2610,31 @@ STUB
   # de `provedor_ok` logo acima.
   printf '%s\n' "$BASE_ENV" > "$VPS_PROJ/.env"
   saida="$(rodar_sem_ia)"
-  if ! printf '%s' "$saida" | grep -q 'Instalação concluída'; then
+  if ! grep -q 'Instalação concluída' <<<"$saida"; then
     printf '  ✗ (controle) a segunda rodada, com chave, não chegou à tela final — cenário inconclusivo\n'
     exit 1
   fi
-  rabo="${saida##*Instalação concluída}"
-  if printf '%s' "$rabo" | grep -q 'A IA ainda não atende'; then
-    printf '  ✗ com a chave presente, a tela final avisou que falta chave de IA\n'; exit 1
+  if grep -q 'A IA ainda não atende' <<<"$saida"; then
+    printf '  ✗ com a chave presente, a tela final avisou que falta chave de IA\n'
+    printf '     (o instalador recebeu a chave do .env mas o aviso da pendência saiu mesmo assim)\n'; exit 1
   fi
   printf '  ✓ com a chave presente, o lembrete não aparece (o aviso não é ruído permanente)\n'
+
+  # ── O outro lado do e-mail: com a Resend no .env, o aviso NÃO aparece ─────
+  # Mesma régua do controle da IA: um `pendencia_do_email` que imprimisse sempre
+  # viraria ruído em toda instalação que já manda e-mail.
+  printf '%s\nRESEND_API_KEY=%s\nRESEND_FROM_EMAIL=%s\n' \
+    "$BASE_ENV" "'re-teste'" "'eu@exemplo.com.br'" > "$VPS_PROJ/.env"
+  saida="$(rodar_sem_ia)"
+  if ! grep -q 'Instalação concluída' <<<"$saida"; then
+    printf '  ✗ (controle do e-mail) a rodada com Resend não chegou à tela final — cenário inconclusivo\n'
+    exit 1
+  fi
+  if grep -q 'O envio de e-mail ainda não funciona' <<<"$saida"; then
+    printf '  ✗ com a Resend no .env, a tela final avisou que falta envio de e-mail\n'
+    printf '     (o instalador recebeu a chave do .env mas o aviso da pendência saiu mesmo assim)\n'; exit 1
+  fi
+  printf '  ✓ com a Resend no .env, o lembrete do envio não aparece\n'
 ) || fail=1
 rm -rf "$TMP_SEM_IA"
 
@@ -2482,14 +2754,14 @@ STUB
   # achar: a recusa nomeia o contêiner encontrado e ensina a saída.
   saida="$(rodar install.sh --yes)"
   chegou_na_deteccao || exit 1
-  if printf '%s' "$saida" | grep -q 'já estão ocupadas'; then
+  if grep -q 'já estão ocupadas' <<<"$saida"; then
     printf '  ✗ caiu no painel genérico: a varredura de modo host não achou o Traefik\n'
     printf '     %s\n' "$(printf '%s' "$saida" | grep -m1 'já estão ocupadas')"; exit 1
   fi
-  if ! printf '%s' "$saida" | grep -q "traefik-hostinger"; then
+  if ! grep -q "traefik-hostinger" <<<"$saida"; then
     printf '  ✗ a recusa não nomeia o Traefik encontrado — quem lê não sabe o que confirmar\n'; exit 1
   fi
-  if ! printf '%s' "$saida" | grep -q 'REVERSE_PROXY=traefik'; then
+  if ! grep -q 'REVERSE_PROXY=traefik' <<<"$saida"; then
     printf '  ✗ a recusa não ensina a saída (REVERSE_PROXY=traefik no .env)\n'; exit 1
   fi
   if grep -qE '^TRAEFIK_NETWORK=' "$PROJ/.env"; then
@@ -2505,7 +2777,7 @@ STUB
   # um terminal, e prender o teste à prosa é prender o comportamento à redação.
   saida="$(rodar install.sh "" "" "s${RESTO_DAS_PERGUNTAS}")"
   chegou_na_deteccao || exit 1
-  if ! printf '%s' "$saida" | grep -q 'traefik-hostinger'; then
+  if ! grep -q 'traefik-hostinger' <<<"$saida"; then
     printf '  ✗ o instalador nem mostrou o que encontrou antes de agir\n'; exit 1
   fi
   # A rede é EXTERNA no compose: se não existir, o `up -d` morre em "declared as
@@ -2551,7 +2823,7 @@ STUB
   # explícita no .env já é a resposta, inclusive em --yes.
   saida="$(rodar install.sh --yes "REVERSE_PROXY='traefik'")"
   chegou_na_deteccao || exit 1
-  if printf '%s' "$saida" | grep -q 'Não consegui descobrir a rede'; then
+  if grep -q 'Não consegui descobrir a rede' <<<"$saida"; then
     printf '  ✗ com REVERSE_PROXY=traefik no .env o instalador morre sem achar a rede\n'; exit 1
   fi
   if ! grep -qx 'TRAEFIK_NETWORK="crmhost_teste_proxy"' "$PROJ/.env"; then
@@ -2599,16 +2871,16 @@ STUB
 
   # 1. Recusa. O sintoma do defeito era instalar em silêncio; qualquer coisa que
   #    não seja parar aqui é o defeito de volta.
-  if ! printf '%s' "$saida" | grep -q 'Já existe um DeskcommCRM NO AR'; then
+  if ! grep -q 'Já existe um DeskcommCRM NO AR' <<<"$saida"; then
     printf '  ✗ NÃO recusou a instalação por cima da que está no ar\n'
     printf '     últimas linhas: %s\n' "$(printf '%s' "$saida" | tail -3 | tr '\n' ' ')"; exit 1
   fi
   # 2. Nomeia a árvore do OUTRO — sem isso quem lê não sabe qual pasta usar.
-  if ! printf '%s' "$saida" | grep -q '/root/DeskcommCRM'; then
+  if ! grep -q '/root/DeskcommCRM' <<<"$saida"; then
     printf '  ✗ a recusa não diz ONDE está a instalação que já existe\n'; exit 1
   fi
   # 3. Ensina a saída acionável (atualizar a que existe).
-  if ! printf '%s' "$saida" | grep -q 'update.sh'; then
+  if ! grep -q 'update.sh' <<<"$saida"; then
     printf '  ✗ a recusa não ensina o caminho (update.sh na pasta que já existe)\n'; exit 1
   fi
   # 4. Recusou de verdade: não pode ter subido nada. `up -d` depois da recusa
@@ -2622,7 +2894,7 @@ STUB
   # da árvore que É a dona. Isto é re-execução legítima — o caminho que o kit
   # ensina para corrigir uma resposta — e tem de seguir. Sem este par, bastaria
   # bloquear tudo para o teste acima ficar verde.
-  cat > "$VPS_RAIZ/bin/docker" <<STUB2
+  cat > "$VPS_RAIZ/bin/docker-inner" <<STUB2
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "\$DOCKER_LOG"
 case "\$1" in
@@ -2637,10 +2909,10 @@ case "\$1" in
 esac
 exit 0
 STUB2
-  chmod +x "$VPS_RAIZ/bin/docker"
+  chmod +x "$VPS_RAIZ/bin/docker-inner"
   saida="$(rodar install.sh --yes)"
   chegou_na_deteccao || exit 1
-  if printf '%s' "$saida" | grep -q 'Já existe um DeskcommCRM NO AR'; then
+  if grep -q 'Já existe um DeskcommCRM NO AR' <<<"$saida"; then
     printf '  ✗ bloqueou a RE-EXECUÇÃO legítima (mesma árvore) — o kit manda rodar de novo\n'; exit 1
   fi
   printf '  ✓ e a re-execução de dentro da própria árvore continua passando\n'
@@ -2677,7 +2949,7 @@ exit 0
 STUB
   saida="$(rodar install.sh --yes)"
   chegou_na_deteccao || exit 1
-  if printf '%s' "$saida" | grep -q 'paro aqui em vez de chutar'; then
+  if grep -q 'paro aqui em vez de chutar' <<<"$saida"; then
     printf '  ✗ recusou uma eleição que TEM prova (a coluna Ports diz quem publica)\n'; exit 1
   fi
   if ! grep -qx 'TRAEFIK_NETWORK="coolify"' "$VPS_PROJ/.env"; then
@@ -2690,6 +2962,68 @@ STUB
   printf '  ✓ com prova na coluna Ports segue sem perguntar, e usa a rede do proxy\n'
 ) || fail=1
 rm -rf "$TMP5"
+
+echo "integração: Traefik pendurado em MAIS DE UMA rede Docker"
+# A função acima decide; este caso prova que o install.sh obedece à decisão —
+# inclusive à recusa, que só vale se o instalador PARAR em vez de cair num
+# default. As redes do proxy vêm de REDES_DO_PROXY para a mesma VPS servir aos
+# três desfechos.
+TMP_REDES="$(mktemp -d)"
+(
+  montar_vps "$TMP_REDES" "crmredes" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+case "$1" in
+  compose) case "$*" in *" exec "*) printf 'healthy\n{"data":{"status":"healthy"}}\n' ;; esac; exit 0 ;;
+  run)     case "$*" in *--entrypoint*) exit 1 ;; esac; exit 0 ;;
+  ps)      for a in "$@"; do [ "$a" = "network=host" ] && em_host=1; done
+           [ "${em_host:-0}" = 1 ] && exit 0
+           printf 'coolify-proxy|coolify|traefik:v3.3|0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp\n'
+           exit 0 ;;
+  inspect) case "$*" in *NetworkMode*) printf '%s\n' "${REDES_DO_PROXY%% *}";; *Networks*) printf '%s \n' "$REDES_DO_PROXY";; esac; exit 0 ;;
+  network) case "$2" in inspect) printf 'bridge\n' ;; esac; exit 0 ;;
+esac
+exit 0
+STUB
+  export REDES_DO_PROXY="aaa-simulado coolify"
+  saida="$(rodar install.sh --yes)"
+  chegou_na_deteccao || exit 1
+  if ! grep -qx 'TRAEFIK_NETWORK="coolify"' "$VPS_PROJ/.env"; then
+    printf '  ✗ com aaa-simulado e coolify, TRAEFIK_NETWORK saiu %s (esperava coolify)\n' \
+      "$(grep -E '^TRAEFIK_NETWORK=' "$VPS_PROJ/.env" || echo '(ausente)')"; exit 1
+  fi
+  printf '  ✓ entre várias redes, prefere a coolify mesmo fora da ordem alfabética\n'
+
+  export REDES_DO_PROXY="rede-a rede-b"
+  saida="$(rodar install.sh --yes)"
+  chegou_na_deteccao || exit 1
+  if grep -qE '^TRAEFIK_NETWORK=' "$VPS_PROJ/.env"; then
+    printf '  ✗ sem a coolify escolheu às cegas: %s\n' "$(grep -E '^TRAEFIK_NETWORK=' "$VPS_PROJ/.env")"; exit 1
+  fi
+  if ! grep -q 'rede-a rede-b' <<<"$saida" || ! grep -q 'TRAEFIK_NETWORK=<nome>' <<<"$saida"; then
+    printf '  ✗ a recusa não nomeia as redes encontradas e/ou não manda declarar TRAEFIK_NETWORK\n'
+    printf '%s\n' "$saida" | tail -5 | sed 's/^/       /'; exit 1
+  fi
+  printf '  ✓ sem a coolify, para nomeando as redes e mandando declarar TRAEFIK_NETWORK\n'
+
+  saida="$(rodar install.sh --yes "TRAEFIK_NETWORK='rede-b'")"
+  chegou_na_deteccao || exit 1
+  if ! grep -qx 'TRAEFIK_NETWORK="rede-b"' "$VPS_PROJ/.env"; then
+    printf '  ✗ TRAEFIK_NETWORK declarado não venceu a descoberta: saiu %s\n' \
+      "$(grep -E '^TRAEFIK_NETWORK=' "$VPS_PROJ/.env" || echo '(ausente)')"; exit 1
+  fi
+  printf '  ✓ TRAEFIK_NETWORK declarado continua vencendo a descoberta\n'
+
+  # Exportado no ambiente (sem estar no .env) passa pela MESMA condição -z.
+  saida="$(TRAEFIK_NETWORK=rede-b rodar install.sh --yes)"
+  chegou_na_deteccao || exit 1
+  if ! grep -qx 'TRAEFIK_NETWORK="rede-b"' "$VPS_PROJ/.env"; then
+    printf '  ✗ TRAEFIK_NETWORK exportado não venceu a descoberta: saiu %s\n' \
+      "$(grep -E '^TRAEFIK_NETWORK=' "$VPS_PROJ/.env" || echo '(ausente)')"; exit 1
+  fi
+  printf '  ✓ TRAEFIK_NETWORK exportado no ambiente também vence a descoberta\n'
+) || fail=1
+rm -rf "$TMP_REDES"
 
 echo "DDL: a conexão do schema é separada da que vai para os contêineres (issue #192)"
 # `SUPABASE_DB_URL` acumulava dois papéis numa string só: ela vai para o `.env`
@@ -2892,7 +3226,7 @@ STUB
   saida="$(rodar install.sh --yes)"
 
   # Vacuidade: sem o ramo de schema existente, não há re-aplicação para medir.
-  if ! printf '%s' "$saida" | grep -q "schema já existe"; then
+  if ! grep -q "schema já existe" <<<"$saida"; then
     printf '  ✗ o install.sh não entrou no ramo de schema existente — teste inconclusivo, não verde\n'; exit 1
   fi
   n="$(grep -c -- '-f /b.sql' "$VPS_LOG")"
@@ -2900,11 +3234,11 @@ STUB
     printf '  ✗ esperava o baseline aplicado 2 vezes (deadlock, depois limpo); foram %s\n' "$n"; exit 1
   fi
   printf '  ✓ o deadlock da 1ª passada fez o install.sh aplicar o baseline de novo\n'
-  if ! printf '%s' "$saida" | grep -q "✓ schema re-aplicado"; then
+  if ! grep -q "✓ schema re-aplicado" <<<"$saida"; then
     printf '  ✗ a 2ª passada saiu limpa e a tela não disse ✓ schema re-aplicado:\n'
     printf '%s\n' "$saida" | grep -iE "schema|banco|deadlock" | sed 's/^/       /'; exit 1
   fi
-  if printf '%s' "$saida" | grep -q "NÃO são os esperados"; then
+  if grep -q "NÃO são os esperados" <<<"$saida"; then
     printf '  ✗ o deadlock da 1ª passada virou aviso, embora a 2ª tenha curado\n'; exit 1
   fi
   printf '  ✓ e o veredito é o da última passada: ✓ schema re-aplicado, sem aviso\n'
@@ -2936,14 +3270,14 @@ STUB
   export BASELINE_ESPERA_S=0
   saida="$(rodar install.sh --yes)"
 
-  if ! printf '%s' "$saida" | grep -q "schema já existe"; then
+  if ! grep -q "schema já existe" <<<"$saida"; then
     printf '  ✗ o install.sh não entrou no ramo de schema existente — teste inconclusivo, não verde\n'; exit 1
   fi
-  if ! printf '%s' "$saida" | grep -q "Erros no banco que NÃO são os esperados"; then
+  if ! grep -q "Erros no banco que NÃO são os esperados" <<<"$saida"; then
     printf '  ✗ a lista grande não chegou ao aviso de banco\n'; exit 1
   fi
   # A linha seguinte ao bloco do schema: se ela saiu, o instalador sobreviveu ao aviso.
-  if ! printf '%s' "$saida" | grep -q "verificação:"; then
+  if ! grep -q "verificação:" <<<"$saida"; then
     printf '  ✗ o instalador morreu no aviso de banco (a verificação de tabelas, logo depois, não saiu)\n'
     printf '%s\n' "$saida" | grep -iE "schema|banco|erro" | tail -5 | sed 's/^/       /'; exit 1
   fi
@@ -2988,26 +3322,164 @@ NEXT_PUBLIC_APP_URL='https://crm.exemplo.com.br'"
   dois="$(rodar update.sh "" "$extra")"
 
   # CONTROLE POSITIVO: sem chegar ao fim, a ausência do aviso não mede nada.
-  if ! printf '%s' "$um" | grep -q 'Atualização concluída'; then
+  if ! grep -q 'Atualização concluída' <<<"$um"; then
     printf '  ✗ o update.sh não chegou ao fim — cenário inconclusivo, não verde\n'
     printf '     última linha: %s\n' "$(printf '%s' "$um" | sed -E 's/\x1b\[[0-9;]*m//g' | grep -v '^$' | tail -1)"
     exit 1
   fi
-  if ! printf '%s' "$um" | grep -q 'URL Configuration'; then
+  if ! grep -q 'URL Configuration' <<<"$um"; then
     printf '  ✗ a 1ª atualização passou calada pelo Site URL — quem já instalou não fica sabendo\n'
     printf '     (o Site URL dele está em localhost:3000 e ninguém consegue redefinir a senha)\n'
     exit 1
   fi
   # O domínio PREENCHIDO, não um placeholder.
-  if ! printf '%s' "$um" | grep -q 'https://crm.exemplo.com.br/auth/confirm'; then
+  if ! grep -q 'https://crm.exemplo.com.br/auth/confirm' <<<"$um"; then
     printf '  ✗ o aviso não traz o domínio preenchido — quem lê não sabe o que escrever\n'; exit 1
   fi
-  if printf '%s' "$dois" | grep -q 'URL Configuration'; then
+  if grep -q 'URL Configuration' <<<"$dois"; then
     printf '  ✗ a 2ª atualização repetiu o aviso — atualização que resmunga ensina a ignorar a saída\n'; exit 1
   fi
   printf '  ✓ a 1ª atualização avisa (com o domínio preenchido) e a 2ª fica calada\n'
 ) || fail=1
 rm -rf "$TMP_AVISO"
+
+echo "e-mails de acesso: o aviso da 1ª atualização respeita a topologia"
+# O aviso acima é o da NUVEM (painel do Supabase + token sbp_). Ele saía em TODA
+# topologia — o install.sh nunca cria o marcador —, e mandava quem tem o
+# Supabase na própria VPS a outra conta. Pelo update.sh inteiro, até o fim:
+#   - Supabase próprio fora do kit: confere SITE_URL no .env DELE, sem sbp_;
+#   - single-server: nada a conferir (o kit grava SITE_URL e
+#     ADDITIONAL_REDIRECT_URLS), nenhum aviso.
+TMP_AVISO_TOPO="$(mktemp -d)"
+(
+  montar_vps "$TMP_AVISO_TOPO" "crmtopo" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+case "$1" in
+  compose) case "$*" in *" exec "*) printf 'healthy\n{"data":{"status":"healthy"}}\n' ;; esac; exit 0 ;;
+esac
+exit 0
+STUB
+  cp supabase-single-server.override.yml "$TMP_AVISO_TOPO/"
+  mkdir -p "$VPS_PROJ/supabase"; : > "$VPS_PROJ/supabase/baseline.sql"
+  (cd "$VPS_PROJ" && git init -q -b main . \
+    && git -c user.email=t@exemplo -c user.name=teste add -A \
+    && git -c user.email=t@exemplo -c user.name=teste commit -qm base \
+    && git tag v9.9.9) >/dev/null 2>&1
+  unset SUPABASE_ACCESS_TOKEN
+
+  proprio="$(rodar update.sh "" "INTERNAL_SECRET='segredo-de-teste'
+NEXT_PUBLIC_APP_URL='https://crm.exemplo.com.br'
+NEXT_PUBLIC_SUPABASE_URL='https://supabase.meucliente.com.br'")"
+  rm -f "$VPS_PROJ/.deskcomm-site-url-avisado"
+  mkdir -p "$VPS_PROJ/.runtime/supabase"
+  printf '%s\n' "SITE_URL=https://crm.exemplo.com.br" > "$VPS_PROJ/.runtime/supabase/.env"
+  single="$(rodar update.sh "" "INTERNAL_SECRET='segredo-de-teste'
+NEXT_PUBLIC_APP_URL='https://crm.exemplo.com.br'
+NEXT_PUBLIC_SUPABASE_URL='https://crm.exemplo.com.br'
+SINGLE_SERVER=1")"
+
+  for par in "proprio:$proprio" "single:$single"; do
+    nome="${par%%:*}"; saida="${par#*:}"
+    # CONTROLE POSITIVO: sem chegar ao fim, a ausência do aviso não mede nada.
+    if ! grep -q 'Atualização concluída' <<<"$saida"; then
+      printf '  ✗ %s: o update.sh não chegou ao fim — cenário inconclusivo, não verde\n' "$nome"
+      printf '     última linha: %s\n' "$(printf '%s' "$saida" | grep -v '^$' | tail -1)"
+      exit 1
+    fi
+    if grep -qE 'sbp_|painel do Supabase' <<<"$saida"; then
+      printf '  ✗ %s: a 1ª atualização mandou buscar o token sbp_ / o painel da nuvem\n' "$nome"; exit 1
+    fi
+  done
+  if ! grep -q 'SITE_URL=https://crm.exemplo.com.br' <<<"$proprio"; then
+    printf '  ✗ Supabase próprio: o aviso não manda conferir o SITE_URL no .env dele\n'; exit 1
+  fi
+  if grep -q 'CONFIRA UMA COISA' <<<"$single"; then
+    printf '  ✗ single-server: o aviso do Site URL saiu, e o Site URL ali é do kit\n'; exit 1
+  fi
+  printf '  ✓ Supabase próprio confere o SITE_URL dele, single-server fica calado — nenhum pede sbp_\n'
+) || fail=1
+rm -rf "$TMP_AVISO_TOPO"
+
+echo "e-mails de acesso: o single-server fica calado já na atualização que traz o conserto"
+# Na atualização que traz o conserto, quem roda é o update.sh ANTIGO (o bash lê
+# o arquivo que abriu; o checkout troca o inode), com o texto da nuvem embutido.
+# O que ele faz depois do checkout é reler o _common.sh NOVO e chamar
+# atualizar_supabase_single_server — ANTES de decidir o aviso pelo marcador. É
+# no corpo dela que o marcador nasce, ou o single-server lê o sbp_ uma última vez.
+#
+# O antigo é o update.sh de hoje com o bloco do aviso trocado pelo texto que ele
+# embutia até a v. que trouxe aviso_do_site_url (main c71a27af7): medido em
+# 2026-10-08, a reconstrução é byte a byte o update.sh daquele commit. Fica
+# reconstruído, e não por `git show`, porque o CI faz checkout raso.
+TMP_AVISO_ANTIGO="$(mktemp -d)"
+(
+  montar_vps "$TMP_AVISO_ANTIGO" "crmantigo" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+case "$1" in
+  compose) case "$*" in *" exec "*) printf 'healthy\n{"data":{"status":"healthy"}}\n' ;; esac; exit 0 ;;
+esac
+exit 0
+STUB
+  cp supabase-single-server.override.yml "$TMP_AVISO_ANTIGO/"
+  mkdir -p "$VPS_PROJ/supabase" "$VPS_PROJ/.runtime/supabase"; : > "$VPS_PROJ/supabase/baseline.sql"
+  printf '%s\n' "SITE_URL=https://crm.exemplo.com.br" > "$VPS_PROJ/.runtime/supabase/.env"
+  (cd "$VPS_PROJ" && git init -q -b main . \
+    && git -c user.email=t@exemplo -c user.name=teste add -A \
+    && git -c user.email=t@exemplo -c user.name=teste commit -qm base \
+    && git tag v9.9.9) >/dev/null 2>&1
+  VELHO="$(cat <<'VELHO'
+    DOM_AVISO="$(printf '%s' "${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}")"
+    cat <<AVISO
+
+$(c_ylw "  ─── CONFIRA UMA COISA, UMA VEZ SÓ ─────────────────────")
+
+  Os e-mails de acesso (esqueci minha senha, confirmação de cadastro,
+  aceite de convite) levam para o endereço que estiver em Authentication
+  → URL Configuration, no painel do Supabase. Instalações feitas antes de
+  o instalador perguntar o token do Supabase ficaram com o padrão de
+  projeto novo, \`http://localhost:3000\`, que só existe na máquina de
+  quem desenvolve — e aí ninguém consegue redefinir a própria senha.
+
+  Vale conferir. Se já estiver com os valores abaixo, não há nada a fazer:
+
+       Site URL:       ${DOM_AVISO}
+       Redirect URLs:  ${DOM_AVISO%/}/auth/confirm
+
+  Este aviso não se repete — para o instalador cuidar disso sozinho, rode
+  o update com \`export SUPABASE_ACCESS_TOKEN=sbp_...\` no ambiente.
+AVISO
+VELHO
+)"
+  # ENVIRON, e não `awk -v`: o -v interpreta as barras do \` do texto.
+  VELHO="$VELHO" awk '
+    /^    # O texto depende da topologia \(single-server/ { next }
+    /^    # ver aviso_do_site_url, em _common\.sh\./        { next }
+    /^    aviso_do_site_url /                               { print ENVIRON["VELHO"]; next }
+    { print }' update.sh > "$TMP_AVISO_ANTIGO/update.sh"
+  # CONTROLE: sem a troca, o cenário mediria o update.sh novo outra vez.
+  if grep -q 'aviso_do_site_url' "$TMP_AVISO_ANTIGO/update.sh" \
+     || ! grep -qF 'export SUPABASE_ACCESS_TOKEN=sbp_' "$TMP_AVISO_ANTIGO/update.sh"; then
+    printf '  ✗ não consegui reconstruir o update.sh antigo — cenário inconclusivo, não verde\n'; exit 1
+  fi
+  unset SUPABASE_ACCESS_TOKEN
+
+  single="$(rodar update.sh "" "INTERNAL_SECRET='segredo-de-teste'
+NEXT_PUBLIC_APP_URL='https://crm.exemplo.com.br'
+NEXT_PUBLIC_SUPABASE_URL='https://crm.exemplo.com.br'
+SINGLE_SERVER=1")"
+  if ! grep -q 'Atualização concluída' <<<"$single"; then
+    printf '  ✗ o update.sh antigo não chegou ao fim — cenário inconclusivo, não verde\n'
+    printf '     última linha: %s\n' "$(printf '%s' "$single" | grep -v '^$' | tail -1)"
+    exit 1
+  fi
+  if grep -qE 'CONFIRA UMA COISA|sbp_' <<<"$single"; then
+    printf '  ✗ single-server: o update.sh antigo + _common.sh novo ainda mandou buscar o token sbp_\n'; exit 1
+  fi
+  printf '  ✓ update.sh antigo + _common.sh novo: o single-server não vê o aviso sbp_\n'
+) || fail=1
+rm -rf "$TMP_AVISO_ANTIGO"
 
 echo "DDL: nenhum script do kit manda a string do APP para o Postgres"
 # A guarda de CLASSE. Os três cenários acima provam o install.sh e o update.sh
@@ -3116,7 +3588,7 @@ NEXT_PUBLIC_APP_URL='https://crm.exemplo.com.br'")"
   if grep -q -E '^compose .* up -d$' "$VPS_LOG"; then
     printf '  ✗ o update.sh subiu a stack mesmo com a rede do NPM ausente\n'; exit 1
   fi
-  if ! printf '%s' "$saida" | grep -q 'PROXY_NETWORK_NAME'; then
+  if ! grep -q 'PROXY_NETWORK_NAME' <<<"$saida"; then
     printf '  ✗ a morte não ensina a saída (PROXY_NETWORK_NAME no .env)\n'
     printf '     saída: %s\n' "$(printf '%s' "$saida" | tail -3)"; exit 1
   fi
@@ -3164,6 +3636,83 @@ NEXT_PUBLIC_APP_URL='https://crm.exemplo.com.br'" >/dev/null
 caddy_skip_e2e "caddy (default): recria o próprio proxy"       caddy   ""                                          sim
 caddy_skip_e2e "traefik: nunca recria o Caddy"                  traefik "TRAEFIK_NETWORK='crmcaddyskip_proxy'"      nao
 caddy_skip_e2e "npm: nunca recria o Caddy"                      npm     "PROXY_NETWORK_NAME='proxy_network'"       nao
+caddy_skip_e2e "cloudflared: nunca recria o Caddy"              cloudflared "CLOUDFLARE_TUNNEL_TOKEN='token'"     nao
+
+echo "integração: update.sh só recria o Caddy com uma configuração que o Caddy aceitou (#2724)"
+# O arquivo do operador em caddy-sites/ não trava mais a atualização; em troca,
+# um arquivo errado ali faria o Caddy recriado parar e levar o CRM junto. A
+# guarda confere ANTES do primeiro `up -d` (a imagem nova do Caddy também
+# recria o proxy no `up -d` do parque) e, recusada, deixa o proxy antigo no ar
+# e diz o motivo citando caddy-sites/. O dublê faz o papel do `caddy validate`:
+# recusa quando algum .caddy da pasta tem a palavra QUEBRADO, aprova senão. E
+# ele lê o stdin: se o `run` herdasse o stdin de quem roda o update.sh por pipe,
+# comeria o próprio script — o dublê registra se achou algo para ler.
+proxy_conferido_e2e() {  # proxy_conferido_e2e <descrição> <conteúdo do .caddy> <bom|ruim>
+  local desc="$1" conteudo="$2" esperado="$3" dir saida n_val n_up
+  dir="$(mktemp -d)"
+  (
+    montar_vps "$dir" "crmcaddysites" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+case "$*" in
+  *" run "*"caddy validate"*)
+    if IFS= read -r -t 1 _l; then printf 'STDIN_CONSUMIDO\n' >> "$DOCKER_LOG"; fi
+    if grep -qs QUEBRADO caddy-sites/*.caddy; then
+      printf 'Error: adapting config using caddyfile: /etc/caddy/sites/wiki.caddy:2: unrecognized directive: QUEBRADO\n' >&2
+      exit 1
+    fi
+    printf 'Valid configuration\n'; exit 0 ;;
+  *" config --services"*) printf 'app\nworker\nscheduler\ncaddy\nwaha\n'; exit 0 ;;
+esac
+case "$1" in
+  compose) case "$*" in *" exec "*) printf 'healthy\n{"data":{"status":"healthy"}}\n' ;; esac; exit 0 ;;
+esac
+exit 0
+STUB
+    (cd "$VPS_PROJ" && git init -q -b main . \
+      && printf 'caddy-sites/*\n' > .gitignore \
+      && git -c user.email=t@exemplo -c user.name=teste add -A \
+      && git -c user.email=t@exemplo -c user.name=teste commit -qm base \
+      && git tag v9.9.9) >/dev/null 2>&1
+    mkdir -p "$VPS_PROJ/caddy-sites"
+    printf '%s\n' "$conteudo" > "$VPS_PROJ/caddy-sites/wiki.caddy"
+    saida="$(rodar update.sh --skip-backup "INTERNAL_SECRET='segredo-de-teste'
+NEXT_PUBLIC_APP_URL='https://crm.exemplo.com.br'" 'linha do stdin que não é do caddy
+')"
+    n_val="$(grep -n 'caddy validate' "$VPS_LOG" | head -1 | cut -d: -f1)"
+    n_up="$(grep -nE '^compose .* up -d( |$)' "$VPS_LOG" | grep -v -- '--force-recreate' | head -1 | cut -d: -f1)"
+    falhou=""
+    [ -n "$n_val" ] && [ -n "$n_up" ] && [ "$n_val" -lt "$n_up" ] \
+      || { printf '    a conferência não veio antes do primeiro up -d (validate=%s up=%s)\n' "$n_val" "$n_up"; falhou=1; }
+    ! grep -q STDIN_CONSUMIDO "$VPS_LOG" \
+      || { printf '    a conferência comeu o stdin do update.sh\n'; falhou=1; }
+    if [ "$esperado" = bom ]; then
+      grep -qF -- '--force-recreate --no-deps caddy' "$VPS_LOG" \
+        || { printf '    com a configuração aceita o Caddy não foi recriado\n'; falhou=1; }
+      grep -qE '^compose .* up -d$' "$VPS_LOG" \
+        || { printf '    o up -d do parque não foi o de sempre (sem lista de serviços)\n'; falhou=1; }
+      grep -q '✓ proxy recarregado' <<<"$saida" \
+        || { printf '    a saída não confirma o proxy recarregado\n'; falhou=1; }
+    else
+      ! grep -qF -- '--force-recreate --no-deps caddy' "$VPS_LOG" \
+        || { printf '    o Caddy foi recriado com a configuração recusada\n'; falhou=1; }
+      ! grep -E '^compose .* up -d' "$VPS_LOG" | grep -qw caddy \
+        || { printf '    um up -d do parque alcançou o caddy\n'; falhou=1; }
+      grep -qE '^compose .* up -d app worker scheduler waha$' "$VPS_LOG" \
+        || { printf '    o up -d do parque não subiu os outros serviços\n'; falhou=1; }
+      grep -q 'caddy-sites/' <<<"$saida" && grep -q 'unrecognized directive' <<<"$saida" \
+        && grep -q 'proxy anterior segue no ar' <<<"$saida" \
+        || { printf '    o aviso não cita caddy-sites/ e o motivo do Caddy\n'; falhou=1; }
+    fi
+    if [ -z "$falhou" ]; then printf '  ✓ %s\n' "$desc"
+    else printf '  ✗ %s\n     saída: %s\n' "$desc" "$(printf '%s' "$saida" | tail -4)"; exit 1; fi
+  ) || fail=1
+  rm -rf "$dir"
+}
+proxy_conferido_e2e "arquivo bom em caddy-sites/: confere e recria o proxy" \
+  "$(printf 'wiki.exemplo.com.br {\n\treverse_proxy wiki:80\n}')" bom
+proxy_conferido_e2e "arquivo ruim em caddy-sites/: mantém o proxy antigo e avisa" \
+  "$(printf 'wiki.exemplo.com.br {\n\tQUEBRADO\n}')" ruim
 
 echo "nome do projeto que o docker compose usa"
 # O compose faz TrimLeft("_-") no basename. Sem isso, uma pasta /root/_deskcomm
@@ -3277,7 +3826,7 @@ cron_vazio() (
     bash -c 'set -euo pipefail; . "$1/_common.sh"; psql_run() { :; }
              setup_event_log_drain_cron; setup_update_agent_cron; echo CHEGOU-AO-FIM' _ "$VPS_RAIZ" 2>&1)" \
     && rc=0 || rc=$?
-  if [ $rc -ne 0 ] || ! printf '%s' "$out" | grep -q CHEGOU-AO-FIM; then
+  if [ $rc -ne 0 ] || ! grep -q CHEGOU-AO-FIM <<<"$out"; then
     printf '  ✗ agendar o cron numa VPS sem crontab derrubou o script (saída %s)\n' "$rc"; return 1
   fi
   if [ "$(grep -c '# deskcomm:' "$sandbox" 2>/dev/null)" != 2 ]; then
@@ -3341,7 +3890,7 @@ STUB
 
   # CONTROLE POSITIVO: se a instalação nem chegou ao fim, a ausência do bloco
   # abaixo não significa nada — seria sonda cega lida como aprovação.
-  if ! printf '%s' "$saida" | grep -q "Instalação concluída"; then
+  if ! grep -q "Instalação concluída" <<<"$saida"; then
     printf '  ✗ a instalação não chegou à tela final — cenário inconclusivo, não verde\n'; exit 1
   fi
 
@@ -3353,11 +3902,11 @@ STUB
   # "avisou onde a pessoa está olhando".
   rabo="${saida##*Instalação concluída}"
   faltou=""
-  printf '%s' "$rabo" | grep -q "URL Configuration" || faltou="${faltou} URL-Configuration"
-  printf '%s' "$rabo" | grep -q "Site URL" || faltou="${faltou} Site-URL"
+  grep -q "URL Configuration" <<<"$rabo" || faltou="${faltou} URL-Configuration"
+  grep -q "Site URL" <<<"$rabo" || faltou="${faltou} Site-URL"
   # O domínio PREENCHIDO, não um placeholder: quem instala não deve ter de
   # descobrir qual endereço escrever.
-  printf '%s' "$rabo" | grep -q "https://crm.exemplo.com.br/auth/confirm" \
+  grep -q "https://crm.exemplo.com.br/auth/confirm" <<<"$rabo" \
     || faltou="${faltou} Redirect-URL-com-o-dominio"
   if [ -n "$faltou" ]; then
     printf '  ✗ a tela final não avisa o que falta para os e-mails de acesso funcionarem:%s\n' "$faltou"
@@ -3400,11 +3949,11 @@ fi
 TMP_SITEURL="$(mktemp -d)"
 (
   KIT_AQUI="$PWD"
-  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$TMP_SITEURL/" || exit 1
+  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_manifestos.sh" "$TMP_SITEURL/" || exit 1
   mkdir -p "$TMP_SITEURL/../supabase/templates" 2>/dev/null
   # Os modelos moram em ../supabase/templates relativo ao script.
   mkdir -p "$TMP_SITEURL/kit" "$TMP_SITEURL/supabase/templates"
-  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_i18n.sh" "$TMP_SITEURL/kit/"
+  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_manifestos.sh" "$KIT_AQUI/_i18n.sh" "$TMP_SITEURL/kit/"
   cp "$KIT_AQUI/../supabase/templates/confirmation.html" \
      "$KIT_AQUI/../supabase/templates/recovery.html" "$TMP_SITEURL/supabase/templates/" || exit 1
 
@@ -3443,7 +3992,7 @@ STUB
 
   # CONTROLE POSITIVO: se o dublê não levou o script até o caminho VERDE, a
   # ausência de pendência abaixo não mede nada — mediria um script que morreu.
-  if ! printf '%s' "$saida" | grep -q 'CONFERIDOS'; then
+  if ! grep -q 'CONFERIDOS' <<<"$saida"; then
     printf '  ✗ o dublê não levou o script ao caminho verde — cenário inconclusivo, não verde\n'
     printf '     (rc=%s, última linha: %s)\n' "$rc" \
       "$(printf '%s' "$saida" | sed -E 's/\x1b\[[0-9;]*m//g' | grep -v '^$' | tail -1)"
@@ -3493,7 +4042,7 @@ TMP_RASCUNHO="$(mktemp -d)"
 (
   KIT_AQUI="$PWD"
   cd "$TMP_RASCUNHO" || exit 1
-  cp "$KIT_AQUI/install.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_i18n.sh" . || exit 1
+  cp "$KIT_AQUI/install.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_manifestos.sh" "$KIT_AQUI/_i18n.sh" . || exit 1
   INSTALL_SH_LIB=1 . ./install.sh >/dev/null 2>&1
   set +e   # o install.sh liga `set -e`; aqui as sondas precisam poder sair != 0
 

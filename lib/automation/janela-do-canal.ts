@@ -34,7 +34,7 @@ import {
   janelaDeEnvioAberta,
   proximaAberturaDaJanela,
 } from "@/lib/agent-engine/pacing/engine";
-import { fusoDaJanela, parseWarmupCaps } from "@/lib/agent-engine/pacing/store";
+import { fusoDaJanela, parseDiasDaProspeccao, parseWarmupCaps } from "@/lib/agent-engine/pacing/store";
 import { logger } from "@/lib/logger";
 
 interface LinhaDeKnobs {
@@ -43,6 +43,8 @@ interface LinhaDeKnobs {
   window_start_hour: number | null;
   window_end_hour: number | null;
   allow_sunday: boolean | null;
+  /** Dias da prospecção (0642). Automação não é prospecção: lido por fidelidade, nunca usado. */
+  prospeccao_dias: unknown;
   timezone: string | null;
   warmup_daily_caps: unknown;
 }
@@ -61,7 +63,7 @@ export async function knobsDoCanal(
     admin
       .from("channel_knobs")
       .select(
-        "throttle_ms, jitter_max_ms, window_start_hour, window_end_hour, allow_sunday, timezone, warmup_daily_caps",
+        "throttle_ms, jitter_max_ms, window_start_hour, window_end_hour, allow_sunday, prospeccao_dias, timezone, warmup_daily_caps",
       )
       .eq("organization_id", organizationId)
       .eq("channel_session_id", channelSessionId)
@@ -89,9 +91,22 @@ export async function knobsDoCanal(
   return {
     throttleMs: linha.throttle_ms ?? PACING_DEFAULTS.throttleMs,
     jitterMaxMs: linha.jitter_max_ms ?? PACING_DEFAULTS.jitterMaxMs,
+    // Automação é disparo em massa — o atraso humano (0499) não se aplica, mas
+    // o tipo PacingKnobs pede os quatro; herdam o default conservador.
+    atrasoNotarMs: PACING_DEFAULTS.atrasoNotarMs,
+    msPorCaractere: PACING_DEFAULTS.msPorCaractere,
+    atrasoMinimoMs: PACING_DEFAULTS.atrasoMinimoMs,
+    atrasoMaximoMs: PACING_DEFAULTS.atrasoMaximoMs,
     windowStartHour: linha.window_start_hour ?? PACING_DEFAULTS.windowStartHour,
     windowEndHour: linha.window_end_hour ?? PACING_DEFAULTS.windowEndHour,
+    // Automação é disparo: nunca lê a janela de resposta (0495). O par espelha o
+    // de disparo só para o tipo fechar, sem ir buscar `resposta_*` no banco.
+    respostaStartHour: linha.window_start_hour ?? PACING_DEFAULTS.windowStartHour,
+    respostaEndHour: linha.window_end_hour ?? PACING_DEFAULTS.windowEndHour,
     allowSunday: linha.allow_sunday ?? PACING_DEFAULTS.allowSunday,
+    // Automação é disparo em massa, nunca prospecção: os dias são lidos por
+    // fidelidade do objeto, mas nenhum caminho daqui passa `prospeccao: true`.
+    prospeccaoDias: parseDiasDaProspeccao(linha.prospeccao_dias) ?? PACING_DEFAULTS.prospeccaoDias,
     timezone: fusoDaJanela(linha.timezone, fusoDaOrg),
     warmupDailyCaps: caps ?? PACING_DEFAULTS.warmupDailyCaps,
   };

@@ -49,6 +49,16 @@ interface IdemState {
 function makeCtx(state: IdemState): McpContext {
   const supabase = {
     from: (table: string) => {
+      // Spec 21: a tool confere `is_personal` antes de abrir. Sem pessoal na
+      // base do teste, a consulta volta vazia e o fluxo segue igual a antes.
+      if (table === "contacts") {
+        const cadeia: Record<string, () => unknown> = {};
+        for (const metodo of ["select", "eq", "in", "is", "limit"]) {
+          cadeia[metodo] = () => cadeia;
+        }
+        cadeia["maybeSingle"] = () => Promise.resolve({ data: null, error: null });
+        return cadeia;
+      }
       if (table !== "idempotency_keys") throw new Error(`tabela inesperada: ${table}`);
       return {
         select: () => ({
@@ -148,6 +158,22 @@ describe("crm_start_conversation_and_send", () => {
       crmStartConversationAndSend.handler(parsedInput as never, makeCtx(state)),
     ).rejects.toThrow(/contact_id ou phone_number/);
 
+    expect(mockedOpen).not.toHaveBeenCalled();
+    expect(mockedSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["texto sem corpo", { type: "text" }],
+    ["contato compartilhado sem o contato", { type: "contact", body: "Oi" }],
+  ])("mensagem inválida (%s) é recusada ANTES de abrir a conversa", async (_nome, mensagem) => {
+    await expect(
+      crmStartConversationAndSend.handler(
+        { channel_session_id: SESSION_ID, phone_number: "+5511999990000", ...mensagem } as never,
+        makeCtx({ cached: null, inserts: [] }),
+      ),
+    ).rejects.toThrow(/body, media_url/);
+
+    expect(mockedSegurar).not.toHaveBeenCalled();
     expect(mockedOpen).not.toHaveBeenCalled();
     expect(mockedSend).not.toHaveBeenCalled();
   });

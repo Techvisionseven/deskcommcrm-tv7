@@ -2,10 +2,24 @@
  * Cost computation for AI invocations.
  *
  * Looks up `ai_pricing` (rarely changing global table) and converts token
- * usage to cost in *cents* (rounded up to integer to err on the side of
- * over-billing rather than free usage).
+ * usage to cost in *cents*, FRACIONADO — igual ao `costCents` do seam
+ * (`lib/agent-engine/edge/llm/pricing.ts`) e às colunas `numeric` de
+ * `llm_calls`/`ai_invocations`.
+ *
+ * Exceção: Gemini 3.6/3.7/3.8 Flash (e o prefixo `provider/`) não usam a
+ * linha. Ela já está em 150/750 desde a migration 0649, para a lista mostrar
+ * a tarifa de 2027. O gasto sai de `costCentsDoGeminiFlashComVirada`, o mesmo
+ * corte de `costCents` (promo até o instante anterior a 2027-01-01T00:00:00Z).
+ *
+ * Arredondava para cima até o centavo inteiro "para errar cobrando a mais".
+ * Numa chamada de classificador (~250 tokens de entrada no gpt-5.6-luna, custo
+ * real ≈ 0,01 centavo) isso gravava 1 centavo: 100× o real. Medido numa VPS em
+ * set/2026: o `sentiment_classify` somava 5.278 de 5.714 centavos do mês — o
+ * teto de orçamento via um gasto que não existiu, e ligado teria travado a IA
+ * da organização por um número falso.
  */
 
+import { costCentsDoGeminiFlashComVirada } from "@/lib/agent-engine/edge/llm/pricing";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 interface PricingRow {
@@ -59,6 +73,11 @@ export interface ComputeCostInput {
   completionTokens?: number;
   /** For embedding-only models, treat tokens as embedding tokens. */
   embeddingTokens?: number;
+  /**
+   * Instante da chamada. Sem ele, agora. Os Gemini 3.6/3.7/3.8 Flash (e o
+   * prefixo `provider/`) usam o corte de `costCents`, não a linha 150/750.
+   */
+  em?: Date;
 }
 
 /**
@@ -105,9 +124,22 @@ async function precoDoCatalogo(
 }
 
 /**
- * Returns cost in **cents**, rounded up. Zero when pricing missing.
+ * Returns cost in **cents** (fracionado, sem arredondar). Zero when pricing missing.
  */
 export async function computeCost(input: ComputeCostInput): Promise<number> {
+  // Estes três Flash têm a tarifa de 2027 no catálogo desde a 0649. O gasto
+  // gravado em llm_calls tem de seguir `costCents` (promo estritamente antes
+  // de 2027-01-01T00:00:00.000Z). Outro modelo continua na linha de ai_pricing.
+  const pelaVirada = costCentsDoGeminiFlashComVirada(
+    input.model,
+    {
+      inputTokens: input.promptTokens ?? 0,
+      outputTokens: input.completionTokens ?? 0,
+    },
+    input.em ?? new Date(),
+  );
+  if (pelaVirada !== null) return pelaVirada;
+
   const pricing = await loadPricing();
   const row = pricing.get(input.model);
   if (!row) {
@@ -119,7 +151,7 @@ export async function computeCost(input: ComputeCostInput): Promise<number> {
     const cents =
       ((input.promptTokens ?? 0) * doCatalogo.prompt) / 1_000_000 +
       ((input.completionTokens ?? 0) * doCatalogo.completion) / 1_000_000;
-    return Math.ceil(cents);
+    return cents;
   }
 
   const promptRate = toNumber(row.prompt_cents_per_million_tokens);
@@ -135,7 +167,7 @@ export async function computeCost(input: ComputeCostInput): Promise<number> {
     (completionTokens * completionRate) / 1_000_000 +
     (embeddingTokens * embeddingRate) / 1_000_000;
 
-  return Math.ceil(cents);
+  return cents;
 }
 
 /** Test-only: drop the in-memory pricing cache. */

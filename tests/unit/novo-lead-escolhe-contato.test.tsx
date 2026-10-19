@@ -22,8 +22,8 @@
  *
  * O contato fica OPCIONAL, com aviso. O defeito relatado é a ausência do campo,
  * não a permissão de criar sem ele: com o campo na tela e o título nascendo com
- * o nome da pessoa, o caminho fácil já é o certo. Obrigar custaria um major
- * (`exige_acao` em `lib/release/fragmento.ts:44`) e quebraria o hábito de abrir
+ * o nome da pessoa, o caminho fácil já é o certo. Obrigar exigiria ação do
+ * operador (`exige_acao`, então major; minor desde 07/10) e quebraria o hábito de abrir
  * o card no meio da ligação — decisão do dono da instalação em 16/09, depois de
  * medir os dois custos. Se o quadro continuar juntando card órfão, a trava se
  * decide com dado.
@@ -45,6 +45,9 @@ vi.mock("@/hooks/contacts/useContactList", () => ({
   useContactList: (filtros: { search?: string }) => busca(filtros),
 }));
 
+vi.mock("@/hooks/auth/AuthProvider", () => ({
+  useActiveOrg: () => ({ currency: "BRL", country: null }),
+}));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 import { NewLeadDialog } from "@/components/kanban/NewLeadDialog";

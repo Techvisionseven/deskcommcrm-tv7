@@ -3,7 +3,8 @@
  *
  * Pipeline (per org, per batch run):
  *   1. List conversations where usable_for_rag=true AND status='resolved'
- *      AND usable_for_rag_marked_at > sinceTs
+ *      AND o momento de ELEGIBILIDADE (a marcação OU a resolução, o que veio
+ *      por último) está dentro de `sinceTs` — ver o comentário da query.
  *   2. For each conversation:
  *      a. Load messages (filtered by org_id), build "Cliente: ...\nAtendente: ..."
  *      b. Run anonymize() (CPF / email / phone / CEP / PT-BR first names)
@@ -20,8 +21,8 @@
  */
 
 import { embedText } from "@/lib/ai/embed";
-import { resolverChaveDeEmbedding } from "@/lib/ai/embeddings/chave";
-import { anonymize, detectResidualPii, padroesDePii } from "@/lib/ai/anonymize";
+import { modeloDeEmbedding, resolverChaveDeEmbedding } from "@/lib/ai/embeddings/chave";
+import { anonymize, detectResidualPii, padroesDaIngestao } from "@/lib/ai/anonymize";
 import { perfilDaOrganizacao } from "@/lib/legal/perfil-do-pais";
 import { chunkText, computeContentHash } from "@/lib/ai/rag/chunker";
 import {
@@ -39,7 +40,10 @@ const VALIDATOR_MIN_MSGS = 10;
 export interface IngestConversationsArgs {
   organizationId: string;
   agentId: string;
-  /** Only conversations marked after this timestamp are considered. */
+  /**
+   * A janela do lote: a conversa entra se o momento em que ficou ELEGÍVEL
+   * (marcada em `usable_for_rag` e resolvida) está depois disto.
+   */
   sinceTs: Date;
   /** Max conversations processed per call. Default 50. */
   cap?: number;
@@ -111,6 +115,7 @@ async function ensureConversationsSource(
 interface ConvRow {
   id: string;
   organization_id: string;
+  contact_id: string;
 }
 
 interface MsgRow {
@@ -128,6 +133,30 @@ function buildTranscript(messages: MsgRow[]): string {
     lines.push(`${speaker}: ${body}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * Tira do lote as conversas de contatos pessoais (spec 21, etapa 9).
+ *
+ * Uma leitura a mais por lote, e não por conversa: os contatos do lote são
+ * poucos (teto `cap`) e a pergunta é uma só.
+ */
+async function semConversasDePessoal(
+  admin: ReturnType<typeof createAdminClient>,
+  organizationId: string,
+  convs: ConvRow[],
+): Promise<ConvRow[]> {
+  if (convs.length === 0) return convs;
+  const ids = [...new Set(convs.map((c) => c.contact_id))];
+  const { data } = await admin
+    .from("contacts")
+    .select("id")
+    .eq("organization_id", organizationId)
+    .eq("is_personal", true)
+    .in("id", ids);
+  const pessoais = new Set(((data ?? []) as Array<{ id: string }>).map((c) => c.id));
+  if (pessoais.size === 0) return convs;
+  return convs.filter((c) => !pessoais.has(c.contact_id));
 }
 
 export async function ingestConversationsBatch(
@@ -155,14 +184,28 @@ export async function ingestConversationsBatch(
   }
 
   // 1. Pull eligible conversations.
+  //
+  // A janela olha o momento em que a conversa ficou ELEGÍVEL — marcada
+  // (`usable_for_rag`) E resolvida — e não só a hora da marcação (issue #3044).
+  // Marcar uma conversa ABERTA e resolvê-la mais de 24 h depois deixava o selo
+  // "Exemplo para a IA" nela e nenhum lote a pegava nunca: quando o status virava
+  // `resolved`, `usable_for_rag_marked_at` já estava fora da janela.
+  //
+  // `status_changed_at` é o instante da ÚLTIMA transição de status; como o filtro
+  // exige `status='resolved'`, ele é o momento da resolução (`fn_service_status`
+  // o carimba em toda transição). O `or` cobre as duas ordens: resolvida depois
+  // de marcada entra por `status_changed_at`; marcada depois de resolvida entra
+  // por `usable_for_rag_marked_at`. O portão de reingestão segue sendo só
+  // `rag_review_status is null`.
+  const since = sinceTs.toISOString();
   const { data: convRows, error: convErr } = await admin
     .from("conversations")
-    .select("id, organization_id")
+    .select("id, organization_id, contact_id")
     .eq("organization_id", organizationId)
     .eq("usable_for_rag", true)
     .eq("status", "resolved")
-    .gt("usable_for_rag_marked_at", sinceTs.toISOString())
     .is("rag_review_status", null)
+    .or(`usable_for_rag_marked_at.gt.${since},status_changed_at.gt.${since}`)
     .limit(cap);
 
   if (convErr) {
@@ -170,7 +213,15 @@ export async function ingestConversationsBatch(
     return { processed: 0, flaggedReview: 0, skipped: 0, embeddingSkipped: false };
   }
 
-  const conversations = (convRows ?? []) as ConvRow[];
+  // Contato pessoal nunca é ingerido (spec 21, etapa 9): a conversa some do
+  // acervo junto com o resto. O lote que já passou continua respondível se
+  // nada for feito — por isso o marcar zera `usable_for_rag` na hora
+  // (`contacts/[id]/personal/route.ts`); aqui cai quem é pessoal agora.
+  const conversations = await semConversasDePessoal(
+    admin,
+    organizationId,
+    (convRows ?? []) as ConvRow[],
+  );
   if (conversations.length === 0) {
     return { processed: 0, flaggedReview: 0, skipped: 0, embeddingSkipped: false };
   }
@@ -183,6 +234,7 @@ export async function ingestConversationsBatch(
       knowledgeSourceId: sourceId,
       agentId,
       sourceType: "conversas",
+      embeddingModel: modeloDeEmbedding(chave.provedor),
     });
     versionId = v.versionId;
   } catch (err) {
@@ -200,8 +252,9 @@ export async function ingestConversationsBatch(
 
   // O perfil do PAÍS da organização (issue #1033): o mesmo conjunto de padrões
   // anonimiza e vigia. Resolvido UMA vez por rodada — ler por conversa daria o
-  // mesmo resultado e uma consulta por conversa.
-  const padroes = padroesDePii([await perfilDaOrganizacao(admin, organizationId)]);
+  // mesmo resultado e uma consulta por conversa. O Brasil vai por baixo de
+  // qualquer país: ver `padroesDaIngestao`.
+  const padroes = padroesDaIngestao(await perfilDaOrganizacao(admin, organizationId));
 
   for (const conv of conversations) {
     // Defense in depth: re-check org id.

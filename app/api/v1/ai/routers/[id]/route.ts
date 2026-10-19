@@ -5,17 +5,18 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
  * DELETE /api/v1/ai/routers/:id — remove o router (admin), audit `ai.router_deleted`.
  *   Cascade FK (migration 0085) já apaga ai_router_members junto.
  *
- * organization_id sempre de requireRole — nunca do path/body.
+ * organization_id sempre da sessão/token — nunca do path/body.
  */
 import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 import { z } from "zod";
 
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
-import { requireRole } from "@/lib/auth/require-role";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { MAX_CLASSIFIER_CONTEXT_MESSAGES } from "@/lib/ai/classifier-context";
 
 export const dynamic = "force-dynamic";
 
@@ -24,30 +25,41 @@ type RouteCtx = { params: Promise<{ id: string }> };
 const UUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const ROUTER_DETAIL_COLUMNS = "id, name, channel_session_id, is_active, config, fallback_agent_id";
-const MEMBER_COLUMNS = "id, agent_id, intent_name, intent_description, examples, position, flow_pointer_id";
+const MEMBER_COLUMNS =
+  "id, agent_id, intent_name, intent_description, examples, position, flow_pointer_id, pipeline_id, stage_id";
 
 const patchRouterSchema = z.object({
   name: z.string().min(1).max(120).optional(),
   is_active: z.boolean().optional(),
   fallback_agent_id: z.string().uuid().nullable().optional(),
-  config: z.record(z.string(), z.unknown()).optional(),
+  config: z.record(z.string(), z.unknown()).optional().refine((c) =>
+    c?.context_message_count === undefined ||
+    (typeof c.context_message_count === "number" && Number.isInteger(c.context_message_count) &&
+      c.context_message_count >= 0 && c.context_message_count <= MAX_CLASSIFIER_CONTEXT_MESSAGES),
+    "context_message_count deve ser inteiro entre 0 e 16"),
 });
 
 // ---------------------------------------------------------------------------
 // GET
 // ---------------------------------------------------------------------------
 
-export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
+export async function GET(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   const requestId = randomUUID();
   const { id } = await ctx.params;
   if (!UUID_RX.test(id)) {
     return fail("invalid_request", "id inválido.", 400, { requestId });
   }
 
-  const authz = await requireRole("agent", { requestId, resource: "ai_routers" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "ai_routers",
+    role: "agent",
+    scope: "config:read",
+    tokenRole: "admin",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
-  const { org } = authz;
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
+  const { organizationId } = authz;
 
   const admin = createAdminClient();
 
@@ -55,7 +67,7 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
     .from("ai_routers")
     .select(ROUTER_DETAIL_COLUMNS)
     .eq("id", id)
-    .eq("organization_id", org.orgId)
+    .eq("organization_id", organizationId)
     .maybeSingle();
   if (routerErr) {
     return fail("internal_error", "Erro ao buscar router.", 500, { requestId });
@@ -68,7 +80,7 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
     .from("ai_router_members")
     .select(MEMBER_COLUMNS)
     .eq("router_id", id)
-    .eq("organization_id", org.orgId)
+    .eq("organization_id", organizationId)
     .order("position", { ascending: true });
   if (membersErr) {
     return fail("internal_error", "Erro ao buscar membros do router.", 500, { requestId });
@@ -91,10 +103,20 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
     return fail("invalid_request", "id inválido.", 400, { requestId });
   }
 
-  const authz = await requireRole("admin", { requestId, resource: "ai_routers" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "ai_routers",
+    role: "admin",
+    scope: "config:write",
+    tokenRole: "admin",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
-  const { user: authUser, org } = authz;
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
+  const { organizationId, actor } = authz;
+
+  const teto = await tetoDeEscritaDoToken(authz, "ai_routers", requestId);
+  if (teto) return teto;
+  const authUserId = actor.type === "user" ? actor.id : null;
 
   let rawBody: unknown;
   try {
@@ -118,7 +140,7 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
     .from("ai_routers")
     .select("id, config")
     .eq("id", id)
-    .eq("organization_id", org.orgId)
+    .eq("organization_id", organizationId)
     .maybeSingle();
   if (loadErr) {
     return fail("internal_error", "Erro ao carregar router.", 500, { requestId });
@@ -144,7 +166,7 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
     .from("ai_routers")
     .update(update)
     .eq("id", id)
-    .eq("organization_id", org.orgId);
+    .eq("organization_id", organizationId);
   if (updErr) {
     if (updErr.code === "23505") {
       return fail("router_already_exists", t("Este número já tem um roteador ativo."), 409, { requestId });
@@ -154,8 +176,9 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
 
   void audit({
     action: "ai.router_updated",
-    actorUserId: authUser.id,
-    organizationId: org.orgId,
+    actorUserId: authUserId,
+    actorApiTokenId: authz.apiTokenId ?? null,
+    organizationId,
     resourceType: "ai_router",
     resourceId: id,
     requestId,
@@ -169,7 +192,7 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
 // DELETE
 // ---------------------------------------------------------------------------
 
-export async function DELETE(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
+export async function DELETE(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   const supportDenied = await requireSupportWrite();
   if (supportDenied) return supportDenied;
 
@@ -179,10 +202,20 @@ export async function DELETE(_req: NextRequest, ctx: RouteCtx): Promise<Response
     return fail("invalid_request", "id inválido.", 400, { requestId });
   }
 
-  const authz = await requireRole("admin", { requestId, resource: "ai_routers" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "ai_routers",
+    role: "admin",
+    scope: "config:write",
+    tokenRole: "admin",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
-  const { user: authUser, org } = authz;
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
+  const { organizationId, actor } = authz;
+
+  const teto = await tetoDeEscritaDoToken(authz, "ai_routers", requestId);
+  if (teto) return teto;
+  const authUserId = actor.type === "user" ? actor.id : null;
 
   const admin = createAdminClient();
 
@@ -190,7 +223,7 @@ export async function DELETE(_req: NextRequest, ctx: RouteCtx): Promise<Response
     .from("ai_routers")
     .select("id")
     .eq("id", id)
-    .eq("organization_id", org.orgId)
+    .eq("organization_id", organizationId)
     .maybeSingle();
   if (loadErr) {
     return fail("internal_error", "Erro ao carregar router.", 500, { requestId });
@@ -203,15 +236,16 @@ export async function DELETE(_req: NextRequest, ctx: RouteCtx): Promise<Response
     .from("ai_routers")
     .delete()
     .eq("id", id)
-    .eq("organization_id", org.orgId);
+    .eq("organization_id", organizationId);
   if (delErr) {
     return fail("internal_error", "Erro ao remover router.", 500, { requestId });
   }
 
   void audit({
     action: "ai.router_deleted",
-    actorUserId: authUser.id,
-    organizationId: org.orgId,
+    actorUserId: authUserId,
+    actorApiTokenId: authz.apiTokenId ?? null,
+    organizationId,
     resourceType: "ai_router",
     resourceId: id,
     requestId,

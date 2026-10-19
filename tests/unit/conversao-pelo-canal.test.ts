@@ -8,7 +8,10 @@
  *   4. o canal passando por cima de quem já configurou a Meta direta — inclusive
  *      desligada, que é decisão de quem opera;
  *   5. uma instabilidade na leitura das conversas virando a pendência
- *      `sem_conexao` de uma venda que tem caminho.
+ *      `sem_conexao` de uma venda que tem caminho;
+ *   6. o evento de ETAPA da Meta (0524) parado em `sem_conexao` quando a
+ *      organização só tem o canal — ou saindo com outro nome, outro instante
+ *      ou um valor que o transporte direto não mandaria.
  *
  * A feature (`lib/conversoes/`) nunca pergunta QUAL provider atende a conversa:
  * pergunta pela capacidade `reportConversion` do adapter. O provider concreto
@@ -17,7 +20,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { conversaoDeVendaHandler } from "@/lib/conversoes/envio.handler";
+import { conversaoDeEtapaMetaHandler } from "@/lib/conversoes/etapa-meta.handler";
 import { vendaPeloCanalLigada } from "@/lib/conversoes/venda-pelo-canal";
+import { MOTIVO_LEGIVEL } from "@/lib/conversoes/estado-da-conexao";
+import { EVENTOS_DE_ETAPA_NO_CANAL, rotuloDoEventoDaMeta } from "@/lib/conversoes/regras-meta";
 import { zernioReportConversion } from "@/lib/channels/zernio/conversoes";
 import { resolveZernioCreds } from "@/lib/channels/zernio/credentials";
 import type { EventRow } from "@/lib/event-log/dispatcher";
@@ -109,6 +115,15 @@ describe("o envio pelo canal (o adapter)", () => {
     });
   });
 
+  it("evento de etapa sem valor sai sem `value` e sem `currency` — zero seria mentira", async () => {
+    const f = vi.spyOn(globalThis, "fetch").mockResolvedValue(resposta({ eventsReceived: 1, eventsFailed: 0 }));
+    await zernioReportConversion({ ...VENDA, event: "InitiateCheckout", valueCents: null });
+    const corpo = JSON.parse(f.mock.calls[0]![1]?.body as string);
+    expect(corpo.eventName).toBe("InitiateCheckout");
+    expect(corpo).not.toHaveProperty("value");
+    expect(corpo).not.toHaveProperty("currency");
+  });
+
   it("sem conversa conhecida, manda só o telefone", async () => {
     const f = vi.spyOn(globalThis, "fetch").mockResolvedValue(resposta({ eventsReceived: 1, eventsFailed: 0 }));
     await zernioReportConversion({ ...VENDA, providerConversationId: null });
@@ -139,8 +154,13 @@ function fakeAdmin(t: {
   conversasIlegiveis?: boolean;
   /** A chave "Enviar vendas pelo canal da conversa" (doc 76). Padrão aqui: ligada. */
   vendaPeloCanal?: boolean;
+  /** Linhas a mais (regra da etapa, a etapa, o livro-razão) para o evento de etapa. */
+  extras?: Record<string, unknown>;
 }) {
   const conexao = t.conexao ?? "ausente";
+  // O livro-razão é relido depois de gravado (o retrato da etapa): o que foi
+  // escrito precisa voltar na leitura seguinte.
+  const estado: Record<string, unknown> = { ...t.extras };
   return {
     from(tabela: string) {
       tabelasLidas.push(tabela);
@@ -168,6 +188,7 @@ function fakeAdmin(t: {
                 test_event_code: null,
                 enabled: conexao === "ligada",
               },
+        ...estado,
       };
       const q = {
         select: () => q,
@@ -178,6 +199,11 @@ function fakeAdmin(t: {
         maybeSingle: async () => ({ data: linhas[tabela] ?? null, error: null }),
         upsert: async (v: Record<string, unknown>) => {
           gravados.push(v);
+          if (tabela === "ad_conversion_dispatches")
+            estado.ad_conversion_dispatches = {
+              ...(estado.ad_conversion_dispatches as Record<string, unknown> | undefined),
+              ...v,
+            };
           return { error: null };
         },
         // Leitura em lista (as conversas do contato).
@@ -340,5 +366,192 @@ describe("o handler escolhe UM caminho", () => {
       reason: "recusado_pela_plataforma",
       detail: "no dataset",
     });
+  });
+});
+
+// ─── O evento de ETAPA da Meta pelo canal ────────────────────────────────────
+
+const ETAPA = "44444444-4444-4444-8444-444444444444";
+const CHAVE_DA_ETAPA = `MetaEtapa:${ETAPA}`;
+/**
+ * ⚠️ RELATIVO, e não uma data fixa — e o porquê é uma bomba que já estourou.
+ *
+ * O transporte direto da Meta RECUSA evento com mais de 7 dias
+ * (`lib/plataformas-de-anuncio/meta/conversions.ts`, teto da plataforma). Este
+ * arquivo usava `"2026-10-06T16:32:50.000Z"`; em 13/10 a data cruzou o teto e o
+ * caso do caminho direto virou vermelho na `main` **sem ninguém tocar em
+ * nada** — verde no CI de 13/10 01:44Z (merge #2805) e vermelho no dia
+ * seguinte. Data fixa como instante de evento é a mesma classe do `[contact]`:
+ * envelhece sozinha.
+ *
+ * Uma hora atrás é recente para o teto, e todas as asserções que dependem do
+ * instante calculam a partir DESTA constante — nada aqui afirma o valor
+ * absoluto. O fixture de venda já usava data relativa (`closed_at`):
+ * `new Date(Date.now() - 60_000)`.
+ */
+const ENTROU_NA_ETAPA = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+const regraDaEtapa = (metaEvent = "InitiateCheckout") => ({
+  meta_ads_conversion_rules: {
+    id: "r1",
+    stage_id: ETAPA,
+    event_name: CHAVE_DA_ETAPA,
+    meta_event: metaEvent,
+    enabled: true,
+    configured_at: "2026-10-01T00:00:00Z",
+  },
+  crm_stages: { id: ETAPA },
+});
+
+const entrouNaEtapa: EventRow = {
+  ...evento,
+  event_type: "lead.stage_changed",
+  payload: { to_stage_id: ETAPA },
+  created_at: ENTROU_NA_ETAPA,
+};
+
+describe("o evento de ETAPA da Meta também sai pelo canal", () => {
+  beforeEach(() => {
+    gravados.length = 0;
+    tabelasLidas.length = 0;
+  });
+
+  it("sem conexão direta e com a chave ligada: sai pelo canal com o nome padrão, o instante da etapa e sem valor", async () => {
+    vi.mocked(createAdminClient).mockReturnValue(
+      fakeAdmin({ sessao: CANAL_COM_PONTE, extras: regraDaEtapa() }) as never,
+    );
+    const f = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(resposta({ eventsReceived: 1, eventsFailed: 0 }));
+
+    const r = await conversaoDeEtapaMetaHandler.handle(entrouNaEtapa);
+
+    expect(r.status).toBe("ok");
+    expect(f).toHaveBeenCalledOnce();
+    expect(String(f.mock.calls[0]![0])).toContain("/v1/whatsapp/conversions");
+    const corpo = JSON.parse(f.mock.calls[0]![1]?.body as string);
+    expect(corpo).toMatchObject({
+      eventName: "InitiateCheckout",
+      eventId: `${LEAD}:${CHAVE_DA_ETAPA}`,
+      eventTime: Math.floor(Date.parse(ENTROU_NA_ETAPA) / 1000),
+      conversationId: "CONV1",
+      phoneE164: "5511988880000",
+    });
+    // O transporte direto não manda valor em evento de etapa; o canal também não.
+    expect(corpo).not.toHaveProperty("value");
+    expect(corpo).not.toHaveProperty("currency");
+    expect(gravados.at(-1)).toMatchObject({
+      status: "sent",
+      platform: "meta_ads",
+      event_name: CHAVE_DA_ETAPA,
+      meta_event_name: "InitiateCheckout",
+      value_cents: null,
+    });
+  });
+
+  it("com a chave DESLIGADA, a etapa fica na pendência de sempre e nada sai", async () => {
+    vi.mocked(createAdminClient).mockReturnValue(
+      fakeAdmin({ sessao: CANAL_COM_PONTE, vendaPeloCanal: false, extras: regraDaEtapa() }) as never,
+    );
+    const f = vi.spyOn(globalThis, "fetch");
+
+    const r = await conversaoDeEtapaMetaHandler.handle(entrouNaEtapa);
+
+    expect(r).toMatchObject({ status: "skipped", detail: "sem_conexao" });
+    expect(f).not.toHaveBeenCalled();
+    expect(tabelasLidas).not.toContain("conversations");
+  });
+
+  it("com a conexão direta ligada, a etapa segue por ela — e o canal não é chamado", async () => {
+    vi.mocked(createAdminClient).mockReturnValue(
+      fakeAdmin({ sessao: CANAL_COM_PONTE, conexao: "ligada", extras: regraDaEtapa() }) as never,
+    );
+    const f = vi.spyOn(globalThis, "fetch").mockResolvedValue(resposta({ events_received: 1 }));
+
+    const r = await conversaoDeEtapaMetaHandler.handle(entrouNaEtapa);
+
+    expect(r.status).toBe("ok");
+    expect(f).toHaveBeenCalledOnce();
+    expect(String(f.mock.calls[0]![0])).toContain("graph.facebook.com");
+    expect(String(f.mock.calls[0]![0])).not.toContain("/v1/whatsapp/conversions");
+  });
+
+  it("o reprocessamento de uma etapa parada em `sem_conexao` sai pelo canal com o RETRATO, não com a regra de agora", async () => {
+    vi.mocked(createAdminClient).mockReturnValue(
+      fakeAdmin({
+        sessao: CANAL_COM_PONTE,
+        extras: {
+          ...regraDaEtapa("AddToCart"),
+          ad_conversion_dispatches: {
+            status: "skipped",
+            platform: "meta_ads",
+            value_cents: null,
+            currency: "BRL",
+            remote_request_id: null,
+            event_occurred_at: ENTROU_NA_ETAPA,
+            meta_event_name: "InitiateCheckout",
+          },
+        },
+      }) as never,
+    );
+    const f = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(resposta({ eventsReceived: 1, eventsFailed: 0 }));
+
+    const r = await conversaoDeEtapaMetaHandler.handle({
+      ...evento,
+      event_type: "ad_conversion.retry_requested",
+      payload: { event_name: CHAVE_DA_ETAPA },
+    });
+
+    expect(r.status).toBe("ok");
+    expect(JSON.parse(f.mock.calls[0]![1]?.body as string)).toMatchObject({
+      eventName: "InitiateCheckout",
+      eventTime: Math.floor(Date.parse(ENTROU_NA_ETAPA) / 1000),
+    });
+  });
+
+  it("evento da Meta fora do vocabulário do canal (ViewContent): a pendência NOMEIA o evento, sem chamar a rede", async () => {
+    vi.mocked(createAdminClient).mockReturnValue(
+      fakeAdmin({ sessao: CANAL_COM_PONTE, extras: regraDaEtapa("ViewContent") }) as never,
+    );
+    const f = vi.spyOn(globalThis, "fetch");
+
+    const r = await conversaoDeEtapaMetaHandler.handle(entrouNaEtapa);
+
+    expect(r).toMatchObject({ status: "skipped", detail: "evento_fora_do_canal" });
+    expect(gravados.at(-1)).toMatchObject({ status: "skipped", reason: "evento_fora_do_canal" });
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  // #2457: `QualifiedLead` está na lista da tela (EVENTOS_DA_META) e fora da do
+  // canal. Sem isto a regra cai em `sem_conexao` e manda a pessoa preencher uma
+  // conexão direta que esta instalação só-com-canal nunca vai ter.
+  it("evento recomendado pela própria tela (QualifiedLead) fora da lista do canal: pendência nomeada, não `sem_conexao`", async () => {
+    vi.mocked(createAdminClient).mockReturnValue(
+      fakeAdmin({ sessao: CANAL_COM_PONTE, extras: regraDaEtapa("QualifiedLead") }) as never,
+    );
+    const f = vi.spyOn(globalThis, "fetch");
+
+    const r = await conversaoDeEtapaMetaHandler.handle(entrouNaEtapa);
+
+    expect(r).toMatchObject({ status: "skipped", detail: "evento_fora_do_canal" });
+    expect(gravados.at(-1)).toMatchObject({
+      status: "skipped",
+      reason: "evento_fora_do_canal",
+      detail: expect.stringContaining("QualifiedLead"),
+    });
+    expect(f).not.toHaveBeenCalled();
+  });
+});
+
+// #2457: o texto da pendência lista o que o ENVIO aceita, pelo nome da tela.
+// Escrito à mão, ele já ofereceu `Purchase` — que não é opção de etapa — e os
+// nomes da Meta em inglês, que a tela não mostra.
+describe("o texto de `evento_fora_do_canal` sai da mesma lista que o envio usa", () => {
+  it("nomeia cada evento que o canal repassa pelo rótulo da tela, e não oferece a compra", () => {
+    const texto = MOTIVO_LEGIVEL.evento_fora_do_canal;
+    for (const e of EVENTOS_DE_ETAPA_NO_CANAL) expect(texto).toContain(rotuloDoEventoDaMeta(e));
+    expect(texto).not.toContain("Purchase");
   });
 });

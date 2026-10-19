@@ -92,7 +92,14 @@ else
   tem_base="$(echo "$diff_nomes" | grep -cx 'supabase/baseline.sql' || true)"
   tem_mani="$(echo "$diff_nomes" | grep -cx 'supabase/migrations/MANIFEST.md' || true)"
   [ "$tem_base" = 1 ] && ok "migration nova COM apêndice no baseline.sql" || trava "migration nova SEM apêndice em supabase/baseline.sql — o kit self-host aplica só o baseline; sem ele a mudança não chega em quem instalou"
-  [ "$tem_mani" = 1 ] && ok "migration nova COM linha no MANIFEST.md" || trava "migration nova SEM linha em supabase/migrations/MANIFEST.md"
+  sem_desc=""
+  for m in $migs; do
+    git show "HEAD:$m" 2>/dev/null | grep -E '^-- manifest:[[:space:]]*[^[:space:]]' >/dev/null || sem_desc="$sem_desc $m"
+  done
+  if [ -z "$sem_desc" ]; then ok "migration nova COM descrição (\`-- manifest:\` no .sql)"
+  elif [ "$tem_mani" = 1 ]; then ok "migration nova COM linha no MANIFEST.md (jeito antigo; prefira \`-- manifest:\` no .sql)"
+  else trava "migration nova SEM descrição:$sem_desc — ponha uma linha \`-- manifest: <o quê e por quê>\` no cabeçalho do .sql (não no MANIFEST.md)"
+  fi
   # A POPULAÇÃO da unicidade: a main do PRODUTO (o remoto que aponta para
   # melgarafael/DeskcommCRM, com qualquer nome) mais `refs/heads` E
   # `refs/remotes` (#1273). O `origin/main` de antes, num clone de fork, é a main
@@ -211,6 +218,25 @@ elif [ "$toca_produto" -gt 0 ]; then
   olhe "diff toca o produto e não há fragmento em .changes/ — se o operador da VPS percebe a mudança, escreva um (impacto: nada_mudou | capacidade_nova | exige_acao)"
 else
   nao "sem fragmento, e o diff não toca o produto"
+fi
+# A skill de operação ensina onde fica cada tela; fragmento novo (ou menu
+# mexido) pode trazer tela que o mapa ainda não cita. Só AVISA: quem decide
+# se o mapa acompanha é quem escreve, não este script.
+mapa_tocado="$(echo "$diff_nomes" | grep -c '^lib/navigation/catalogo\.ts$' || true)"
+if [ -n "$frag" ] || [ "$mapa_tocado" -gt 0 ]; then
+  conferir="$raiz/.agents/skills/deskcomm-operacao/scripts/conferir-mapa.sh"
+  if [ -x "$conferir" ] || [ -f "$conferir" ]; then
+    mapa_faltas="$(bash "$conferir" 2>/dev/null | grep '^⚠' || true)"
+    if [ -n "$mapa_faltas" ]; then
+      echo "$mapa_faltas" | while IFS= read -r linha; do olhe "${linha#⚠ }"; done
+    else
+      ok "mapa da skill de operação cobre as telas do menu (comando: bash .agents/skills/deskcomm-operacao/scripts/conferir-mapa.sh)"
+    fi
+  else
+    nao "mapa da skill de operação: script ausente neste clone"
+  fi
+else
+  nao "sem fragmento nem mudança no menu: mapa da skill não conferido"
 fi
 
 # ── 5. Env var nova ──────────────────────────────────────────────────────────

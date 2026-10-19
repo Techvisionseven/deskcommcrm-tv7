@@ -25,6 +25,8 @@ hard-coded, nada de espelhar schema.
 | D5 | Cifra | Reusa `AI_CRED_AES_KEY` (AES-256-GCM). Sem env var nova. |
 | D6 | Escopo da IA | **Qualquer tabela da conexão, sem allowlist.** Travas: somente-leitura, timeout, teto de linhas, auditoria sem valores. |
 
+> **Revisada pela Spec 23 (Fatia 2a).** A D6 acima descreve a Spec 20 e continua valendo para toda conexão que já existia (`source_mode = 'all'`: o assistente lê qualquer tabela que o usuário do banco enxergue). Conexões novas nascem com `source_mode = 'list'`: o assistente só lê o que o administrador marcou em "O que o assistente pode ver", e sem nada marcado não enxerga nada. Contexto e decisão: `docs/specs/23-spec-banco-externo-mysql.md`.
+
 ## Superfície
 
 ### Schema
@@ -109,6 +111,19 @@ o filtro e entregava até 100 linhas para o modelo oferecer "as mais próximas"
 (pensado num catálogo de produtos). Numa tabela de clientes, o CPF que não casa
 entregaria os registros de outras pessoas. No recorte, o vazio fica vazio e a
 resposta ensina o modelo a repetir com um trecho menor do termo.
+
+**Na conversa, só as linhas do cliente (migration 0558).** A conexão guarda
+`customer_key_column` + `customer_key_kind` (`phone`|`email`), configurados em
+**Dados externos › Editar › Cliente nas conversas**. Com `ctx.contatoDoTurno`, a
+`crm_query_external_data` lê o telefone/e-mail do contato no CRM (organização +
+id do turno) e acrescenta `coluna in (...)` aos filtros do modelo — parametrizado,
+somado com `and`, sem o modelo escolher o valor. Com a coluna configurada, a
+consulta na conversa é recusada quando o contato não tem o dado no cadastro
+(`cliente_sem_identificador`) ou a tabela não tem a coluna
+(`tabela_sem_identificador_do_cliente`). Sem a coluna configurada, a consulta
+segue como antes (versão menor, decisão do mantenedor), e a lista de **Dados
+externos** avisa em destaque até a coluna ser escolhida. Fora do turno, nada muda. Prova:
+`lib/mcp/tools/dados-externos.test.ts`.
 
 ## Segurança
 

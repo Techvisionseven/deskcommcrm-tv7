@@ -27,25 +27,31 @@ import { NextRequest } from "next/server";
 import { audit } from "@/lib/audit";
 import { fail } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
-import { loadAuthUser, requireAuth, resolveActiveOrg } from "@/lib/auth/server";
+import { loadAuthUser, requireAuth, orgAtivaSemPortao } from "@/lib/auth/server";
 import type { AuthUser } from "@/lib/auth/types";
 import { CHANNEL_PROVIDER_META, CHANNEL_PROVIDER_WAHA } from "@/lib/channels/capabilities";
 import { reactivateChannelSession } from "@/lib/channels/reactivate";
 import { validateMetaCredentials } from "@/lib/channels/meta/validate-credentials";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { sincronizarRecebimentoDeGrupos } from "@/lib/grupos/sincronizar-filtro";
 import { createClient } from "@/lib/supabase/server";
 import { getWahaClient } from "@/lib/waha/client";
 import { encryptWebhookSecret } from "@/lib/webhooks/secrets";
 
-vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
+// `orgAtivaDaApi` REAL (sobre o `orgAtivaSemPortao` mockado): é ela que decide o 403 da org suspensa.
+vi.mock("@/lib/auth/require-role", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  requireRole: vi.fn(),
+}));
 vi.mock("@/lib/auth/server", () => ({
   mfaEmDivida: vi.fn(async () => false),
   requireAuth: vi.fn(),
   loadAuthUser: vi.fn(),
-  resolveActiveOrg: vi.fn(),
+  orgAtivaSemPortao: vi.fn(),
 }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
+vi.mock("@/lib/grupos/sincronizar-filtro", () => ({ sincronizarRecebimentoDeGrupos: vi.fn(async () => "sincronizado") }));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined) }));
 vi.mock("@/lib/webhooks/secrets", () => ({ encryptWebhookSecret: vi.fn() }));
 vi.mock("@/lib/channels/meta/validate-credentials", () => ({ validateMetaCredentials: vi.fn() }));
@@ -280,10 +286,10 @@ function authOk(): void {
     idioma: "pt-BR" as const,
     organizations: [{ organization_id: ORG, organization_name: "Org", role: "admin" }],
   };
-  const org = { orgId: ORG, name: "Org", role: "admin" as const };
+  const org = { orgId: ORG, name: "Org", role: "admin" as const, org_status: "active" };
   vi.mocked(requireAuth).mockResolvedValue(user);
   vi.mocked(loadAuthUser).mockResolvedValue(user);
-  vi.mocked(resolveActiveOrg).mockResolvedValue(org);
+  vi.mocked(orgAtivaSemPortao).mockResolvedValue(org);
   vi.mocked(requireRole).mockResolvedValue({ ok: true, user, org });
 }
 
@@ -475,6 +481,24 @@ describe("POST /api/v1/channel-sessions/[id]/reconnect — canal excluído não 
     expect(waha.stopSession).toHaveBeenCalledWith(NOME_SESSAO);
     expect(waha.startSession).toHaveBeenCalledWith(NOME_SESSAO);
     expect(db.linhas[0]?.status).toBe("STARTING");
+  });
+
+  it("I1: reconectar ressincroniza o filtro de grupos DEPOIS de reiniciar a sessão, na org da sessão", async () => {
+    authOk();
+    makeDb({ sessions: [canalQr({ status: "FAILED" })] });
+    const waha = transporteOk();
+    vi.mocked(sincronizarRecebimentoDeGrupos).mockClear();
+    const { POST } = await import("@/app/api/v1/channel-sessions/[id]/reconnect/route");
+    const res = await POST(req(), ctx());
+
+    expect(res.status).toBe(200);
+    expect(sincronizarRecebimentoDeGrupos).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Function),
+      expect.objectContaining({ organizationId: ORG, sessionRef: NOME_SESSAO }),
+    );
+    expect(waha.startSession.mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(sincronizarRecebimentoDeGrupos).mock.invocationCallOrder[0]!);
   });
 
   it("clone sem a migration 0106: reconectar continua funcionando", async () => {

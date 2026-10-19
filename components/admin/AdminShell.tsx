@@ -2,15 +2,25 @@
 import { useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import { PlatformModeBanner } from "./PlatformModeBanner";
+import { AvisoSemSmtp } from "./AvisoSemSmtp";
 import { AdminSidebar } from "./AdminSidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { List } from "@/lib/ui/icons";
 import { useT } from "@/hooks/i18n/useT";
+import type { ModuloOpcional } from "@/lib/instalacao/modulos";
 
 interface AdminShellProps {
   userEmail: string;
+  /** Repassado ao menu: entradas de módulo só aparecem com ele ligado. */
+  modulosLigados?: readonly ModuloOpcional[];
+  /**
+   * A instalação está SEM SMTP (lido uma vez em `app/admin/(protected)/layout.tsx`).
+   * `true` desenha o aviso persistente de `/admin/email` em todas as telas do
+   * admin (#2755, item 3); o padrão `false` mantém a casca como estava.
+   */
+  semSmtp?: boolean;
   children: ReactNode;
 }
 
@@ -55,7 +65,12 @@ interface AdminShellProps {
  * funcionando, em vez de repetir o erro a cada tela adicionada — é o padrão
  * recomendado pelo Radix (Provider perto da raiz, compartilhando o delay).
  */
-export function AdminShell({ userEmail, children }: AdminShellProps) {
+export function AdminShell({
+  userEmail,
+  modulosLigados = [],
+  semSmtp = false,
+  children,
+}: AdminShellProps) {
   const t = useT();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   // Mesmo padrão de `app/app/_components/AppShell.tsx`: ajuste de estado
@@ -71,12 +86,16 @@ export function AdminShell({ userEmail, children }: AdminShellProps) {
     <TooltipProvider>
       <div className="flex min-h-screen w-full flex-col bg-background">
         <PlatformModeBanner />
+        {/* Logo abaixo da tarja do modo plataforma: as duas são o topo
+            persistente deste painel — ver a medição de largura em
+            `PlatformModeBanner.tsx` e a decisão de lugar em `AvisoSemSmtp.tsx`. */}
+        {semSmtp ? <AvisoSemSmtp /> : null}
         <div className="flex flex-1">
-          <AdminSidebar userEmail={userEmail} />
+          <AdminSidebar userEmail={userEmail} modulosLigados={modulosLigados} />
           <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
             <SheetContent side="left" className="w-72 max-w-[85vw] gap-0 p-0 lg:hidden">
               <SheetTitle className="sr-only">{t("Menu de navegação")}</SheetTitle>
-              <AdminSidebar userEmail={userEmail} variant="mobile" />
+              <AdminSidebar userEmail={userEmail} variant="mobile" modulosLigados={modulosLigados} />
             </SheetContent>
           </Sheet>
           <div className="flex min-w-0 flex-1 flex-col">

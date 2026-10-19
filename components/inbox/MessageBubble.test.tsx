@@ -79,6 +79,21 @@ describe("MessageBubble — ações sobre mensagem própria", () => {
     await waitFor(() => expect(onApagar).toHaveBeenCalledOnce());
   });
 
+  it("ocultar no CRM não promete WhatsApp — a conversa pode ser do Instagram ou do Facebook", async () => {
+    // "Ocultar" aparece em todo canal (ao contrário de "Apagar para todos", que
+    // só existe onde o canal altera a mensagem enviada). O aviso dizia "continua
+    // no WhatsApp do cliente" também no direct do Instagram.
+    const user = userEvent.setup();
+    const onOcultar = vi.fn(async () => undefined);
+    render(<MessageBubble message={msg({ direction: "inbound", sent_via: "external_device" })} onOcultar={onOcultar} />);
+    await user.click(screen.getByRole("button", { name: "Opções da mensagem" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Ocultar no CRM" }));
+    const aviso = screen.getByText(/A mensagem continua na conversa do cliente/);
+    expect(aviso.textContent).not.toMatch(/whatsapp/i);
+    fireEvent.click(screen.getAllByRole("button", { name: "Ocultar no CRM" }).at(-1)!);
+    await waitFor(() => expect(onOcultar).toHaveBeenCalledOnce());
+  });
+
   it("salva com Enter, preserva Shift+Enter e evita envio duplicado", async () => {
     const user = userEvent.setup();
     const onEditar = vi.fn(async () => undefined);
@@ -157,7 +172,7 @@ describe("MessageBubble — ocultação local de recebida", () => {
     const { rerender } = render(<MessageBubble message={recebida} onOcultar={onOcultar} onRestaurar={onRestaurar} />);
     await user.click(screen.getByRole("button", { name: "Opções da mensagem" }));
     await user.click(await screen.findByRole("menuitem", { name: "Ocultar no CRM" }));
-    expect(screen.getByText(/continua no WhatsApp do cliente/)).toBeInTheDocument();
+    expect(screen.getByText(/continua na conversa do cliente/)).toBeInTheDocument();
     fireEvent.click(screen.getAllByRole("button", { name: "Ocultar no CRM" }).at(-1)!);
     await waitFor(() => expect(onOcultar).toHaveBeenCalledOnce());
     rerender(<MessageBubble message={{ ...recebida, metadata: { crm_hidden_at: "2026-09-24T12:00:00Z" } }}
@@ -330,5 +345,58 @@ describe("pino compartilhado pelo cliente", () => {
     render(<MessageBubble message={msg({ direction: "inbound", type: "location", body: "📍 Location" })} />);
     expect(screen.getByText("📍 Location")).toBeTruthy();
     expect(screen.queryByRole("link", { name: /Abrir no mapa/ })).toBeNull();
+  });
+});
+
+it("citação de contato compartilhado mostra o nome em vez do vCard bruto", () => {
+  const vcard = "BEGIN:VCARD\nFN:Rafa Baldin\nTEL;type=CELL:+5511999999999\nEND:VCARD";
+  render(<MessageBubble message={msg({ body: "Resposta" })} citada={msg({ id: "c2", type: "contact", body: vcard })} />);
+  expect(screen.getByText("Rafa Baldin")).toBeInTheDocument();
+  expect(screen.queryByText(/BEGIN:VCARD/)).toBeNull();
+});
+
+/**
+ * O remetente de GRUPO, acima do balão recebido.
+ *
+ * `metadata.group_sender` só é lido por `lerRemetenteDeGrupo`
+ * (`lib/messaging/remetente-de-grupo.ts`, Task 2) — este arquivo não conhece o
+ * formato bruto, só o resultado da leitura. Sem o nome de quem mandou, uma
+ * conversa de grupo lida no CRM mostra toda mensagem como se fosse da mesma
+ * pessoa, e é exatamente o WhatsApp que não faz essa confusão.
+ */
+describe("MessageBubble — remetente de grupo", () => {
+  it("mensagem de grupo mostra quem mandou acima do balão", () => {
+    render(
+      <MessageBubble
+        message={msg({
+          direction: "inbound",
+          body: "bom dia",
+          metadata: { group_sender: { name: "Maria", phone: "+5521999990000", lid: null } },
+        })}
+      />,
+    );
+    expect(screen.getByText("Maria · +5521999990000")).toBeInTheDocument();
+  });
+
+  it("mensagem individual não mostra remetente", () => {
+    render(
+      <MessageBubble message={msg({ direction: "inbound", body: "bom dia", metadata: {} })} />,
+    );
+    expect(screen.queryByText(/·/)).toBeNull();
+  });
+
+  it("mensagem outbound não mostra remetente de grupo mesmo com metadata presente", () => {
+    // `lerRemetenteDeGrupo` só é chamado para `inbound` no componente — uma
+    // mensagem que ESTE CRM mandou não tem "quem mandou" a descobrir.
+    render(
+      <MessageBubble
+        message={msg({
+          direction: "outbound",
+          body: "bom dia",
+          metadata: { group_sender: { name: "Maria", phone: "+5521999990000", lid: null } },
+        })}
+      />,
+    );
+    expect(screen.queryByText("Maria · +5521999990000")).toBeNull();
   });
 });

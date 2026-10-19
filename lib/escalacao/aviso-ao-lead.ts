@@ -119,7 +119,7 @@ const ABERTURAS: Record<MotivoDoAviso, readonly string[]> = {
   ],
   pediu_humano: [
     "Claro! Já estou chamando alguém da equipe para falar com você.",
-    "Sem problema — acabei de acionar uma pessoa do time para continuar daqui.",
+    "Sem problema. Acabei de acionar uma pessoa do time para continuar daqui.",
     "Perfeito. Passei sua conversa para um atendente humano agora.",
   ],
   orcamento_de_ia: [

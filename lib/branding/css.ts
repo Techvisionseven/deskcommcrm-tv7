@@ -51,6 +51,7 @@
  */
 
 import { GRAUS, stop } from "./rampa";
+import { ehFormaDeValorPermitida, ehNomeDeToken } from "./formas-de-valor";
 import type { CorResolvida } from "./resolve";
 
 export type CodigoDoCss =
@@ -71,21 +72,12 @@ export type CssDaMarca = {
   readonly motivos: readonly MotivoDoCss[];
 };
 
-/** `--nome-do-token`. Sem maiúscula, sem escape, sem espaço. */
-const NOME_DE_TOKEN = /^--[a-z][a-z0-9-]*$/;
-
 /**
- * As três formas de valor que este produto emite. Ancoradas nas duas pontas
- * (`^`/`$`) de propósito: sem âncora, `#ff0000; } body { x` casaria o prefixo e
- * passaria com o resto pendurado.
+ * `--nome-do-token`. Sem maiúscula, sem escape, sem espaço.
+ * A régua mora em `formas-de-valor.ts` — TODO emissor de custom property usa o
+ * mesmo `ehNomeDeToken`/`ehFormaDeValorPermitida`, para que duas definições de
+ * "forma segura" nunca divirjam.
  */
-const FORMAS_DE_VALOR: readonly RegExp[] = [
-  /^#[0-9a-f]{3}$/i,
-  /^#[0-9a-f]{6}$/i,
-  /^rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\)$/,
-  /^rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*(?:0|1|0?\.\d{1,4})\s*\)$/,
-  /^var\(--[a-z][a-z0-9-]*\)$/,
-];
 
 /**
  * Sequências que não podem existir na saída, checadas no texto JÁ montado.
@@ -118,7 +110,18 @@ function declaracoesDoTema(cor: CorResolvida, tema: "claro" | "escuro"): Declara
   const derivada = cor.derivada;
   if (!derivada) return saida;
 
-  const t = tema === "claro" ? derivada.claro : derivada.escuro;
+  // ── A segunda semente (#2482) ─────────────────────────────────────────────
+  //
+  // Só o ESCURO troca de fonte: com `corEscura` preenchida, o bloco
+  // `[data-theme="dark"]` deriva da segunda semente pela MESMA `derivarMarca`
+  // — mesmos pisos de contraste, mesmo deslocamento de rampa —, e o claro
+  // segue na primeira. Sem a chave, `fonte` é a própria `derivada`, que é o
+  // caminho de antes: a ausência é o caso normal, não um ramo especial.
+  //
+  // `--color-brand` continua sendo a semente PRINCIPAL nos DOIS blocos: ele é
+  // declarado acima, antes deste ponto, e é o que e-mail e logo leem.
+  const fonte = tema === "escuro" && cor.corEscura ? cor.corEscura.derivada : derivada;
+  const t = tema === "claro" ? fonte.claro : fonte.escuro;
 
   // Os 11 stops saem JÁ DESLOCADOS, e por isso podem diferir entre os dois
   // blocos. Os rótulos vêm de `GRAUS` (rampa.ts) e não de uma lista repetida
@@ -160,7 +163,7 @@ function declaracoesDoTema(cor: CorResolvida, tema: "claro" | "escuro"): Declara
   // sempre significou. Com d=0 — a Sage e toda marca que já cabe — a saída é
   // idêntica à de antes, byte a byte.
   for (const [i, grau] of GRAUS.entries()) {
-    saida.push([`--color-accent-${grau}`, stop(derivada.rampa, i + t.deslocamento)]);
+    saida.push([`--color-accent-${grau}`, stop(fonte.rampa, i + t.deslocamento)]);
   }
 
   saida.push(
@@ -277,7 +280,7 @@ export function cssDaMarca(
   for (const [seletor, tema] of escopo) {
     const decls = declaracoesDoTema(cor, tema);
     for (const [nome, valor] of decls) {
-      if (!NOME_DE_TOKEN.test(nome)) {
+      if (!ehNomeDeToken(nome)) {
         motivos.push({
           codigo: "nome_de_token_invalido",
           alvo: paraDiagnostico(nome),
@@ -285,7 +288,7 @@ export function cssDaMarca(
         });
         return { css: null, motivos };
       }
-      if (!FORMAS_DE_VALOR.some((forma) => forma.test(valor))) {
+      if (!ehFormaDeValorPermitida(valor)) {
         motivos.push({
           codigo: "valor_fora_da_allowlist",
           alvo: nome,

@@ -9,6 +9,7 @@ import { format, isToday, isYesterday } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { MessageBubble } from "./MessageBubble";
+import { separarReacoes } from "@/lib/inbox/reacoes-no-fio";
 import { NoteCard } from "./NoteCard";
 import { PassagemCard } from "./PassagemCard";
 import { useMessagesRealtime } from "@/hooks/inbox/useMessagesRealtime";
@@ -170,9 +171,11 @@ export function ChatThread({
     [passagens, currentUser.id, dono?.userId, dono?.nome],
   );
 
+  const { falas, reacoesPorAlvo } = useMemo(() => separarReacoes(messages), [messages]);
+
   const items: ThreadItem[] = useMemo(
-    () => mergeThreadItems(messages, notes, cartoes),
-    [messages, notes, cartoes],
+    () => mergeThreadItems(falas, notes, cartoes),
+    [falas, notes, cartoes],
   );
 
   const paginas = q.data?.pages.length ?? 0;
@@ -231,9 +234,22 @@ export function ChatThread({
       const sc = scrollerRef.current;
       if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight > 120) return;
     }
-    // Fio ainda vazio não ancora nada: marcar aqui faria a guarda valer a partir
-    // da pintura em branco, que é exatamente o defeito acima.
-    if (items.length > 0) jaAncorou.current = true;
+    /**
+     * O CARTÃO PODE CHEGAR COM O ESQUELETO AINDA NA TELA (#2515).
+     *
+     * As passagens vêm de `usePassagensDaConversa`, uma consulta própria, e
+     * podem resolver ANTES da de mensagens. Aí `items.length` já é 1 enquanto
+     * `q.isLoading` ainda é verdadeiro — e o ramo do esqueleto NÃO monta
+     * `scrollerRef` nem `bottomRef`. Marcar `jaAncorou` nesse instante consumia
+     * a abertura sobre um `scrollIntoView` que roda em cima de um ref nulo:
+     * nada rolava, mas quando as mensagens chegassem a guarda de distância via
+     * 308px até o fim e devolvia sem rolar, deixando "Assumir e responder"
+     * abaixo da dobra (medido na run 37660047994: `base=1028`, `janela=720`).
+     *
+     * Por isso a marca só vale com o destino montado: enquanto o fio de
+     * verdade não existe, a abertura continua pendente.
+     */
+    if (items.length > 0 && bottomRef.current) jaAncorou.current = true;
 
     bottomRef.current?.scrollIntoView({
       behavior: primeiraAncoragem ? "auto" : "smooth",
@@ -393,6 +409,7 @@ export function ChatThread({
                   // citada é antiga demais e ficou fora da página, o fio some —
                   // que é melhor que segurar a conversa esperando.
                   citada={porId.get(item.data.reply_to_message_id ?? "") ?? null}
+                  reacoes={reacoesPorAlvo.get(item.data.id)}
                   // Sem isto o balão diz "Você" em toda mensagem digitada no
                   // CRM — inclusive nas do colega, porque `sent_via='user'` só
                   // registra que um humano digitou, nunca qual.

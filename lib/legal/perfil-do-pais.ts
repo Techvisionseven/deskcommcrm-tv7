@@ -33,6 +33,31 @@
  *     países do que a lista oferece; é o que permite preparar o trabalho sem
  *     publicar o que ninguém revisou.
  *
+ * ─── Portugal: revisão feita por IA, por delegação do dono (doc 88) ───────
+ *
+ * Em 2026-10-05 a citação `RGPD art. 15.º (Regulamento (UE) 2016/679)` foi
+ * conferida por revisão AUTOMATIZADA, feita por IA por delegação do dono do
+ * produto (doc 88 das decisões; issues #1033 e #1946). NÃO é parecer jurídico
+ * e não houve advogado em Portugal. Fontes conferidas: o RGPD em português no
+ * JO L 119 de 4.5.2016 (repositório de publicações da UE, com as retificações
+ * do JO L 127/2018 e do JO L 74/2021, que não tocam os arts. 12.º, 15.º, 17.º
+ * e 20.º) e a reprodução da PGR Lisboa; a Lei n.º 58/2019 (nada nela muda o
+ * art. 15.º); as Guidelines 01/2022 do EDPB. O prazo do produto (7 e 15 dias
+ * úteis, calendário português) foi simulado de 2026 a 2030 e nunca passa do
+ * mês do art. 12.º, n.º 3.
+ *
+ * Por isso o perfil leva `revisadaPorIa` — a tela declara a natureza da
+ * revisão a quem responde pelo documento — e `rotuloNoDocumento: "Direito
+ * exercido"`: no RGPD, "base legal" é o art. 6.º (licitude), e o art. 15.º é
+ * o direito que o titular exerceu.
+ *
+ * Ressalva da Nuvemshop, reconferida em 2026-10-05: a Nuvemshop não abre loja
+ * em Portugal, e os 3 webhooks dela são o único caminho que cria pedido de
+ * titular (vigiado por `tests/unit/so-a-nuvemshop-cria-pedido-de-titular`).
+ * Uma organização portuguesa com loja Nuvemshop BRASILEIRA alcança o fluxo; aí
+ * o titular é brasileiro e as duas leis podem valer — citar o RGPD não é
+ * falso, mas é incompleto.
+ *
  * ─── A separação documento × forma (regra adotada do #928) ────────────────
  *
  * Não se inventa dígito verificador. País com checksum público documentado
@@ -43,6 +68,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { HOLIDAYS_BR_ISO } from "@/lib/lgpd/holidays-br";
+import { HOLIDAYS_PT_ISO } from "@/lib/lgpd/holidays-pt";
 
 /** ISO-3166 alpha-2, em maiúsculas. `null`/vazio na coluna significa Brasil. */
 export type CodigoDePais = string;
@@ -102,6 +128,27 @@ export interface DocumentoDoTitular {
   normaliza(valor: string): string;
 }
 
+/**
+ * Os rótulos da tela da ORGANIZAÇÃO — o nome legal da empresa e o número que a
+ * identifica (`legal_name` e `cnpj` no schema de Configurações).
+ *
+ * Mesma razão de `DocumentoDoTitular.rotulo`: o vocabulário de TELA é
+ * propriedade do país, e não do componente. Enquanto
+ * `app/app/settings/tenant/_form.tsx` escrevia "Razão social" e "CNPJ" em
+ * duro, uma organização portuguesa via o Brasil na própria tela de
+ * Configurações (issue #1946, item 4) — o mesmo defeito que o #1945 corrigiu
+ * nos diálogos de negócio e de contato.
+ *
+ * A coluna continua `cnpj` e o schema não muda: muda só o que se lê na tela,
+ * a mesma régua de `apelidosDoCabecalho` (o vocabulário de tela muda, o dado não).
+ */
+export interface EmpresaDoPais {
+  /** O rótulo da tela do nome legal: "Razão social", "Denominação social". */
+  rotuloNomeLegal: string;
+  /** O rótulo da tela do número da empresa: "CNPJ", "NIPC". */
+  rotuloNumero: string;
+}
+
 export interface LeiCitada {
   /** Sigla pela qual a lei é conhecida: "LGPD", "GDPR". */
   nome: string;
@@ -114,6 +161,59 @@ export interface LeiCitada {
    * o documento não cita esta lei (ver cabeçalho).
    */
   revisada: boolean;
+  /**
+   * A revisão foi feita por IA, sem advogado local. A tela de Configurações
+   * declara isso a quem responde pelo documento (ver o cabeçalho).
+   */
+  revisadaPorIa?: true;
+  /**
+   * Como o documento de acesso rotula a citação.
+   *
+   * O Brasil DECLARA desde a issue #2344: "Base legal" era impreciso ali — o
+   * art. 18 da LGPD é um DIREITO do titular, e a base legal fica nos arts. 7 e
+   * 11. Portugal já usava "Direito exercido" (doc 88), e o rótulo brasileiro
+   * passa a ser o mesmo. Ausente = o renderizador cai no rótulo do perfil
+   * padrão, e país sem lei revisada não chega aqui (a citação é `null`).
+   */
+  rotuloNoDocumento?: string;
+}
+
+/**
+ * Os papéis legais como o PAÍS os chama — o rótulo do rodapé do relatório e do
+ * documento de acesso.
+ *
+ * "Controlador" e "Encarregado (DPO)" são os termos da LGPD brasileira. No
+ * RGPD em português de Portugal os mesmos papéis são "Responsável pelo
+ * tratamento" (art. 4.º, n.º 7) e "Encarregado da proteção de dados" (art.
+ * 37.º) — e uma organização portuguesa lia os dois termos brasileiros no PDF
+ * que o próprio sistema gerava para o titular dela (issue #2344).
+ *
+ * Mesma razão de `empresa` e `documento`: o vocabulário legal é propriedade do
+ * país, e não do componente. Os valores brasileiros são o PADRÃO do produto —
+ * quem renderiza sem perfil (payload de teste, país sem registro) usa os dele.
+ */
+export interface PapeisDoPais {
+  /** O responsável pelos dados: "Controlador" (BR), "Responsável pelo tratamento" (PT). */
+  controlador: string;
+  /** O contato do titular: "Encarregado (DPO)" (BR), "Encarregado da proteção de dados" (PT). */
+  encarregado: string;
+}
+
+/**
+ * A autoridade de supervisão do país — a alínea f) do art. 15.º, n.º 1.
+ *
+ * Mora no PERFIL, e não no módulo do art. 15.º, porque é propriedade do país:
+ * trocar de país troca a autoridade junto com a lei e com o calendário (mesma
+ * razão de `lei`, `calendario` e `padroesDePii`). Um país sem autoridade
+ * revisada não declara o campo, e o relatório não emite a alínea f) — a mesma
+ * régua de `lei.revisada`: a lei errada, ou a autoridade errada, é pior do que
+ * não citar.
+ */
+export interface AutoridadeDeSupervisao {
+  /** Como a autoridade é conhecida, já com a sigla: "Comissão Nacional de Proteção de Dados (CNPD)". */
+  nome: string;
+  /** Onde o titular reclama. Site oficial, não buscado em runtime. */
+  site: string;
 }
 
 export interface CalendarioDeDiasUteis {
@@ -129,8 +229,60 @@ export interface PerfilDoPais {
   /** Nome do país como o operador o lê. */
   nome: string;
   documento: DocumentoDoTitular;
+  /**
+   * Os rótulos da tela da ORGANIZAÇÃO — nome legal e número da empresa.
+   *
+   * Vêm do país junto com `documento`, porque a mesma troca de país na tela de
+   * Configurações troca os dois: o rótulo não é do componente.
+   */
+  empresa: EmpresaDoPais;
+  /**
+   * Um telefone DESTE país em E.164, para o exemplo dos formulários.
+   *
+   * Mora aqui porque o campo é o mesmo em toda tela e o exemplo não é: o
+   * `+5511999998888` escrito em duro em `NewContactDialog` ensinava DDI
+   * brasileiro a quem cadastra cliente em Lisboa. País novo declara o seu.
+   */
+  telefoneExemplo: string;
+  /**
+   * A LÍNGUA dos destinatários deste país, em BCP-47 (`pt-BR`, `pt-PT`).
+   *
+   * Decide o `lang` do HTML e a língua dos textos que saem do produto para quem
+   * está no país — o alarme ao encarregado (`lib/lgpd/sla-alarm.ts`) é o
+   * primeiro consumidor (issue #2347, item 2). NÃO é a língua da INTERFACE
+   * (`lib/i18n/idiomas`): a interface segue quem opera, e um país pode falar uma
+   * variante que o seletor de idioma não oferece (`pt-PT`). Obrigatória de
+   * propósito, pela mesma razão de `empresa`: país novo declara a sua, e o
+   * esquecimento vira erro de tipo em vez de texto em português calado.
+   */
+  idioma: string;
+  /**
+   * O FUSO SUGERIDO ao escolher este país no seletor (issue #2347, item 4).
+   *
+   * Não é o fuso GRAVADO nem o `FUSO_PADRAO` do produto: uma organização de
+   * Portugal que nunca trocou o fuso continua com `America/Sao_Paulo` (o
+   * DEFAULT da coluna) e mandava ao titular datas em GMT-3. O seletor de país
+   * oferece este valor, e quem escolhe ainda pode recusá-lo trocando o fuso.
+   */
+  fusoDoSugerido: string;
   /** `null` quando o país ainda não tem lei revisada para citar. */
   lei: LeiCitada | null;
+  /**
+   * Os papéis do documento, no vocabulário do país (issue #2344).
+   *
+   * Vêm do perfil junto com `lei`, porque a mesma troca de país troca os dois:
+   * o rodapé do relatório que o titular recebe num país não pode chamar o
+   * responsável pelos dados por um nome que a lei daquele país não usa.
+   */
+  papel: PapeisDoPais;
+  /**
+   * A autoridade a quem o titular reclama (art. 15.º, n.º 1, al. f)). Ausente
+   * em países cuja citação não foi revisada — e o Brasil, cujo documento segue
+   * a LGPD (art. 18, II) e não a lista do RGPD, não declara este campo: a
+   * regra byte a byte do doc 88 (`tests/fixtures/lgpd-brasil-antes-do-doc88/`)
+   * é o que trava o PDF brasileiro.
+   */
+  autoridadeDeSupervisao?: AutoridadeDeSupervisao;
   calendario: CalendarioDeDiasUteis;
   /** Padrões PRÓPRIOS do país; e-mail/telefone são universais e moram fora. */
   padroesDePii: readonly PadraoDePiiDoPais[];
@@ -159,6 +311,24 @@ export function isValidCpf(raw: string): boolean {
   return d2 === parseInt(s[10]!, 10);
 }
 
+/**
+ * O mod-11 do NIF português — o dígito de controlo da Autoridade Tributária,
+ * algoritmo público (não é checksum inventado; respeita a régua do #928).
+ *
+ * Para os oito primeiros dígitos valem os pesos 9..2 (da esquerda para a
+ * direita); o resto da soma módulo 11 decide o dígito: resto 0 ou 1 → `0`,
+ * senão `11 - resto`. O nono dígito tem de bater com esse cálculo.
+ */
+export function isValidNif(raw: string): boolean {
+  const s = raw.replace(/\D/g, "");
+  if (!/^\d{9}$/.test(s) || /^(\d)\1{8}$/.test(s)) return false;
+  let sum = 0;
+  for (let i = 0; i < 8; i++) sum += parseInt(s[i]!, 10) * (9 - i);
+  const resto = sum % 11;
+  const digito = resto < 2 ? 0 : 11 - resto;
+  return digito === parseInt(s[8]!, 10);
+}
+
 const DOCUMENTO_BR: DocumentoDoTitular = {
   rotulo: "CPF",
   exemplo: "000.000.000-00",
@@ -174,11 +344,31 @@ const PERFIL_BR: PerfilDoPais = {
   codigo: "BR",
   nome: "Brasil",
   documento: DOCUMENTO_BR,
+  // O par que a tela da organização mostra no Brasil (issue #1946, item 4).
+  empresa: {
+    rotuloNomeLegal: "Razão social",
+    rotuloNumero: "CNPJ",
+  },
+  telefoneExemplo: "+5511999998888",
+  idioma: "pt-BR",
+  fusoDoSugerido: "America/Sao_Paulo",
   lei: {
     nome: "LGPD",
     numero: "Lei nº 13.709/2018",
     artigo: "Art. 18, II",
     revisada: true,
+    // O art. 18 da LGPD é um DIREITO do titular (o art. 18, II, o de acesso),
+    // e não uma base legal — esta fica nos arts. 7 e 11. Portugal já rotulava
+    // "Direito exercido" (doc 88); o Brasil passa a rotular igual (issue #2344).
+    // O `data.json` brasileiro NÃO ganha chave nova: `foraDoBrasil` continua
+    // devolvendo `{}` para o padrão, e o rótulo sai do PERFIL no renderizador.
+    rotuloNoDocumento: "Direito exercido",
+  },
+  // Os papéis como a LGPD os chama — e o padrão do produto: quem renderiza
+  // sem perfil usa estes (issue #2344).
+  papel: {
+    controlador: "Controlador",
+    encarregado: "Encarregado (DPO)",
   },
   calendario: {
     feriados: HOLIDAYS_BR_ISO,
@@ -201,6 +391,98 @@ const PERFIL_BR: PerfilDoPais = {
   ],
 };
 
+const DOCUMENTO_PT: DocumentoDoTitular = {
+  rotulo: "NIF",
+  exemplo: "123 456 789",
+  regra: "dígito de controlo (mod-11 da Autoridade Tributária)",
+  mensagemInvalido: "NIF inválido",
+  confereDigito: true,
+  apelidosDoCabecalho: ["nif", "contribuinte"],
+  valida: isValidNif,
+  normaliza: (valor) => valor.replace(/\D/g, ""),
+};
+
+const PERFIL_PT: PerfilDoPais = {
+  codigo: "PT",
+  nome: "Portugal",
+  documento: DOCUMENTO_PT,
+  // Como Portugal chama o mesmo par (issue #1946, item 4): `Denominação social`
+  // é a designação legal da firma, e `NIPC` o Número de Identificação de
+  // Pessoas Coletivas — o análogo do CNPJ, e não um NIF de titular.
+  empresa: {
+    rotuloNomeLegal: "Denominação social",
+    rotuloNumero: "NIPC",
+  },
+  telefoneExemplo: "+351912345678",
+  idioma: "pt-PT",
+  fusoDoSugerido: "Europe/Lisbon",
+  lei: {
+    nome: "RGPD",
+    numero: "Regulamento (UE) 2016/679",
+    artigo: "art. 15.º",
+    // Revisada por IA em 2026-10-05, por delegação do dono (doc 88) — não é
+    // parecer jurídico. Registro completo no cabeçalho deste arquivo.
+    revisada: true,
+    revisadaPorIa: true,
+    rotuloNoDocumento: "Direito exercido",
+  },
+  // Os papéis como o RGPD em pt-PT os chama: "responsável pelo tratamento"
+  // (art. 4.º, n.º 7) e "encarregado da proteção de dados" (art. 37.º) — as
+  // fontes são as mesmas da revisão do doc 88 (JO L 119), com a mesma ressalva
+  // de revisão por IA. Enquanto o rodapé dizia "Controlador" e "Encarregado
+  // (DPO)", o titular português lia o vocabulário da lei brasileira.
+  papel: {
+    controlador: "Responsável pelo tratamento",
+    encarregado: "Encarregado da proteção de dados",
+  },
+  // Alínea f) do art. 15.º, n.º 1: a autoridade portuguesa. Conferida em
+  // 2026-10-05 na fonte primária (site oficial da CNPD) junto com o resto da
+  // revisão do doc 88; a mesma ressalva vale — revisão por IA, sem advogado.
+  autoridadeDeSupervisao: {
+    nome: "Comissão Nacional de Proteção de Dados (CNPD)",
+    site: "https://www.cnpd.pt",
+  },
+  calendario: {
+    feriados: HOLIDAYS_PT_ISO,
+    rotulo: "feriados nacionais portugueses",
+  },
+  padroesDePii: [
+    {
+      // ANTES do NIF: `+351 912 345 678` tem três blocos que o padrão de NIF
+      // também casaria (o miolo `912 345 678`), e o telefone é o dono do número.
+      tipo: "telefonePT",
+      marcador: "[TELEFONE]",
+      fonte: "\\+351[\\s.-]?\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{3}",
+      naoCobre:
+        "telemóvel de 9 dígitos sem o `+351` — é indistinguível de um NIF e os dois são PII; o que separa é o prefixo",
+    },
+    {
+      tipo: "iban",
+      marcador: "[IBAN]",
+      fonte: "\\bPT\\d{2}(?:\\s?\\d{4}){5}\\s?\\d\\b",
+      naoCobre: "IBAN de outro país e IBAN colado a letra sem o prefixo `PT`",
+    },
+    {
+      tipo: "nif",
+      marcador: "[NIF]",
+      // O lookahead deixa o CPF separado (`123.456.789-09`) para o padrão
+      // brasileiro: sem ele, os nove primeiros dígitos viravam `[NIF]` e os
+      // dois do dígito de controlo sobravam no texto (medido na cerca
+      // `mascara-da-ingestao-tem-o-brasil-por-baixo`).
+      fonte: "\\b(?:PT\\s?)?\\d{3}[ .]?\\d{3}[ .]?\\d{3}(?![.\\s-]\\d{2}\\b)\\b",
+      naoCobre:
+        "NIF colado a letra sem o prefixo `PT` (ex.: `nif123456789`) e NIF com menos de 9 dígitos",
+    },
+    {
+      tipo: "codigoPostal",
+      marcador: "[CODIGO_POSTAL]",
+      fonte: "\\b\\d{4}[-\\s]\\d{3}\\b",
+      naoCobre:
+        "código postal sem separador (7 dígitos) e código estrangeiro (CEP brasileiro usa ponto e 8 dígitos)",
+    },
+  ],
+};
+
 /**
  * O registro de países conhecidos.
  *
@@ -215,6 +497,7 @@ const PERFIL_BR: PerfilDoPais = {
  */
 export const PERFIS_DO_PAIS: Record<CodigoDePais, PerfilDoPais> = {
   BR: PERFIL_BR,
+  PT: PERFIL_PT,
 };
 
 /** O perfil de um código; vazio ou desconhecido degrada para o Brasil. */

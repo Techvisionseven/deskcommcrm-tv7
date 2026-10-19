@@ -3,7 +3,7 @@
  * Next (`./ponto.ts` lê a chave pelo cliente admin do Supabase).
  *
  * Duas coisas, iguais para toda tarefa que o turno pergunta (a manipulação, o
- * roteador): ler o estado da tarefa na organização, e gravar a linha de erro da
+ * roteador, a resposta ao follow-up): ler o estado da tarefa na organização, e gravar a linha de erro da
  * falha que pede ação. Nenhuma das duas lança: o turno é o atendimento do
  * cliente.
  */
@@ -12,7 +12,7 @@ import type pg from "pg";
 import { logger } from "@/lib/logger";
 
 import { MODELO_DO_JEV, type FalhaDaDecisao } from "./cliente";
-import { lerConfigDoJev, type EstadoDaTarefa } from "./config";
+import { lerConfigDoJev, type ConfigDoJev, type EstadoDaTarefa } from "./config";
 import { estadoEfetivoDaTarefa, type TarefaDoJev } from "./tarefas";
 import { codigoDoErroDoJev } from "./textos";
 
@@ -20,25 +20,34 @@ import { codigoDoErroDoJev } from "./textos";
  * O estado da tarefa nesta organização. Leitura que falha vale desligada: sem
  * saber se a empresa consentiu, nada sai para a rede.
  */
-export async function estadoDaTarefaNoPool(
+export async function configDaTarefaNoPool(
   pool: pg.Pool,
   organizationId: string,
   tarefa: TarefaDoJev,
-): Promise<EstadoDaTarefa> {
+): Promise<ConfigDoJev> {
   try {
     const { rows } = await pool.query<{ settings: unknown }>(
       "select settings from public.organizations where id = $1",
       [organizationId],
     );
-    return estadoEfetivoDaTarefa(lerConfigDoJev(rows[0]?.settings), tarefa);
+    return lerConfigDoJev(rows[0]?.settings);
   } catch (erro) {
     logger.warn("estado do Jev não pôde ser lido; a tarefa segue só com a IA de sempre", {
       organization_id: organizationId,
       tarefa: tarefa.id,
       erro: erro instanceof Error ? erro.name : typeof erro,
     });
-    return "desligada";
+    return lerConfigDoJev(null);
   }
+}
+
+/** Estado e aceite podem ser resolvidos da mesma leitura, sem corrida entre consultas. */
+export async function estadoDaTarefaNoPool(
+  pool: pg.Pool,
+  organizationId: string,
+  tarefa: TarefaDoJev,
+): Promise<EstadoDaTarefa> {
+  return estadoEfetivoDaTarefa(await configDaTarefaNoPool(pool, organizationId, tarefa), tarefa);
 }
 
 /**

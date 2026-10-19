@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 import { loadAuthUser } from "@/lib/auth/server";
@@ -10,6 +10,19 @@ vi.mock("@/lib/auth/server", () => ({
   mfaEmDivida: vi.fn(async () => false),
 }));
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
+// A escrita da instalação passa por requirePlatformAdminEscrita (scope 'full' +
+// MFA em dia): o dublê entrega a linha REAL de `platform_admins`, para que a
+// regra rode de verdade em vez de ser encenada.
+const pa = vi.hoisted(() => ({ row: null as Record<string, unknown> | null }));
+vi.mock("@/lib/supabase/server", () => ({
+  createClient: async () => ({
+    auth: { getUser: async () => ({ data: { user: { id: "11111111-1111-4111-8111-111111111111" } } }) },
+    from: () => {
+      const q = { select: () => q, eq: () => q, is: () => q, maybeSingle: async () => ({ data: pa.row }) };
+      return q;
+    },
+  }),
+}));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined) }));
 
 const OWNER = { id: "11111111-1111-4111-8111-111111111111", email: "dono@x.com", is_platform_admin: true };
@@ -39,9 +52,17 @@ let insertError: { code: string; message: string } | null;
 let versionSelectError: { message: string } | null;
 /** Erro que a leitura (`maybeSingle`) de `system_update_runs` deve devolver neste caso. */
 let runSelectError: { message: string } | null;
+/**
+ * A linha de `platform_smtp_settings` que o dublê devolve — é ela que decide se
+ * a instalação TEM SMTP, e portanto se o painel mostra o aviso (#2755).
+ */
+let smtpRow: Record<string, unknown> | null;
+/** Erro que a leitura (`maybeSingle`) de `platform_smtp_settings` deve devolver. */
+let smtpSelectError: { message: string } | null;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  pa.row = { user_id: "11111111-1111-4111-8111-111111111111", scope: "full", mfa_required: false, revoked_at: null };
   inserted = null;
   runRow = null;
   runUpdatePatch = null;
@@ -49,6 +70,8 @@ beforeEach(() => {
   insertError = null;
   versionSelectError = null;
   runSelectError = null;
+  smtpRow = null;
+  smtpSelectError = null;
   versionRow = {
     id: 1,
     current_version: "1.0.0",
@@ -76,8 +99,18 @@ beforeEach(() => {
       // quebraria com TypeError, e o teste "melhoraria" o mock em vez do
       // double refletir a query de verdade.
       const maybeSingle = async () => ({
-        data: table === "system_version" ? versionRow : runRow,
-        error: table === "system_version" ? versionSelectError : runSelectError,
+        data:
+          table === "system_version"
+            ? versionRow
+            : table === "platform_smtp_settings"
+              ? smtpRow
+              : runRow,
+        error:
+          table === "system_version"
+            ? versionSelectError
+            : table === "platform_smtp_settings"
+              ? smtpSelectError
+              : runSelectError,
       });
       return {
         select: () => ({
@@ -114,6 +147,12 @@ beforeEach(() => {
       };
     },
   } as never);
+});
+
+// `SINGLE_SERVER` entra e sai por caso (o estado do SMTP depende dele): sem esta
+// limpeza, o primeiro caso que o liga contaminaria todos os seguintes.
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 function get() {
@@ -307,6 +346,65 @@ describe("GET /api/v1/system/version", () => {
     expect(body.data.current_version).toBe("1.0.0");
     expect(body.data.update_available).toBe(true);
     expect(body.data.run.superseded).toBe(false);
+  });
+
+  /**
+   * O ESTADO PERSISTIDO DA RODADA CHEGANDO À TELA — o coração do #1040.
+   *
+   * O kit grava disputa/retentativas/passada nas três colunas do run; quem
+   * conta isso para quem clicou é ESTA rota. Se ela devolvesse só
+   * sucesso/falha (o `status`), a tela continuaria contando uma história mais
+   * simples que a acontecida — o aviso morreria no `.update.log`, no disco da
+   * VPS, exatamente como o issue descreve.
+   */
+  it("⭐ devolve a rodada do banco do run — disputa, retentativas e passada", async () => {
+    versionRow.current_version = "1.0.0";
+    runRow = {
+      id: "55555555-5555-4555-8555-555555555555",
+      status: "success",
+      last_step: "app",
+      dispatched_at: new Date().toISOString(),
+      from_version: "1.0.0",
+      to_version: "1.1.0",
+      log_tail: "deadlock detected … 2ª passada fechou",
+      disputa_de_banco: true,
+      retentativas_do_banco: 1,
+      passada_do_banco: 2,
+    };
+    vi.mocked(loadAuthUser).mockResolvedValue(OWNER as never);
+    const { GET } = await import("../version/route");
+    const body = await (await GET(get())).json();
+
+    expect(body.data.run.status).toBe("success");
+    expect(body.data.run.rodada_do_banco).toEqual({
+      disputa: true,
+      retentativas: 1,
+      passada: 2,
+    });
+  });
+
+  it("coluna nula é 'não medido': a rota devolve null, não zero", async () => {
+    // Rodada que não passou pelo banco (atualização só de código) deixa as três
+    // colunas nulas. `null` é o que mantém a tela calada; `0` viraria a frase
+    // "não houve disputa" para uma disputa que ninguém mediu.
+    versionRow.current_version = "1.0.0";
+    runRow = {
+      id: "55555555-5555-4555-8555-555555555555",
+      status: "success",
+      last_step: "codigo",
+      dispatched_at: new Date().toISOString(),
+      from_version: "1.0.0",
+      to_version: "1.1.0",
+      log_tail: "",
+      disputa_de_banco: null,
+      retentativas_do_banco: null,
+      passada_do_banco: null,
+    };
+    vi.mocked(loadAuthUser).mockResolvedValue(OWNER as never);
+    const { GET } = await import("../version/route");
+    const body = await (await GET(get())).json();
+
+    expect(body.data.run.rodada_do_banco).toBeNull();
   });
 
   it("depois de um rollback, quem não é dono também vê a versão que está no ar", async () => {
@@ -690,9 +788,20 @@ describe("POST /api/v1/system/update", () => {
   });
 
   it("nega para quem não é dono do servidor", async () => {
+    pa.row = null;
     vi.mocked(loadAuthUser).mockResolvedValue(MEMBRO as never);
     const { POST } = await import("../update/route");
     expect((await POST(post())).status).toBe(403);
+    expect(inserted).toBeNull();
+  });
+
+  it("nega o platform admin somente leitura (support_readonly) com forbidden_scope", async () => {
+    pa.row = { ...pa.row, scope: "support_readonly" };
+    vi.mocked(loadAuthUser).mockResolvedValue(OWNER as never);
+    const { POST } = await import("../update/route");
+    const res = await POST(post());
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.code).toBe("forbidden_scope");
     expect(inserted).toBeNull();
   });
 
@@ -779,5 +888,81 @@ describe("POST /api/v1/system/update", () => {
     const body = await res.json();
     expect(body.error.code).toBe("state_conflict");
     expect(body.error.message).toBe("Já existe uma atualização em andamento.");
+  });
+});
+
+/**
+ * #2755 (item 3): O PAINEL DE ATUALIZAÇÃO PRECISA SABER — E SÓ O DONO PRECISA.
+ *
+ * O aviso de "sem SMTP" no painel lê este campo. Ele nasce do caminho de leitura
+ * que já existe (`lerSmtp`, o mesmo que a tela /admin/email usa) e da régua da
+ * ação que sofre com o problema (`semSmtpNaInstalacao`): host E remetente, só no
+ * servidor único, e só quando o BANCO respondeu — um soluço dele não é falta de
+ * configuração. Quem não é dono não recebe o campo: aviso sem ação disponível é
+ * só ansiedade.
+ */
+describe("GET /api/v1/system/version — o estado do SMTP da instalação", () => {
+  const LINHA_COM_SMTP = {
+    smtp_host: "smtp.revenda.com.br",
+    smtp_port: 587,
+    smtp_security: "starttls",
+    smtp_username: "nao-responda@revenda.com.br",
+    smtp_password_encrypted: null,
+    from_email: "nao-responda@revenda.com.br",
+    from_name: "Revenda",
+  };
+
+  async function corpo() {
+    const { GET } = await import("../version/route");
+    return (await GET(get())).json();
+  }
+
+  it("⭐ servidor único sem SMTP: o dono recebe smtp_configured: false", async () => {
+    vi.stubEnv("SINGLE_SERVER", "1");
+    vi.mocked(loadAuthUser).mockResolvedValue(OWNER as never);
+
+    const body = await corpo();
+
+    expect(body.data.smtp_configured).toBe(false);
+  });
+
+  it("⭐ CONTROLE — com SMTP salvo na tela: smtp_configured: true e o painel fica calado", async () => {
+    vi.stubEnv("SINGLE_SERVER", "1");
+    smtpRow = LINHA_COM_SMTP;
+    vi.mocked(loadAuthUser).mockResolvedValue(OWNER as never);
+
+    const body = await corpo();
+
+    expect(body.data.smtp_configured).toBe(true);
+  });
+
+  it("banco que NÃO respondeu não vira 'sem SMTP' — soluço não é falta de configuração", async () => {
+    // Quem lê o aviso vai configurar uma coisa que talvez já esteja lá: "não sei"
+    // não pode sair da rota disfarçado de "não tem".
+    vi.stubEnv("SINGLE_SERVER", "1");
+    smtpSelectError = { message: "relation does not exist" };
+    vi.mocked(loadAuthUser).mockResolvedValue(OWNER as never);
+
+    const body = await corpo();
+
+    expect(body.data.smtp_configured).toBe(true);
+  });
+
+  it("fora do servidor único o login tem e-mail próprio: não há o que avisar", async () => {
+    vi.stubEnv("SINGLE_SERVER", "");
+    vi.mocked(loadAuthUser).mockResolvedValue(OWNER as never);
+
+    const body = await corpo();
+
+    expect(body.data.smtp_configured).toBe(true);
+  });
+
+  it("quem não é dono não recebe o campo — é ele quem configura, e aviso sem ação é ansiedade", async () => {
+    vi.stubEnv("SINGLE_SERVER", "1");
+    vi.mocked(loadAuthUser).mockResolvedValue(MEMBRO as never);
+
+    const body = await corpo();
+
+    expect(body.data.smtp_configured).toBeUndefined();
   });
 });

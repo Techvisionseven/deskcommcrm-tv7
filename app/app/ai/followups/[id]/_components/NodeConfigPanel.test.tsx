@@ -140,3 +140,35 @@ describe("NodeConfigPanel — o formulário do lembrete interno", () => {
     );
   });
 });
+
+// #1130 (@vgamkt), decisão do doc 69 (b): cada roteiro escolhe se recomeça para
+// quem já o concluiu, e o padrão é NÃO.
+describe("NodeConfigPanel — o roteiro que recomeça", () => {
+  it("nasce desligado e, ligado, grava `pode_recomecar` nas configurações do roteiro", async () => {
+    const onSettingsChange = vi.fn();
+    montarCom("trigger", { surface: "atendimento", onSettingsChange });
+
+    const chave = screen.getByTestId("roteiro-pode-recomecar").querySelector('[role="switch"]');
+    expect(chave).not.toBeNull();
+    expect(chave).toHaveAttribute("aria-checked", "false");
+
+    await userEvent.setup({ delay: null }).click(chave!);
+    expect(onSettingsChange).toHaveBeenCalledWith(expect.objectContaining({ pode_recomecar: true }));
+  });
+
+  it("desligar tira a chave do grafo (volta ao padrão) sem perder as outras configurações", async () => {
+    const onSettingsChange = vi.fn();
+    montarCom("trigger", {
+      surface: "atendimento",
+      settings: { max_tentativas_pergunta: 4, gatilhos: ["agendar"], pode_recomecar: true },
+      onSettingsChange,
+    });
+
+    const chave = screen.getByTestId("roteiro-pode-recomecar").querySelector('[role="switch"]');
+    expect(chave).toHaveAttribute("aria-checked", "true");
+    await userEvent.setup({ delay: null }).click(chave!);
+
+    const gravado = onSettingsChange.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(gravado).toEqual({ max_tentativas_pergunta: 4, gatilhos: ["agendar"] });
+  });
+});

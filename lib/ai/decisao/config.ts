@@ -29,6 +29,8 @@
  */
 import { z } from "zod";
 
+import { ORIGEM_PADRAO, ORIGENS_DO_JEV } from "./origem";
+
 import type { createAdminClient } from "@/lib/supabase/admin";
 
 export const ESTADOS_DA_TAREFA = ["observando", "decidindo", "desligada"] as const;
@@ -66,6 +68,12 @@ const tarefasSchema = z.object({
   clima: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
   manipulacao: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
   roteador: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
+  humano: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
+  opt_out: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
+  followup: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
+  campo_do_negocio: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
+  sinal_de_urgencia: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
+  afirmacao_de_fato: tarefaGravadaSchema.optional().catch(tarefaIlegivel),
 });
 
 export const idDaTarefaSchema = tarefasSchema.keyof();
@@ -79,6 +87,16 @@ export const configDoJevSchema = z
      * sempre decide. `decide`: o Jev decide. Gravar o clima grava os dois.
      */
     modo: z.enum(["observacao", "decide"]).default("observacao"),
+    /** Instalações existentes continuam comparando até o admin escolher o modo independente. */
+    modo_roteador: z.enum(["comparacao", "sob_demanda"]).default("comparacao"),
+    /**
+     * DE ONDE O JEV RESPONDE (`./origem`): a TypeSafe direto, ou via OpenRouter
+     * reaproveitando a credencial OpenRouter da organização. Ausente é o caminho
+     * de sempre — a instalação que nunca escolheu nada não muda de
+     * comportamento. Um valor desconhecido (versão mais nova) cai no padrão: o
+     * `z.enum` recusa a config inteira, e o leitor devolve `DESLIGADO`.
+     */
+    origem: z.enum(ORIGENS_DO_JEV).default(ORIGEM_PADRAO),
     /**
      * Quem aceitou mandar a mensagem ao fornecedor estrangeiro, e quando.
      * `alcance` ausente é o aceite da onda 1: cada mensagem, sozinha. Aceite
@@ -109,7 +127,13 @@ export const configDoJevSchema = z
 
 export type ConfigDoJev = z.infer<typeof configDoJevSchema>;
 
-const DESLIGADO: ConfigDoJev = { ligado: false, modo: "observacao", aceite: null };
+const DESLIGADO: ConfigDoJev = {
+  ligado: false,
+  modo: "observacao",
+  modo_roteador: "comparacao",
+  origem: ORIGEM_PADRAO,
+  aceite: null,
+};
 
 export function lerConfigDoJev(settings: unknown): ConfigDoJev {
   const jev =
@@ -124,7 +148,7 @@ export type ResultadoDeGravarConfig =
   | { ok: true; config: ConfigDoJev }
   | { ok: false; motivo: "leitura_falhou" | "config_invalida" | "escrita_recusada" };
 
-export type MudancaDaConfig = Partial<Pick<ConfigDoJev, "ligado" | "modo" | "aceite">> & {
+export type MudancaDaConfig = Partial<Pick<ConfigDoJev, "ligado" | "modo" | "modo_roteador" | "origem" | "aceite">> & {
   /** Só as tarefas que mudam; as outras ficam como estão. */
   tarefas?: Partial<Record<IdDaTarefa, EstadoDaTarefa>>;
 };

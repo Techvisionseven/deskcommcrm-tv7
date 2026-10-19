@@ -7,13 +7,14 @@
  * `admin` da organização, MFA quando houver fator, e auditoria. Listar só lê,
  * mas lê pela credencial da organização, então o gate é o mesmo.
  */
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 import { supportWriteError } from "@/lib/impersonate/support";
 import { headers } from "next/headers";
 import { z } from "zod";
 
 import { audit } from "@/lib/audit";
 import { loadAuthUser, mfaEmDivida, resolveActiveOrg } from "@/lib/auth/server";
-import { ROLE_RANK } from "@/lib/auth/types";
+import { podeAdministrarEmpresa } from "@/lib/auth/pode-administrar-empresa";
 import { VALORES_DE_CATEGORIA } from "@/lib/conversoes/regras-google";
 import {
   criarAcaoDeConversao,
@@ -37,10 +38,7 @@ async function autorizar(escrita: boolean) {
     return { ok: false as const, error: "forbidden_role" as const };
   const activeOrg = await resolveActiveOrg(authUser);
   if (!activeOrg) return { ok: false as const, error: "forbidden_tenant" as const };
-  if (
-    !(authUser.is_platform_admin && !authUser.support) &&
-    ROLE_RANK[activeOrg.role] < ROLE_RANK.admin
-  )
+  if (!podeAdministrarEmpresa(authUser, activeOrg))
     return { ok: false as const, error: "forbidden_role" as const };
   if (escrita && (await mfaEmDivida()))
     return { ok: false as const, error: "mfa_required" as const };
@@ -90,7 +88,7 @@ export async function criarAcaoDeConversaoGoogle(
     resourceType: "ad_platform_connections",
     resourceId: null,
     requestId: hdrs.get("x-request-id") ?? undefined,
-    ip: hdrs.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined,
+    ip: ipDoCliente(hdrs) ?? undefined,
     userAgent: hdrs.get("user-agent") ?? undefined,
     metadata: {
       conversion_action_id: criada.dados.id,

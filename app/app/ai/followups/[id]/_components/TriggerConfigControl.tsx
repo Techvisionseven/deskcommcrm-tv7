@@ -30,6 +30,7 @@ import {
   minutosDoLimiar,
   type UnidadeDeLimiar,
 } from "@/lib/followup/gap-de-retorno";
+import { MAX_PAUSA_DE_REENTRADA_MINUTES } from "@/lib/followup/pausa-de-reentrada";
 
 /**
  * Controle de `trigger_config` do pointer (Task 8.5) — como o fluxo começa.
@@ -79,6 +80,16 @@ interface TriggerFormState {
   thresholdValor: number;
   thresholdUnidade: UnidadeDeLimiar;
   segments: string;
+  /** Pausa de reentrada do gatilho de silêncio, em HORAS na tela; o fio guarda minutos. */
+  reentryPauseHours: number;
+  /** Quantas vezes o fluxo pode recomeçar para o mesmo contato; 0 = sem teto. */
+  maxEnrollments: number;
+  /** Exige que a equipe tenha respondido a última mensagem do cliente. */
+  exigeResposta: boolean;
+  /** Teto do silêncio, em minutos; 0 = sem teto. */
+  maxSilenceMinutes: number;
+  /** A pausa conta do último ENVIO deste fluxo (e não da última mensagem do cliente). */
+  pauseFromLastSend: boolean;
   stageId: string;
   cancelOnReply: boolean;
   eventTypeIds: string[];
@@ -86,6 +97,9 @@ interface TriggerFormState {
 
 const DEFAULT_THRESHOLD_MINUTES = 60;
 const MIN_THRESHOLD_MINUTES = 5;
+const MAX_PAUSA_HORAS = MAX_PAUSA_DE_REENTRADA_MINUTES / 60;
+/** O mesmo teto do mínimo no contrato (7 dias). */
+const MAX_SILENCIO_MINUTOS = 10_080;
 
 const KIND_LABEL: Record<TriggerKind, string> = {
   appointment_no_show:"Falta confirmada pela equipe",
@@ -128,7 +142,17 @@ function parseTriggerConfig(raw: Record<string, unknown>): TriggerFormState {
                   ? "lead_created"
                   : "manual";
   const params =
-    (raw.params as { threshold_minutes?: number; segments?: string[]; stage_id?: string; event_type_ids?: string[] } | undefined) ?? {};
+    (raw.params as {
+      threshold_minutes?: number;
+      segments?: string[];
+      stage_id?: string;
+      event_type_ids?: string[];
+      reentry_pause_minutes?: number;
+      max_silence_minutes?: number;
+      reentry_pause_basis?: string;
+      max_enrollments_por_contato?: number;
+      exige_resposta_da_equipe?: boolean;
+    } | undefined) ?? {};
   const minutosRetorno =
     kind === "inbound_after_silence" && typeof params.threshold_minutes === "number"
       ? params.threshold_minutes
@@ -147,6 +171,16 @@ function parseTriggerConfig(raw: Record<string, unknown>): TriggerFormState {
       (kind === "silence" || kind === "inbound_after_silence") && Array.isArray(params.segments)
         ? params.segments.join(", ")
         : "",
+    reentryPauseHours:
+      kind === "silence" && typeof params.reentry_pause_minutes === "number" ? params.reentry_pause_minutes / 60 : 0,
+    maxSilenceMinutes:
+      kind === "silence" && typeof params.max_silence_minutes === "number" ? params.max_silence_minutes : 0,
+    pauseFromLastSend: kind === "silence" && params.reentry_pause_basis === "ultimo_envio",
+    maxEnrollments:
+      kind === "silence" && typeof params.max_enrollments_por_contato === "number"
+        ? params.max_enrollments_por_contato
+        : 0,
+    exigeResposta: kind === "silence" && params.exige_resposta_da_equipe === true,
     stageId: kind === "stage_change" && typeof params.stage_id === "string" ? params.stage_id : "",
     cancelOnReply: raw.cancel_on_reply === true,
   };
@@ -184,9 +218,20 @@ function toTriggerConfig(form: TriggerFormState): Record<string, unknown> {
     };
   }
 
+  const pausa = Math.round(form.reentryPauseHours * 60);
   return {
     kind: "silence",
-    params: { threshold_minutes: form.thresholdMinutes, ...(segments.length > 0 ? { segments } : {}) },
+    params: {
+      threshold_minutes: form.thresholdMinutes,
+      ...(segments.length > 0 ? { segments } : {}),
+      ...(pausa > 0 ? { reentry_pause_minutes: pausa } : {}),
+      ...(pausa > 0 && form.pauseFromLastSend ? { reentry_pause_basis: "ultimo_envio" } : {}),
+      ...(form.maxSilenceMinutes > 0 ? { max_silence_minutes: Math.round(form.maxSilenceMinutes) } : {}),
+      ...(form.maxEnrollments > 0
+        ? { max_enrollments_por_contato: Math.round(form.maxEnrollments) }
+        : {}),
+      ...(form.exigeResposta ? { exige_resposta_da_equipe: true } : {}),
+    },
     ...cancelOnReply,
   };
 }
@@ -198,8 +243,21 @@ function summaryLabel(
 ): string {
   if(cfg.kind === "appointment_no_show") return t("Gatilho: falta confirmada pela equipe");
   if (cfg.kind === "silence") {
-    const minutes = (cfg.params as { threshold_minutes?: number } | undefined)?.threshold_minutes;
-    return `${t("Gatilho")}: ${t("Silêncio")}${typeof minutes === "number" ? ` (${minutes} min)` : ""}`;
+    const params = cfg.params as
+      | { threshold_minutes?: number; reentry_pause_minutes?: number; max_silence_minutes?: number; reentry_pause_basis?: string }
+      | undefined;
+    const minutes = params?.threshold_minutes;
+    const pausa = params?.reentry_pause_minutes;
+    const teto = params?.max_silence_minutes;
+    const detalhe = [
+      typeof minutes === "number" ? (typeof teto === "number" && teto > 0 ? `${minutes}–${teto} min` : `${minutes} min`) : null,
+      typeof pausa === "number" && pausa > 0
+        ? params?.reentry_pause_basis === "ultimo_envio"
+          ? `${t("no máximo 1× a cada")} ${Math.round((pausa / 60) * 10) / 10} h`
+          : `${t("pausa de")} ${Math.round((pausa / 60) * 10) / 10} h`
+        : null,
+    ].filter(Boolean);
+    return `${t("Gatilho")}: ${t("Silêncio")}${detalhe.length > 0 ? ` (${detalhe.join(" · ")})` : ""}`;
   }
   if (cfg.kind === "inbound_after_silence") {
     const minutes = (cfg.params as { threshold_minutes?: number } | undefined)?.threshold_minutes;
@@ -267,10 +325,21 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
   const minutosRetorno = minutosDoLimiar(form.thresholdValor, form.thresholdUnidade);
   const retornoInvalid =
     form.kind === "inbound_after_silence" && !limiarValido(minutosRetorno);
+  const pausaInvalid =
+    form.kind === "silence" &&
+    (!Number.isFinite(form.reentryPauseHours) || form.reentryPauseHours < 0 || form.reentryPauseHours > MAX_PAUSA_HORAS);
+  const tetoInvalid =
+    form.kind === "silence" &&
+    form.maxSilenceMinutes !== 0 &&
+    (!Number.isFinite(form.maxSilenceMinutes) ||
+      form.maxSilenceMinutes <= form.thresholdMinutes ||
+      form.maxSilenceMinutes > MAX_SILENCIO_MINUTOS);
   const thresholdInvalid =
     (form.kind === "silence" &&
       (!Number.isFinite(form.thresholdMinutes) || form.thresholdMinutes < MIN_THRESHOLD_MINUTES)) ||
-    retornoInvalid;
+    retornoInvalid ||
+    pausaInvalid ||
+    tetoInvalid;
   // Gatilho de etapa sem etapa escolhida não é rascunho: é um fluxo que ficaria
   // ativo sem nunca disparar. O publish recusa; o Salvar recusa antes.
   const stageInvalid = form.kind === "stage_change" && form.stageId.trim().length === 0;
@@ -278,7 +347,14 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
     form.kind !== saved.kind ||
     (form.kind === "appointment_no_show" && form.eventTypeIds.join() !== saved.eventTypeIds.join()) ||
     form.cancelOnReply !== saved.cancelOnReply ||
-    (form.kind === "silence" && (form.thresholdMinutes !== saved.thresholdMinutes || form.segments !== saved.segments)) ||
+    (form.kind === "silence" &&
+      (form.thresholdMinutes !== saved.thresholdMinutes ||
+        form.segments !== saved.segments ||
+        form.reentryPauseHours !== saved.reentryPauseHours ||
+        form.maxSilenceMinutes !== saved.maxSilenceMinutes ||
+        form.maxEnrollments !== saved.maxEnrollments ||
+        form.exigeResposta !== saved.exigeResposta ||
+        form.pauseFromLastSend !== saved.pauseFromLastSend)) ||
     (form.kind === "inbound_after_silence" &&
       (form.thresholdValor !== saved.thresholdValor ||
         form.thresholdUnidade !== saved.thresholdUnidade ||
@@ -306,7 +382,14 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
           {summaryLabel(triggerConfig, etapaSalva ?? null, t)}
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-80" align="end" data-testid="trigger-config-panel">
+      {/* O painel cresce com o gatilho de silêncio (mínimo, teto, segmentos, pausa):
+          numa tela de 720 px o «Salvar gatilho» ficava abaixo da dobra, sem rolagem.
+          Mesma régua do `SelectContent` (altura disponível do Radix + rolagem). */}
+      <PopoverContent
+        className="w-80 max-h-(--radix-popover-content-available-height) overflow-y-auto"
+        align="end"
+        data-testid="trigger-config-panel"
+      >
         <div className="space-y-3">
           <div className="space-y-2">
             <Label htmlFor="trigger-kind">{t("Tipo de gatilho")}</Label>
@@ -491,9 +574,30 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
                   onChange={(e) => setForm((f) => ({ ...f, thresholdMinutes: Number(e.target.value) }))}
                   aria-invalid={thresholdInvalid}
                 />
-                {thresholdInvalid && (
+                {thresholdInvalid && !tetoInvalid && !pausaInvalid && (
                   <p className="text-xs text-error-fg">{t("Mínimo de")} {MIN_THRESHOLD_MINUTES} {t("minutos.")}</p>
                 )}
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-max-silence">{t("Silêncio máximo, em minutos (opcional)")}</Label>
+                <Input
+                  id="trigger-max-silence"
+                  type="number"
+                  min={0}
+                  max={MAX_SILENCIO_MINUTOS}
+                  value={form.maxSilenceMinutes}
+                  onChange={(e) => setForm((f) => ({ ...f, maxSilenceMinutes: Number(e.target.value) }))}
+                  aria-invalid={tetoInvalid}
+                  data-testid="trigger-max-silence"
+                />
+                {tetoInvalid && (
+                  <p className="text-xs text-error-fg">{t("Precisa ser maior que o mínimo e no máximo 10080 (7 dias).")}</p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "Com um máximo, o fluxo só começa enquanto o silêncio for recente — por exemplo, entre 10 e 60 minutos depois da última mensagem do cliente. Quem está calado há mais tempo fica de fora. 0 = sem máximo.",
+                  )}
+                </p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="trigger-segments">Segmentos (tags, opcional)</Label>
@@ -503,6 +607,80 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
                   value={form.segments}
                   onChange={(e) => setForm((f) => ({ ...f, segments: e.target.value }))}
                 />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-reentry-pause">{t("Pausa antes de recomeçar (horas)")}</Label>
+                <Input
+                  id="trigger-reentry-pause"
+                  type="number"
+                  min={0}
+                  max={MAX_PAUSA_HORAS}
+                  value={form.reentryPauseHours}
+                  onChange={(e) => setForm((f) => ({ ...f, reentryPauseHours: Number(e.target.value) }))}
+                  aria-invalid={pausaInvalid}
+                  data-testid="trigger-reentry-pause"
+                />
+                {pausaInvalid && (
+                  <p className="text-xs text-error-fg">{t("Use de 0 a 2160 horas (90 dias).")}</p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "Vale para quem já passou por este fluxo e respondeu ou chegou ao fim: ele só recomeça depois deste tempo sem o cliente escrever. Quem nunca passou por ele entra no tempo de silêncio de sempre. 0 = sem pausa.",
+                  )}
+                </p>
+                {form.reentryPauseHours > 0 && (
+                  <div className="flex items-start justify-between gap-2">
+                    <Label htmlFor="trigger-pause-basis" className="text-xs font-normal leading-snug">
+                      {t("Contar a pausa a partir do último envio deste fluxo (e não da última mensagem do cliente)")}
+                    </Label>
+                    <Switch
+                      id="trigger-pause-basis"
+                      checked={form.pauseFromLastSend}
+                      onCheckedChange={(checked) => setForm((f) => ({ ...f, pauseFromLastSend: checked }))}
+                      data-testid="trigger-pause-basis"
+                    />
+                  </div>
+                )}
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-max-enrollments">
+                  {t("Quantas vezes no máximo, por contato (opcional)")}
+                </Label>
+                <Input
+                  id="trigger-max-enrollments"
+                  type="number"
+                  min={0}
+                  max={50}
+                  value={form.maxEnrollments}
+                  onChange={(e) => setForm((f) => ({ ...f, maxEnrollments: Number(e.target.value) }))}
+                  data-testid="trigger-max-enrollments"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "A pausa acima só espaça os reinícios: quem nunca responde volta a receber o fluxo a cada pausa, para sempre. Com um limite, o fluxo para de recomeçar depois deste número de vezes. 0 = sem limite.",
+                  )}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <Label
+                    htmlFor="trigger-exige-resposta"
+                    className="text-xs font-normal leading-snug"
+                  >
+                    {t("Só começar se a equipe já respondeu a última mensagem do cliente")}
+                  </Label>
+                  <Switch
+                    id="trigger-exige-resposta"
+                    checked={form.exigeResposta}
+                    onCheckedChange={(checked) => setForm((f) => ({ ...f, exigeResposta: checked }))}
+                    data-testid="trigger-exige-resposta"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "O tempo de silêncio conta da última mensagem do cliente, e mensagem da equipe não zera essa conta — então quem escreveu e ainda não foi atendido também entra no fluxo. Ligue isto quando o fluxo é para quem sumiu, e não para quem está esperando resposta.",
+                  )}
+                </p>
               </div>
             </>
           )}

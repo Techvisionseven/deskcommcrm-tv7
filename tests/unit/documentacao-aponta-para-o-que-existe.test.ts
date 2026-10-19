@@ -46,9 +46,11 @@ const AUTORIDADE = [
   "docs/threat-model.md",
   "docs/DEPLOY-CHECKLIST.md",
   "docs/SETUP.md",
+  "docs/apostila-contribuidor.md",
   "docs/doctrine",
   "docs/runbooks",
   "docs/adr",
+  "docs/saas",
   "triagem",
   // Skills embutidas: alguém as lê para AGIR (instalar, contribuir). A fonte é
   // `.agents/skills`; o espelho `.claude/skills` é byte-idêntico (gate próprio).

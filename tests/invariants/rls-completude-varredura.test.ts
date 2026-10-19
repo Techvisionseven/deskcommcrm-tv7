@@ -75,6 +75,7 @@ interface Excecao {
  * linhas da OUTRA organização, não uma leitura como superusuário.
  */
 const PROVA_PROPRIA: readonly Excecao[] = [
+  { tabela: "jev_router_decisions", razao: "tests/invariants/jev-roteador-decisoes.test.ts — dois tenants por JWT: leitura local, zero do vizinho; anon sem leitura, authenticated sem escrita; poda com piso no banco." },
   { tabela: "golden_candidates", razao: "tests/invariants/golden-candidates.test.ts — dois tenants reais por JWT (agent): leitura positiva local e ZERO do vizinho nos dois sentidos, a tabela inteira sem filtro igual à própria, anon recusado, e insert/update/delete de authenticated sem efeito (só o servidor grava)." },
   { tabela: "jev_observacoes", razao: "tests/invariants/jev-observacoes.test.ts — dois tenants reais por JWT (agent): leitura positiva local e ZERO do vizinho nos dois sentidos, a tabela inteira sem filtro igual à própria, anon recusado, e insert/update/delete de authenticated sem efeito (só o servidor grava)." },
   { tabela: "prospecting_settings", razao: "tests/invariants/prospecting.test.ts — tabela exclusiva do servidor, ACL e RLS verificadas; FK composta e comandos autenticados cercam a organização." },
@@ -245,6 +246,14 @@ const PROVA_PROPRIA: readonly Excecao[] = [
       "orçamento, criativo e performance de quem anuncia.",
   },
   {
+    tabela: "map_provider_credentials",
+    razao:
+      "tests/invariants/credencial-de-mapas-e-server-side.test.ts — privilégio " +
+      "NENHUM para anon e authenticated, `permission denied` sob `set role`, RLS " +
+      "ligada, zero policies, `organization_id` NOT NULL com FK em cascata. Guarda " +
+      "a chave do Google da organização (0504), que só o servidor lê.",
+  },
+  {
     tabela: "ad_conversion_dispatches",
     razao:
       "tests/invariants/credencial-de-anuncios-e-server-side.test.ts — mesmo " +
@@ -280,6 +289,15 @@ const PROVA_PROPRIA: readonly Excecao[] = [
       "composta que recusa etapa de outra organização.",
   },
   {
+    tabela: "meta_ads_conversion_rules",
+    razao:
+      "tests/invariants/captura-de-clique-e-server-side.test.ts — RLS ligada, " +
+      "zero policies, privilégios revogados e permission denied sob set role " +
+      "anon/authenticated. O servidor aplica organization_id às regras por etapa " +
+      "da Meta (0524). tests/invariants/meta-regras-etapa-isoladas.test.ts prova a " +
+      "FK composta que recusa etapa de outra organização.",
+  },
+  {
     tabela: "ad_tracking_links",
     razao:
       "tests/invariants/captura-de-clique-e-server-side.test.ts — mesmo teste " +
@@ -308,6 +326,28 @@ const PROVA_PROPRIA: readonly Excecao[] = [
       "tests/invariants/captura-de-clique-e-server-side.test.ts — mesmo " +
       "`describe.each`. Guarda as UTMs de cada clique no botão da landing " +
       "page e o ref curto que as liga à mensagem do WhatsApp.",
+  },
+  {
+    tabela: "channel_session_groups",
+    razao:
+      "tests/invariants/grupos-na-inbox.test.ts, dois casos. \"isola por " +
+      "organização (RLS), membro só LÊ e só o service role escreve\": com uma " +
+      "linha REAL semeada na outra organização (e um controle que confere que " +
+      "ela existe), o manager da organização de teste lê 0 linhas dela por JWT " +
+      "e o agent lê a da própria; insert/update/delete de manager, insert de " +
+      "agent e de anon são recusados; o service_role grava e altera. \"nenhuma " +
+      "escrita concedida a anon/authenticated\": o catálogo não tem INSERT, " +
+      "UPDATE, DELETE nem TRUNCATE para anon, authenticated ou PUBLIC. O " +
+      "isolamento é medido num sentido só (org de teste → outra). Migration 0482.",
+  },
+  {
+    tabela: "cobranca_assinaturas",
+    razao:
+      "tests/invariants/cobranca-isolamento.test.ts — dois tenants reais por JWT: " +
+      "admin de A lê 1 linha de A e 0 de B, admin de B o espelho, agent de A lê 0 " +
+      "(a leitura é de admin; por isso não cabe em TABLES, cujo usuário semeado é " +
+      "agent), promovido a admin passa a ler (controle), e UPDATE/INSERT/DELETE " +
+      "pela sessão e qualquer leitura por anon dão permission denied. Migration 0510.",
   },
 ];
 

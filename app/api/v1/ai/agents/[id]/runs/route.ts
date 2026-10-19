@@ -10,9 +10,11 @@
  * última do próprio dia.
  *
  * `ai_agent_runs` só tem dois escritores no repo, e nenhum é o motor de
- * produção: o dispatcher legado (`lib/ai/dispatcher/index.ts`, sem chamador — o
- * cron `app/api/v1/cron/agent-dispatcher` devolve `{ skipped: true,
- * deprecated: true }`) e o runner legado. O motor que responde de verdade é o
+ * produção: a prévia `versions/[vid]/test` (o único vivo, só com
+ * `is_dry_run=true`) e o runner legado (`runAgent`, em
+ * `lib/ai/runtime/agent.ts`), sem chamador desde que perdeu a rota interna e o
+ * dispatcher — o cron `app/api/v1/cron/agent-dispatcher` devolve
+ * `{ skipped: true, deprecated: true }`. O motor que responde de verdade é o
  * `lib/agent-engine`, e ele registra em `llm_calls`.
  *
  * Uma tela que promete um registro que motor nenhum escreve é pior que uma tela
@@ -118,7 +120,13 @@ export function paraLinhaDeExecucao(c: LlmCallRow): Record<string, unknown> {
     // zero seria uma afirmação falsa sobre o turno.
     steps_count: null,
     tool_calls: null,
-    is_dry_run: false,
+    // `agent_preview` NÃO quer dizer teste: o rascunho do modo assistido
+    // (`reply-drafts.ts`, `kind: "assisted"`) grava o mesmo purpose sobre conversa
+    // real com contato real. O que separa o ensaio é o contato: o sandbox roda com
+    // `contactId: null` (`TurnPreview.contactId` — "null means a scenario"), e é
+    // isso que chega a `llm_calls.contact_id`. Versão e run do teste não estão em
+    // `llm_calls`.
+    is_dry_run: c.purpose === "agent_preview" && c.contact_id === null,
     started_at: c.created_at,
     completed_at: c.created_at,
     created_at: c.created_at,

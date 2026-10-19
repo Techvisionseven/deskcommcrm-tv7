@@ -5,14 +5,19 @@ import { audit } from "@/lib/audit";
 import {
   TETO_NOME_DE_SESSAO_WAHA, nomeDaSessaoCabeNoWaha, nomeDaSessaoNovo, podeRenomearSessaoDoWaha,
 } from "@/lib/channels/nome-da-sessao";
+import { lerGuardarHistorico } from "@/lib/channels/acervo-do-historico";
 import type { WahaClient } from "@/lib/waha/client";
 import { WahaSessionError } from "@/lib/waha/client";
+import { sincronizarRecebimentoDeGrupos } from "@/lib/grupos/sincronizar-filtro";
+import { lerLimiteEstourado } from "@/lib/cobranca/limites";
 
 const channelSchema = z.object({
   id: z.string().uuid(), organization_id: z.string().uuid(), waha_session_name: z.string(),
   status: z.enum(["STARTING", "SCAN_QR_CODE", "WORKING", "STOPPED", "FAILED"]),
   display_name: z.string().nullable().optional(), phone_number: z.string().nullable().optional(),
   status_reason: z.string().nullable().optional(), archived_at: z.string().nullable().optional(),
+  // A opção por conexão da #999 mora no `metadata` (jsonb, SEM migration).
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 const receiptSchema = z.object({
   replay: z.boolean(), channel: channelSchema.nullable(), receipt_id: z.string().uuid(), lease_token: z.string().uuid().optional(),
@@ -20,7 +25,8 @@ const receiptSchema = z.object({
 export class ChannelConnectionError extends Error {
   constructor(public readonly code: string, public readonly status: number, public readonly technical?: Record<string, unknown>) { super(code); }
 }
-type Transport = Pick<WahaClient, "createSession" | "startExistingSession" | "stopSession">;
+type Transport = Pick<WahaClient, "createSession" | "startExistingSession" | "stopSession">
+  & Partial<Pick<WahaClient, "definirRecebimentoDeGrupos">>;
 export interface ConnectChannelInput {
   organizationId: string; idempotencyKey: string; userId: string; requestId: string;
   displayName?: string; onboarding?: boolean; restart?: boolean;
@@ -38,6 +44,10 @@ export async function connectWahaChannel(authDb: SupabaseClient, serviceDb: Supa
     p_display_name: input.displayName ?? null, p_onboarding: input.onboarding ?? false,
   });
   if (error) {
+    // O gatilho de canais do plano (spec cobrança §5) recusa de dentro da
+    // reserva. Sobe CRU: a rota traduz para 409 com o número, e embrulhar aqui
+    // apagaria a mensagem que o carrega.
+    if (lerLimiteEstourado(error)) throw error;
     const code = ["idempotency_conflict", "connection_in_progress", "connection_mfa_required", "connection_forbidden"].find((c) => error.message.includes(c));
     throw new ChannelConnectionError(code ?? "connection_reservation_failed", error.code === "42501" ? 403 : code ? 409 : 500);
   }
@@ -85,7 +95,13 @@ export async function connectWahaChannel(authDb: SupabaseClient, serviceDb: Supa
   }
   try {
     if (input.restart) await waha.stopSession(channel.waha_session_name);
-    const creation = await waha.createSession(channel.waha_session_name);
+    // A opção por conexão decide o corpo da criação (desligada por padrão —
+    // decisão do mantenedor na #999). Com ela DESLIGADA a chamada continua
+    // sendo a de sempre, sem segundo argumento: o rastro não muda para quem
+    // não ligou nada.
+    const creation = lerGuardarHistorico(channel.metadata)
+      ? await waha.createSession(channel.waha_session_name, { guardarHistorico: true })
+      : await waha.createSession(channel.waha_session_name);
     created = creation.created;
     if (created) await finish("remote_created");
     const remote = await waha.startExistingSession(channel.waha_session_name);
@@ -96,6 +112,14 @@ export async function connectWahaChannel(authDb: SupabaseClient, serviceDb: Supa
     if (persisted.organization_id !== input.organizationId || persisted.id !== channel.id || persisted.status !== remote.status) {
       throw new Error("connection_checkpoint_mismatch");
     }
+    // Sessão (re)criada nasce ignorando grupos; reativar um canal arquivado mantém
+    // o mesmo id e as linhas LIGADAS de `channel_session_groups`. Ressincroniza o
+    // filtro com o banco (sem PUT quando já está certo). Nunca lança.
+    await sincronizarRecebimentoDeGrupos(
+      serviceDb,
+      waha.definirRecebimentoDeGrupos ? (ref, receber) => waha.definirRecebimentoDeGrupos!(ref, receber) : undefined,
+      { organizationId: input.organizationId, channelSessionId: channel.id, sessionRef: channel.waha_session_name },
+    );
     void audit({ action: channel.archived_at ? "channel.reactivated" : "channel.connected", actorUserId: input.userId,
       organizationId: input.organizationId, resourceType: "channel_session", resourceId: channel.id,
       requestId: input.requestId, metadata: { provider: "waha", origin: input.onboarding ? "onboarding" : "connections" } });

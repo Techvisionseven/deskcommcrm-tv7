@@ -9,11 +9,76 @@
 # comentário — #1324, e com o MODO do arquivo intacto: `chmod +x` deixa os blobs
 # idênticos) passa sem válvula: não é exceção, é o eixo certo. Ver o bloco
 # "O QUE o `M` mudou" abaixo.
+#
+# ── O invariante que a PRÓPRIA branch criou ────────────────────────────────────
+#
+# "Pré-existente" é pré-existente NA MAIN. Um `M` passa como `A` quando TRÊS
+# coisas valem: o caminho não existe em `origin/main`, não existe em
+# `git merge-base HEAD origin/main`, E um commit PRÓPRIO da branch o adicionou —
+# na cadeia de primeiros pais de `base..HEAD`, sem merge. Então a branch o criou
+# e a main nunca teve versão nenhuma dele, muito menos a forte. Editá-lo é, do
+# ponto de vista da main, ADICIONAR: o PR que o leva o mostra inteiro como
+# arquivo novo.
+#
+# A terceira é a que separa "a branch criou" de "a ref LOCAL é velha": as duas
+# primeiras são ausência numa ref que pode não saber da main real. Medido (caso
+# REF-VELHA-MERGE): a triagem traz o PR por `refs/triage/N`, o que NÃO atualiza
+# `origin/main`; o PR tinha mesclado uma main mais nova, com um invariante que a
+# ref local nunca viu. Sem a terceira, enfraquecê-lo saía exit 0 (o hook da main
+# no mesmo estado: exit 1). Com ela, o arquivo chegou por merge, não por commit
+# próprio → acusado.
+# Antes disto o segundo commit da branch sobre o próprio invariante era barrado
+# (o `M` é contra HEAD) e a única saída era a válvula, gasta duas vezes só por
+# isso: 9d396d061 (#2260) e 2b2121922 (#2452), ambos invariantes NOVOS de PR de
+# contribuidor ajustados na triagem. Válvula de rotina é como a guarda morre.
+#
+# As duas referências, e o que cada uma sustenta (caso no teste irmão):
+#   · a merge-base: a branch HERDOU o caminho e a main o apagou depois — a ponta
+#     não o tem, mas a branch não o criou (NOVO-MAIN-APAGOU);
+#   · a ponta: o invariante da branch JÁ ENTROU na main por squash, sem
+#     parentesco com o commit da branch — a merge-base não o tem (NOVO-APOS-FETCH).
+# Só `M`: `D` e `R` seguem acusados mesmo para invariante próprio (rename é
+# delete disfarçado, e o lado apagado de um `R` é da main). O `T` (troca de tipo) e
+# o `C` (cópia) entraram depois (#2465): o primeiro como `M`, o segundo fechado.
+#
+# ⚠️ Falha FECHADA sem a ref: sem `origin/main` (fork sem o remote, clone raso,
+# remote da main com outro nome — `upstream/main` NÃO é consultada, como nas
+# condições 2 e 6) a `merge-base` falha e o `M` segue acusado, como antes.
+#
+# ⚠️ LIMITES medidos, com a ref LOCAL `origin/main` velha (o hook não vai à rede;
+# a doutrina manda `git fetch` antes de trabalhar, e depois dele os dois são
+# acusados — NOVO-APOS-FETCH):
+#   · LIMITE-REF-VELHA: a branch criou o invariante num commit próprio e o PR já
+#     entrou na main. O arquivo É autoria da branch, mas a main já tem a versão
+#     forte. Passa.
+#   · LIMITE-REBASE-COMMIT-DIRETO: a branch fez REBASE sobre uma main mais nova, e
+#     o invariante entrou nessa main por commit SEM merge. Ele aparece na cadeia de
+#     primeiros pais como se fosse da branch. Passa. O mesmo vale para
+#     `cherry-pick`/`merge --squash` da main. Alcance medido em 06/10/2026: na
+#     `main`, 499 dos últimos 500 commits de primeiro pai são merges, e o último
+#     commit sem merge que adicionou invariante é 0122faa0f (17/09). Rebase sobre
+#     uma main que entrou por merge de PR fica acusado (REF-VELHA-REBASE).
 set -euo pipefail
 
 [ "${DESKCOMM_GOV_INVARIANTS_EDIT:-0}" = "1" ] && exit 0
 
-# Status M/D/R (rename = delete disfarçado) em tests/invariants/ bloqueia; A passa.
+# Status M/D/R/T/C em tests/invariants/ bloqueia; A passa.
+#   R = rename (delete disfarçado).
+#   T = TROCA DE TIPO: arquivo vira symlink (ou o inverso), 100644 ↔ 120000. Ele
+#       ficava FORA do regex e passava pelo pre-commit sem a válvula (#2465,
+#       medido igual na main 8dc7a75cc): `tests/invariants/x.test.ts` virava
+#       symlink para um arquivo mais fraco e o guard nem via a linha. T entra
+#       tratado como M — acusado, e só escapa pelas MESMAS exceções do M.
+#   C = cópia: o `--name-status` só a emite com detecção de cópia ligada
+#       (`diff.renames=copies` no config de quem roda, ou `-C`; `diff.copies`
+#       não é chave do git).
+#       Sem `--find-copies-harder` o C só aparece quando a ORIGEM também mudou,
+#       e essa mudança já aparece na própria linha M, sujeita às mesmas regras
+#       de antes — o C não esconde edição de invariante.
+#       Ele entra FECHADO por conservadorismo, igual ao R: a linha tem DOIS
+#       caminhos (`C100<TAB>origem<TAB>destino`) e nenhum passa pelas exceções do M.
+#       O custo: nessa config, um invariante NOVO copiado de um arquivo
+#       modificado passa a pedir a válvula.
 #
 # ⚠️ `-c core.quotepath=false` e o `"?` do regex NÃO são enfeite: eram um FURO
 # ABERTO, medido em 18/09/2026 nesta versão e nas duas anteriores. Com
@@ -33,7 +98,7 @@ set -euo pipefail
 # quatro OIDs vêm vazios, a condição 5 recusa a exclusão e a guarda falha
 # FECHADA — que é o lado certo para um caminho que ela não sabe ler.
 violations=$(git -c core.quotepath=false diff --cached --name-status \
-  | awk -F'\t' '$1 ~ /^(M|D|R)/ && ($2 ~ /^"?tests\/invariants\// || $3 ~ /^"?tests\/invariants\//) { print $0 }')
+  | awk -F'\t' '$1 ~ /^(M|D|R|T|C)/ && ($2 ~ /^"?tests\/invariants\// || $3 ~ /^"?tests\/invariants\//) { print $0 }')
 
 # ── O que o OUTRO LADO DO MERGE mudou não é edição desta branch ────────────
 #
@@ -161,9 +226,27 @@ violations=$(git -c core.quotepath=false diff --cached --name-status \
 # forma sozinho quando a adição que chega é ≥50% similar ao arquivo apagado.
 #
 # ⚠️ Falhar FECHADO é o lado seguro aqui (bloquear pede uma válvula declarada;
-# liberar perde o eval em silêncio). Por isso: sem MERGE_HEAD, merge de mais de
-# um lado (octopus), `merge-base` sem ancestral comum, `is-ancestor` saindo
-# não-zero ou a ref `origin/main` ausente → nenhuma exclusão.
+# liberar perde o eval em silêncio). Por isso: sem nenhum dos DOIS sinais do
+# outro lado, merge de mais de um lado (octopus), `merge-base` sem ancestral
+# comum, `is-ancestor` saindo não-zero ou a ref `origin/main` ausente →
+# nenhuma exclusão.
+#
+# ── OS DOIS SINAIS DO OUTRO LADO (o #374) ───────────────────────────────────
+#
+# O `MERGE_HEAD` é o sinal do caminho CONFLITUDO: o git o escreve quando o
+# merge para para o `git commit` do autor. O caminho LIMPO é outro — o git
+# chama `pre-merge-commit` e, ali, ainda NÃO escreveu o `MERGE_HEAD` (sonda de
+# causa no teste irmão, caso M3-PREMISSA). Sem sinal nenhum o guard falhava
+# FECHADO sobre o que a `main` trouxe: um `git merge origin/main` limpo que
+# tocasse `tests/invariants/**` saía recusado acusando quem mergeia (#374,
+# medido em 28/09/2026) — o falso positivo que a issue pede para fechar.
+#
+# O git entrega o outro lado NAQUELE caminho em `GITHEAD_<sha>=<nome>`, a
+# variável que a estratégia do merge recebe. Ela é o MESMO dado do `MERGE_HEAD`
+# (o commit do outro lado), por isso entra como segunda fonte e não como
+# condição nova: as SEIS acima seguem decidindo, byte a byte igual. Sem a
+# variável (outro git, hook chamado à mão) nada muda e o guard continua
+# fechado — degradação para o comportamento de antes, nunca para liberar.
 #
 # ⚠️ E isto é MUDANÇA DE COMPORTAMENTO declarada contra a versão anterior: sem
 # `origin/main` (fork, clone raso) o falso positivo do #1161 volta a ser
@@ -177,12 +260,32 @@ violations=$(git -c core.quotepath=false diff --cached --name-status \
 # fecha, mas fecha SEMPRE, inclusive no commit comum sem invariante nenhum.)
 arquivo_merge_head="$(git rev-parse --git-path MERGE_HEAD)"
 lados=0
+outro_lado=""
 if [ -f "$arquivo_merge_head" ]; then
   lados=$(grep -c . "$arquivo_merge_head" || true)
 fi
+if [ "$lados" = "1" ]; then
+  outro_lado=$(git rev-parse --quiet --verify MERGE_HEAD^0 2>/dev/null || true)
+fi
+
+# Segunda fonte do outro lado: o caminho do `pre-merge-commit` (merge limpo),
+# onde o `MERGE_HEAD` ainda não existe, entrega o commit alheio em
+# `GITHEAD_<sha>=<nome>`. Exatamente UM — mais de um é octopus, e aí não há
+# "outro lado" singular para medir; nenhum é o commit comum, sem merge algum.
+# O valor da variável é o NOME da ref, não o commit: quem entra na conta é a
+# chave. `sed -n` lê `env` inteiro, e o intervalo {40,} cobre sha1 e sha256.
+if [ -z "$outro_lado" ]; then
+  githeads=$(env | sed -n 's/^\(GITHEAD_[0-9a-fA-F]\{40,\}\)=.*/\1/p' || true)
+  n_lados=$(printf '%s' "$githeads" | grep -c . || true)
+  if [ "$n_lados" = "1" ]; then
+    outro_lado=$(git rev-parse --quiet --verify "${githeads#GITHEAD_}^0" 2>/dev/null || true)
+    if [ -n "$outro_lado" ]; then
+      lados=1
+    fi
+  fi
+fi
 
 if [ -n "$violations" ] && [ "$lados" = "1" ]; then
-  outro_lado=$(git rev-parse --quiet --verify MERGE_HEAD^0 2>/dev/null || true)
   base=$(git merge-base HEAD "$outro_lado" 2>/dev/null || true)
   # condição 2, na forma do irmão `validate-features.sh`: dentro de `if`, um
   # `is-ancestor` não-zero (inclusive `origin/main` inexistente) não mata o hook
@@ -251,8 +354,11 @@ fi
 # Diferença remanescente, blob que falhou, arquivo vazio de um lado ou caminho que o git
 # CITOU (aspas/acento, onde o nome cru não acha o blob) → segue acusado. Falha FECHADA.
 #
-# `D` (deletar) e `R` (rename = delete disfarçado) nem chegam aqui: apagar invariante
-# continua bloqueado sem exceção, e `A` já passava antes.
+# `D` (deletar), `R` (rename = delete disfarçado) e `C` (cópia — dois caminhos na
+# linha) nem chegam aqui: apagar invariante continua bloqueado sem exceção, e `A` já
+# passava antes. O `T` (troca de tipo) CHEGA aqui como `M`; para invariante da main as
+# duas exceções o recusam de qualquer jeito (a main tem o caminho, e o MODO 100644 vs
+# 120000 difere — `mudanca_so_de_comentario` lê justamente o modo).
 sem_comentarios() {
   awk '
 BEGIN {
@@ -327,6 +433,27 @@ mudanca_so_de_comentario() {
   [ "$antes" = "$depois" ]
 }
 
+# $1 caminho de um `M`; 0 = a main nunca teve este caminho — nem a ponta (`origin/main`) nem o
+# ponto de onde esta branch saiu dela (a merge-base) — E um commit próprio da branch o adicionou.
+# Sem `origin/main`, ou sem ancestral comum,
+# a `merge-base` falha e a função devolve 1 — o `M` segue acusado. Ver "O invariante que a
+# PRÓPRIA branch criou" no cabeçalho.
+criado_nesta_branch() {
+  local base
+  base=$(git merge-base HEAD origin/main 2>/dev/null) || return 1
+  [ -n "$base" ] || return 1
+  if git rev-parse --quiet --verify "origin/main:$1" >/dev/null 2>&1 \
+    || git rev-parse --quiet --verify "$base:$1" >/dev/null 2>&1; then
+    return 1
+  fi
+  # A PROCEDÊNCIA, e não só a ausência: um commit PRÓPRIO desta branch (cadeia de primeiros
+  # pais, sem merge) o adicionou. Sem isto a ref local velha liberava o invariante que a main
+  # ganhou depois do último fetch e a branch trouxe por merge (caso REF-VELHA-MERGE).
+  # `--literal-pathspecs`: o caminho é nome, não glob.
+  [ -n "$(git --literal-pathspecs log --first-parent --no-merges --diff-filter=A --format=%H \
+    "$base..HEAD" -- "$1" 2>/dev/null)" ]
+}
+
 if [ -n "$violations" ]; then
   mantidos=''
   while IFS= read -r linha; do
@@ -340,7 +467,12 @@ if [ -n "$violations" ]; then
         # citado pelo git: nome cru não acha o blob -> não decidível aqui, segue acusado
         ;;
       *)
-        if [ "${status:0:1}" = "M" ] && mudanca_so_de_comentario "$caminho"; then
+        # O T (troca de tipo) entra tratado como M: escapa pelas MESMAS exceções, e
+        # nenhuma delas o solta para invariante da main — `criado_nesta_branch` falha
+        # (a main tem o caminho) e `mudanca_so_de_comentario` recusa por MODO (100644 vs
+        # 120000). #2465.
+        if { [ "${status:0:1}" = "M" ] || [ "${status:0:1}" = "T" ]; } \
+          && { criado_nesta_branch "$caminho" || mudanca_so_de_comentario "$caminho"; }; then
           continue
         fi
         ;;

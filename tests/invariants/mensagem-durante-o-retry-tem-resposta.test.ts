@@ -26,7 +26,8 @@ import type * as ObsLogger from "@/lib/agent-engine/obs/logger";
  * Três blocos:
  *   1. a CARONA (`decidirRajada`) contra o banco: job que já tentou enviar não
  *      recebe mensagem nova;
- *   2. o FECHAMENTO depois da entrega: o turno termina sem re-rodar;
+ *   2. o FECHAMENTO depois da entrega: com a correção de `fecharOTurno` também
+ *      recusada, o turno termina sem re-rodar;
  *   3. o CASO MEDIDO de ponta a ponta: o "Sim" recebe resposta, e só uma.
  */
 
@@ -84,14 +85,22 @@ let turnosQueEnviaram = 0;
 
 /**
  * Modelo fake roteado pelo PROMPT, não pela ordem: o fechamento é a chamada cuja
- * última mensagem é a instrução de checkpoint; no laço principal, o primeiro passo
- * chama `send_message` e o passo depois do resultado da tool encerra.
+ * última mensagem é a instrução de checkpoint — ou a CORREÇÃO que `fecharOTurno`
+ * pede quando o JSON volta recusado (`correcaoDoFechamento`); no laço principal,
+ * o primeiro passo chama `send_message` e o passo depois do resultado da tool
+ * encerra. `fechamentos` é a fila dos desfechos das chamadas de fechamento, a
+ * correção incluída.
  */
 function modelo(opts: { enviar: boolean; fechamentos: Array<"invalido" | "ok"> }) {
   return async (call: { prompt?: unknown }) => {
     const msgs = (call.prompt ?? []) as Array<{ role: string; content?: unknown }>;
     const ultima = msgs[msgs.length - 1];
-    if (ultima?.role === "user" && JSON.stringify(ultima.content).includes("Feche o turno AGORA")) {
+    const textoDaUltima = JSON.stringify(ultima?.content ?? "");
+    if (
+      ultima?.role === "user" &&
+      (textoDaUltima.includes("Feche o turno AGORA") ||
+        textoDaUltima.includes("O JSON do fechamento foi recusado"))
+    ) {
       const desfecho = opts.fechamentos[chamadasDeFechamento] ?? "ok";
       chamadasDeFechamento += 1;
       return {
@@ -354,7 +363,7 @@ describe("a carona: job que já tentou enviar não recebe a mensagem nova", () =
 });
 
 describe("o fechamento depois da entrega", () => {
-  it("JSON inválido duas vezes: o turno termina sem checkpoint e SEM voltar para a fila", async () => {
+  it("JSON inválido também na correção: o turno termina sem checkpoint e SEM voltar para a fila", async () => {
     const m1 = await inbound("Quanto custa o plano?");
     const jobId = await enfileira(m1);
 
@@ -371,7 +380,7 @@ describe("o fechamento depois da entrega", () => {
     expect(rows).toHaveLength(0);
   });
 
-  it("a repetição do fechamento que acerta o formato grava o checkpoint", async () => {
+  it("a correção do fechamento que acerta o formato grava o checkpoint", async () => {
     const m1 = await inbound("Quanto custa o plano?");
     const jobId = await enfileira(m1);
 
@@ -383,14 +392,15 @@ describe("o fechamento depois da entrega", () => {
     expect((await job(jobId))?.last_error).toBeNull();
   });
 
-  it("controle: sem entrega, o JSON inválido ainda devolve o job à fila (nada a engolir no re-run)", async () => {
+  it("controle: sem entrega, o JSON inválido também na correção ainda devolve o job à fila (nada a engolir no re-run)", async () => {
     const m1 = await inbound("Quanto custa o plano?");
     const jobId = await enfileira(m1);
 
-    const rodada = await rodaProximo(modelo({ enviar: false, fechamentos: ["invalido", "ok"] }));
+    const rodada = await rodaProximo(modelo({ enviar: false, fechamentos: ["invalido", "invalido"] }));
 
     expect(rodada?.erro?.message).toMatch(/JSON de checkpoint/);
-    expect(chamadasDeFechamento).toBe(1);
+    // A correção de `fecharOTurno` vale com ou sem entrega; sem entrega, o que sobra sobe.
+    expect(chamadasDeFechamento).toBe(2);
     expect(await outbounds()).toBe(0);
     expect((await job(jobId))?.status).toBe("pending");
   });
@@ -400,9 +410,9 @@ describe("o caso medido, de ponta a ponta", () => {
   it("o 'Sim' que chega depois de um fechamento inválido recebe resposta — e uma só", async () => {
     const pergunta = await inbound("Quero saber do plano de duas aulas por semana");
     const primeiro = await enfileira(pergunta);
-    // Primeira tentativa: responde e o fechamento vem inválido (e, no código de
-    // antes, sem segunda chance — a exceção ia para a fila).
-    const doGenerate = modelo({ enviar: true, fechamentos: ["invalido"] });
+    // Primeira tentativa: responde e o fechamento vem inválido, a correção de
+    // `fecharOTurno` também — e, no código de antes, a exceção ia para a fila.
+    const doGenerate = modelo({ enviar: true, fechamentos: ["invalido", "invalido"] });
     await rodaProximo(doGenerate);
     expect(await outbounds()).toBe(1);
 

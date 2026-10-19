@@ -11,7 +11,7 @@ const channel = { id: key, organization_id: org, waha_session_name: "owned", sta
  * `STARTING` antes do `returning`, então o status que chega ao código de
  * conexão NUNCA é o status real do canal. `phone_number`, sim.
  */
-function fixture(linha: Partial<typeof channel> & { phone_number?: string | null } = {}) {
+function fixture(linha: Partial<typeof channel> & { phone_number?: string | null; metadata?: Record<string, unknown> } = {}) {
   const finishes: Record<string, unknown>[] = [];
   const noBanco = { ...channel, phone_number: null as string | null, ...linha };
   const reservado = { ...noBanco, status: "STARTING" };
@@ -197,5 +197,54 @@ describe("renomearSessaoParaOTeto — a guarda também mora no WHERE", () => {
     const novo = await renomearSessaoParaOTeto(f.db, alvo);
     expect(novo).toMatch(/^org_[0-9a-f]{8}_[0-9a-f]{32}$/);
     expect(f.renomeios).toEqual([novo]);
+  });
+});
+
+describe("I1: conectar/reativar ressincroniza o filtro de grupos", () => {
+  it("canal com grupos LIGADOS no banco pede ao WhatsApp para receber grupos depois de iniciar a sessão", async () => {
+    // Reativação de canal arquivado mantém o id e as linhas ligadas; o caminho é o mesmo.
+    const f = fixture();
+    const fromOriginal = (f.db as unknown as { from: (t: string) => unknown }).from;
+    const filtros: Array<[string, unknown]> = [];
+    (f.db as unknown as { from: (t: string) => unknown }).from = (t: string) => {
+      if (t !== "channel_session_groups") return fromOriginal(t);
+      const b = {
+        select: () => b,
+        eq: (c: string, v: unknown) => { filtros.push([c, v]); return b; },
+        then: (res: (v: unknown) => unknown) => Promise.resolve({ count: 1, error: null }).then(res),
+      };
+      return b;
+    };
+    const definirRecebimentoDeGrupos = vi.fn(async () => true);
+    await connectWahaChannel(f.db, f.db, { ...f.transport, definirRecebimentoDeGrupos }, f.input);
+    expect(definirRecebimentoDeGrupos).toHaveBeenCalledWith("owned", true);
+    expect(filtros).toContainEqual(["organization_id", org]);
+    expect(f.transport.startExistingSession.mock.invocationCallOrder[0])
+      .toBeLessThan(definirRecebimentoDeGrupos.mock.invocationCallOrder[0]!);
+  });
+});
+
+describe("limite de números do plano", () => {
+  it("⭐ o PT402 da reserva sobe CRU — a rota precisa da mensagem com o número", async () => {
+    // O gatilho de canais (spec cobrança §5) recusa de dentro de
+    // `fn_reserve_channel_connection`. Embrulhado em ChannelConnectionError, o
+    // número se perdia e a tela dizia "Não foi possível concluir a conexão".
+    const f = fixture();
+    const recusa = { code: "PT402", message: "limite_do_plano:canais:1" };
+    vi.mocked(f.db.rpc).mockImplementationOnce((async () => ({ data: null, error: recusa })) as never);
+    await expect(connectWahaChannel(f.db, f.db, f.transport, f.input)).rejects.toBe(recusa);
+    expect(f.transport.createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("a opção por conexão do acervo (#999)", () => {
+  it("pede o store na criação SÓ quando o canal tem a opção ligada", async () => {
+    const ligado = fixture({ metadata: { guardar_historico: true } });
+    await connectWahaChannel(ligado.db, ligado.db, ligado.transport, ligado.input);
+    expect(ligado.transport.createSession).toHaveBeenCalledWith("owned", { guardarHistorico: true });
+
+    const desligado = fixture();
+    await connectWahaChannel(desligado.db, desligado.db, desligado.transport, desligado.input);
+    expect(desligado.transport.createSession).toHaveBeenCalledWith("owned");
   });
 });

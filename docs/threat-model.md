@@ -34,18 +34,39 @@ São conclusões de leitura de código.
 | `/`, `/login`, `/signup`, `/auth/confirm` | Supabase Auth | ❌ |
 | `/team/accept-invite/:token` | HMAC-SHA256 + `timingSafeEqual` (`lib/auth/invite-token.ts`) | ❌ |
 | `/api/v1/health` | nenhum (por design) | ❌ |
-| `/api/v1/webhooks/waha/*` | HMAC-SHA512 + `timingSafeEqual` (`lib/waha/ingest.ts`) | ❌ |
+| `/api/v1/webhooks/waha/:token` | HMAC-SHA512 + `timingSafeEqual` (`lib/waha/ingest.ts`) | ❌ |
+| `/api/v1/webhooks/waha` (global, sem token) | só rede interna: requisição com marca de proxy de borda recebe 404 (`chegouPelaBorda`, `lib/http/ip-do-cliente.ts` — régua de cabeçalho, válida nos proxies do kit: Caddy, Traefik, Nginx Proxy Manager, túnel da Cloudflare); depois, o mesmo HMAC. Com a porta do app publicada direto, a camada que vale é a assinatura do remetente (`/admin/sistema`) | ❌ |
 | `/api/v1/webhooks/in/:token` | path token + assinatura opcional | ✅ 60/min por token |
 | `/api/v1/webhooks/nuvemshop/*` | HMAC | ❌ |
+| `/api/v1/webhooks/cobranca/:provedor` | Stripe: `Stripe-Signature` (HMAC com horário). Asaas: token estático em `asaas-access-token` (sha256 + `timingSafeEqual`); o corpo é só ponteiro e a decisão vem da releitura. Token vazado: o dono gera outro em Admin › Cobrança › Conexão, "Testar e conectar" de novo | ✅ recusas 120/min por IP; Asaas, avisos válidos de cliente desconhecido 120/min por provedor, chave global (acima, 200 sem gravar) |
 | `/api/v1/cron/*` (9 rotas) | `Bearer INTERNAL_CRON_SECRET\|INTERNAL_SECRET`, **fail-closed** | ❌ |
-| `/api/internal/*` | `x-internal-secret` ou `Bearer INTERNAL_SECRET`, comparação em tempo constante | ❌ |
 | `/api/mcp` | `Bearer tok_...` validado contra `api_tokens` (hash SHA256) | ❌ |
-| `/account-suspended`, `/403`, `/404`, `/500`, `/503`, `/admin/forbidden` | — | ❌ |
+| `/403`, `/404`, `/500`, `/503`, `/admin/forbidden` | — | ❌ |
 
 **Leitura:** a autenticação de cada superfície está bem construída — HMAC com
 `timingSafeEqual` em 6 módulos distintos, crons fail-closed, bearer só via header
 (nunca query string), plaintext do token nunca persistido. O problema **não é o guard;
 é a ausência de limite de tentativas na frente dele.**
+
+### 1.1 O proxy da borda também é superfície (e o túnel, uma borda terceirizada)
+
+No stack padrão, o `Caddyfile` responde **403** a `/api/v1/webhooks/waha` — o webhook
+global, sem token na URL — antes de chegar ao app. O `docker-compose.traefik.yml`
+reproduz esse bloqueio; o `docker-compose.npm.yml` deixa o roteamento para o painel do
+NPM, e ali o bloqueio é responsabilidade do operador.
+
+O `docker-compose.cloudflared.yml` (instalação atrás de NAT, `REVERSE_PROXY=cloudflared`)
+**não tem como impor o 403 pelo compose**: o roteamento é administrado à distância, no
+painel da Cloudflare. Quem recusa é o próprio app: a rota global responde 404 ao que
+chega com marca de proxy de borda, e o túnel marca com `cf-connecting-ip` (ver a linha da
+rota na tabela acima). A assinatura do remetente é opcional e desligada de fábrica
+(`/admin/sistema`); uma regra de WAF no painel é camada extra, opcional.
+
+Fora isso, o túnel **reduz** a superfície clássica: não publica porta de entrada nenhuma
+(nada de 80/443 escutando), então a varredura de porta e o `network_mode: host` que este
+documento assume como premissa não existem nesse modo. O token do túnel é credencial de
+saída; vazá-lo permite publicar rotas no túnel da conta, e por isso ele nunca aparece em
+log nem em query string.
 
 ---
 
@@ -77,8 +98,8 @@ São conclusões de leitura de código.
 > front-matter diz nunca ter havido. O que esta nota faz é corrigir os **fatos** e marcar o T1
 > como devendo reauditoria — não decidir por ela.
 
-`checkRateLimit` existe (`lib/ai/dispatcher/rate-limit.ts`) e é chamado em **2** pontos
-do código: `/api/v1/webhooks/in/:token` e o dispatcher de IA. Nada mais.
+`checkRateLimit` existe (`lib/ai/dispatcher/rate-limit.ts`) e é chamado em vários pontos de
+`app/` e `lib/`, o webhook `/api/v1/webhooks/in/:token` entre eles. Reconte, não cite: `grep -rln 'checkRateLimit(' app lib --include='*.ts' | grep -v '\.test\.'`.
 
 Não há **nenhum** limite de tentativa em:
 
@@ -88,7 +109,7 @@ Não há **nenhum** limite de tentativa em:
   exaustão de recurso (e de cota de IA, se as chaves forem da instância).
 - **`/team/accept-invite/:token`** — o HMAC é forte, mas sem limite o atacante pode
   sondar indefinidamente e sem custo, e sem gerar sinal de alerta.
-- **Os 9 crons e `/api/internal/*`** — o secret é forte e a comparação é em tempo
+- **Os 9 crons** — o secret é forte e a comparação é em tempo
   constante, mas nada limita o volume de tentativas.
 - **`/api/mcp`** — enumeração de bearer token.
 

@@ -101,6 +101,16 @@ describe("o caminho feliz", () => {
     expect(corpo).not.toContain("novo caso esperando você");
   });
 
+  it("com a resposta pelo WhatsApp ligada, o teste ensina o comando no aviso do caso", async () => {
+    const { deps: d, enviados } = deps();
+    await enviarAvisoDeTeste(d, { ...entrada, respostaWhatsappHabilitada: true });
+    const corpo = enviados[0]!.body;
+
+    expect(corpo).toContain("RESPONDER ou PERGUNTAR");
+    expect(corpo).toContain("Responder a esta mensagem de teste não chega a ninguém.");
+    expect(corpo).not.toContain("Responder aqui não chega ao cliente");
+  });
+
   it("o teste PAGA a mensagem no ledger — o número gastou uma", async () => {
     const { deps: d, ledger } = deps();
     await enviarAvisoDeTeste(d, entrada);
@@ -155,6 +165,21 @@ describe("as recusas, cada uma com o seu código", () => {
     await expect(enviarAvisoDeTeste(d.deps, entrada)).resolves.toMatchObject({
       codigo: "canal_nao_aceita_aviso_livre",
     });
+  });
+
+  it("canal PAUSADO pelo operador: o teste também não sai por ele (#2318)", async () => {
+    const d = deps({
+      db: {
+        carregaCanal: vi.fn(async () => ({ ...canalSaudavel, desativado: true })),
+        marcaDaOrganizacao: vi.fn(),
+        destinoEhDaPropriaOrganizacao: vi.fn(),
+      },
+    } as Partial<DepsDoAvisoDeTeste>);
+    await expect(enviarAvisoDeTeste(d.deps, entrada)).resolves.toMatchObject({
+      enviado: false,
+      codigo: "canal_desativado",
+    });
+    expect(d.enviados).toHaveLength(0);
   });
 
   it("canal fora do ar — e o teste NÃO fica esperando 24 h como o aviso real", async () => {

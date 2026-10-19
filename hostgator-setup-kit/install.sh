@@ -23,6 +23,7 @@ REPO_DIR="${REPO_DIR:-deskcommcrm}"
 COMPOSE="docker-compose.prod.yml"
 COMPOSE_TRAEFIK="docker-compose.traefik.yml"
 COMPOSE_NPM="docker-compose.npm.yml"
+COMPOSE_CLOUDFLARED="docker-compose.cloudflared.yml"
 NONINTERACTIVE=0
 [ "${1:-}" = "--yes" ] && NONINTERACTIVE=1
 
@@ -35,34 +36,90 @@ source "$KIT_DIR/_i18n.sh"
 # usar o _common.sh). As duas funções abaixo são gêmeas das de lá — se mexer
 # numa, mexa na outra.
 dc() {
+  # Overlay da CA do Supabase (#829) — mesma condição da gêmea em _common.sh.
+  # Aqui ela importa: antes do clone o overlay pode ainda não existir, e um -f
+  # para arquivo ausente derrubaria o compose no meio da instalação.
+  local -a ca=()
+  if ca_do_supabase_ok && [ -f docker-compose.supabase-ca.yml ]; then ca=(-f docker-compose.supabase-ca.yml); fi
   if [ "${SINGLE_SERVER:-0}" = "1" ]; then
-    docker compose -f "$COMPOSE" -f docker-compose.single-server.yml "$@"
+    # #2099: o overlay do proxy da hospedagem entra também no single-server.
+    case "${REVERSE_PROXY:-caddy}" in
+    traefik) docker compose -f "$COMPOSE" -f docker-compose.single-server.yml -f "$COMPOSE_TRAEFIK" ${ca[@]+"${ca[@]}"} "$@" ;;
+    npm)     docker compose -f "$COMPOSE" -f docker-compose.single-server.yml -f "$COMPOSE_NPM" ${ca[@]+"${ca[@]}"} "$@" ;;
+    *)       docker compose -f "$COMPOSE" -f docker-compose.single-server.yml ${ca[@]+"${ca[@]}"} "$@" ;;
+    esac
     return
   fi
   case "${REVERSE_PROXY:-caddy}" in
-  traefik) docker compose -f "$COMPOSE" -f "$COMPOSE_TRAEFIK" "$@" ;;
-  npm)     docker compose -f "$COMPOSE" -f "$COMPOSE_NPM" "$@" ;;
-  *)       docker compose -f "$COMPOSE" "$@" ;;
+  traefik) docker compose -f "$COMPOSE" -f "$COMPOSE_TRAEFIK" ${ca[@]+"${ca[@]}"} "$@" ;;
+  npm)     docker compose -f "$COMPOSE" -f "$COMPOSE_NPM" ${ca[@]+"${ca[@]}"} "$@" ;;
+  cloudflared) docker compose -f "$COMPOSE" -f "$COMPOSE_CLOUDFLARED" ${ca[@]+"${ca[@]}"} "$@" ;;
+  *)       docker compose -f "$COMPOSE" ${ca[@]+"${ca[@]}"} "$@" ;;
   esac
 }
 dc_files() {
+  # Mesma condição do dc() (#829): a mensagem que ensina o comando tem de bater
+  # com o que o kit roda.
+  local sufixo=""
+  if ca_do_supabase_ok && [ -f docker-compose.supabase-ca.yml ]; then
+    sufixo=" -f docker-compose.supabase-ca.yml"
+  fi
   if [ "${SINGLE_SERVER:-0}" = "1" ]; then
-    printf -- '-f %s -f %s' "$COMPOSE" docker-compose.single-server.yml
+    case "${REVERSE_PROXY:-caddy}" in
+    traefik) printf -- '-f %s -f %s -f %s%s' "$COMPOSE" docker-compose.single-server.yml "$COMPOSE_TRAEFIK" "$sufixo" ;;
+    npm)     printf -- '-f %s -f %s -f %s%s' "$COMPOSE" docker-compose.single-server.yml "$COMPOSE_NPM" "$sufixo" ;;
+    *)       printf -- '-f %s -f %s%s' "$COMPOSE" docker-compose.single-server.yml "$sufixo" ;;
+    esac
     return
   fi
   case "${REVERSE_PROXY:-caddy}" in
-  traefik) printf -- '-f %s -f %s' "$COMPOSE" "$COMPOSE_TRAEFIK" ;;
-  npm)     printf -- '-f %s -f %s' "$COMPOSE" "$COMPOSE_NPM" ;;
-  *)       printf -- '-f %s' "$COMPOSE" ;;
+  traefik) printf -- '-f %s -f %s%s' "$COMPOSE" "$COMPOSE_TRAEFIK" "$sufixo" ;;
+  npm)     printf -- '-f %s -f %s%s' "$COMPOSE" "$COMPOSE_NPM" "$sufixo" ;;
+  cloudflared) printf -- '-f %s -f %s%s' "$COMPOSE" "$COMPOSE_CLOUDFLARED" "$sufixo" ;;
+  *)       printf -- '-f %s%s' "$COMPOSE" "$sufixo" ;;
   esac
 }
 
 # psql/pg_dump efêmeros. No modo single-server o Postgres só é alcançável pela
 # bridge privada (supabase-db), nunca por porta pública.
+#
+# ── A CA do Supabase, declarada UMA vez (#829) ────────────────────────────────
+# GÊMEA da de _common.sh (mesmo motivo das duas acima: este script roda antes do
+# clone existir, e o validador da connection string já precisa saber explicar uma
+# falha de certificado). Se mexer numa, mexa na outra — as duas mensagens e o
+# caminho fixo do contêiner têm de sair byte a byte iguais.
+CA_NO_CONTAINER="/etc/deskcomm/ca/supabase-ca.crt"
+
+# stdout: caminho absoluto da CA (o docker recusa bind relativo).
+# stderr: o que falta, sempre com o nome da variável — é a frase que aparece no
+# lugar do `SELF_SIGNED_CERT_IN_CHAIN` cru que a issue reportou.
+ca_do_supabase() {
+  local p="${SUPABASE_SSL_ROOT_CERT:-}"
+  if [ -z "$p" ]; then
+    printf '%s' "SUPABASE_SSL_ROOT_CERT não está declarada no .env — sem ela o kit não recebe a CA do Supabase. Declare SUPABASE_SSL_ROOT_CERT=/caminho/do/prod-ca-2021.crt (baixe com: curl -fsSL -o /root/certs/prod-ca-2021.crt https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt)" >&2
+    return 1
+  fi
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  if [ ! -f "$p" ] || [ ! -r "$p" ]; then
+    printf '%s' "SUPABASE_SSL_ROOT_CERT aponta para '$p', e este arquivo não existe (ou não é legível). Corrija o caminho no .env — a CA fica FORA do checkout, e o kit só monta arquivo que existe." >&2
+    return 1
+  fi
+  printf '%s' "$p"
+}
+
+# Idem _common.sh: silenciosa, para as decisões de montagem.
+ca_do_supabase_ok() { ca_do_supabase >/dev/null 2>&1; }
+
 pg_container() {
-  local -a rede=()
+  local -a rede=() ca=()
+  local caminho=""
   [ -n "${PSQL_DOCKER_NETWORK:-}" ] && rede=(--network "$PSQL_DOCKER_NETWORK")
-  docker run --rm ${rede[@]+"${rede[@]}"} "$@"
+  # `local caminho` separado de propósito: `local caminho="$(...)"` engole o
+  # status do comando substituído e o `if` aceitaria CA quebrada como pronta.
+  if caminho="$(ca_do_supabase 2>/dev/null)"; then
+    ca=(-v "$caminho:$CA_NO_CONTAINER:ro" -e "PGSSLROOTCERT=$CA_NO_CONTAINER")
+  fi
+  docker run --rm ${rede[@]+"${rede[@]}"} ${ca[@]+"${ca[@]}"} "$@"
 }
 
 # ── Aparência ───────────────────────────────────────────────────────────────
@@ -173,7 +230,14 @@ show_recovery() {
   printf '%s\n'   "$(t "abra o Supabase > SQL Editor e rode (ATENÇÃO: apaga todos os dados):")"
   printf '  %s\n\n' "drop schema public cascade; create schema public;"
 }
-trap 'rc=$?; [ "$rc" -ne 0 ] && show_recovery; exit $rc' EXIT
+# O temporário da pendência de e-mail (passo 7) também sai aqui, em QUALQUER
+# saída: sem isto cada instalação deixava um /tmp/tmp.* com o aviso dentro.
+# Zerado aqui para o trap só apagar o que ESTE script criou: um valor herdado do
+# ambiente apontaria o `rm -f` para um arquivo alheio se a instalação morresse
+# antes do passo 7.
+PENDENCIA_EMAIL=
+apaga_temporarios() { [ -z "${PENDENCIA_EMAIL:-}" ] || rm -f "$PENDENCIA_EMAIL"; }
+trap 'rc=$?; apaga_temporarios; [ "$rc" -ne 0 ] && show_recovery; exit $rc' EXIT
 
 # ── Validadores ─────────────────────────────────────────────────────────────
 # Cada validador recebe o valor, imprime a explicação do problema em português
@@ -251,7 +315,7 @@ v_supabase_url() {
   case "$1" in
     https://*.supabase.co) ;;
     # Supabase SELF-HOSTED (ex.: https://db-crm.exemplo.com.br). A prova é a
-    # chamada a /auth/v1/health logo abaixo, que vale para qualquer host — o
+    # chamada a /auth/v1/verify logo abaixo, que vale para qualquer host — o
     # que se dispensa aqui é só a suposição de que todo Supabase é o da nuvem.
     https://*) ;;
     *supabase.co*) echo "$(t "Cole a URL completa, começando com https:// — ex.: https://abcdefgh.supabase.co")"; return 1;;
@@ -267,13 +331,28 @@ v_supabase_url() {
       *) echo "$(t "O modo single-server exige SUPABASE_INTERNAL_URL com http:// ou https:// para validar o Supabase local.")"; return 1;;
     esac
   fi
-  local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 "${health_url%/}/auth/v1/health" 2>/dev/null)" || code=000
+  # Responder não basta: tem de ser o GoTrue. Qualquer código ≠ 000 passava, e
+  # numa VPS com Coolify a 127.0.0.1:8000 é o PAINEL dele (302 para /login) —
+  # medido no PR 4. A URL é perguntada ANTES das chaves, então não há apikey, e
+  # sem ela o gateway (Envoy no self-hosted, o da nuvem) barra /auth/v1/health
+  # com 401. /auth/v1/verify é rota aberta (é o link dos e-mails): quem responde
+  # é o próprio GoTrue, com o JSON de erro dele (`"msg"`), na nuvem e no
+  # self-hosted. O corpo sozinho não basta (qualquer API pode ter "msg"): exige
+  # também o 400 que o GoTrue devolve ali sem parâmetros — medido no GoTrue do
+  # kit (supabase/gotrue v2.196.0): `{"code":400,...,"msg":"Verify requires a
+  # verification type"}`. Com `type`+`token` ele devolve 303, mas não mandamos.
+  local resp code
+  resp="$(curl -s -m 15 -w '\n%{http_code}' "${health_url%/}/auth/v1/verify" 2>/dev/null)" || resp=000
+  code="${resp##*$'\n'}"
   if [ "$code" = "000" ]; then
     echo "$(t "Não consegui alcançar {1} — confira se o projeto existe, está ativo (projeto pausado não responde) e se o VPS tem internet." "$health_url")"
     return 1
   fi
-  return 0
+  case "$code:${resp%$'\n'*}" in
+    400:*'"msg"'*) return 0;;
+  esac
+  echo "$(t "{1} respondeu (HTTP {2}), mas não é o Supabase: o serviço de login dele não atendeu em /auth/v1/verify. Confira o endereço (e a porta, se houver outro painel no servidor)." "$health_url" "$code")"
+  return 1
 }
 
 # Confere formato + faz a chamada real que só a chave certa responde.
@@ -296,19 +375,34 @@ v_sb_key() {
     *) echo "$(t "Isso não parece uma chave do Supabase (elas começam com 'eyJ' ou 'sb_'). Pegue em Settings > API.")"; return 1;;
   esac
   [ -z "$url" ] && return 0
+  # ── A PROVA HTTP bate no Supabase LOCAL quando ele é desta VPS ──────────────
+  # No single-server a URL pública é servida pelo Caddy desta instalação, e ele
+  # só sobe DEPOIS desta fase: com o domínio atrás de proxy (Cloudflare laranja,
+  # o padrão do kit) a chamada abaixo volta 521 e a instalação PARA na fase 2,
+  # mandando conferir uma chave que está certa — medido numa VPS real, 10/10/2026.
+  # Quem responde à pergunta "esta chave serve?" é o gateway local, publicado só
+  # em loopback — a MESMA escolha que `v_supabase_url` já faz acima. O `ref` do
+  # JWT continua conferido contra a URL que o operador deu: aquela comparação é
+  # sobre o PROJETO, e essa não muda.
+  local prova="$url"
+  if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+    case "${SUPABASE_INTERNAL_URL:-}" in
+      http://*|https://*) prova="$SUPABASE_INTERNAL_URL";;
+    esac
+  fi
   local code
   if [ "$want" = "service_role" ]; then
     # Rota de administração: a anon leva 401 aqui. É o que separa uma da outra.
     code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 \
       -H "apikey: $key" -H "Authorization: Bearer $key" \
-      "$url/auth/v1/admin/users?page=1&per_page=1" 2>/dev/null)" || code=000
+      "$prova/auth/v1/admin/users?page=1&per_page=1" 2>/dev/null)" || code=000
   else
     # /auth/v1/settings é a rota que a anon PODE abrir. Não use /rest/v1/: ele
     # responde 401 "Only the service_role API key can be used for this endpoint"
     # até para a anon correta — validador que reprova o dado certo é pior que
     # nenhum. Provado nesta VPS: settings dá 200 para as chaves do projeto e 401
     # para lixo e para JWT de outro projeto.
-    code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H "apikey: $key" "$url/auth/v1/settings" 2>/dev/null)" || code=000
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H "apikey: $key" "$prova/auth/v1/settings" 2>/dev/null)" || code=000
   fi
   case "$code" in
     2*) return 0;;
@@ -361,6 +455,24 @@ v_db_url() {
   echo "$(t "Não consegui conectar no banco. O Postgres respondeu:")"
   printf '   %s\n' "$(printf '%s' "$out" | head -2)"
   case "$out" in
+    # ── Falha de certificado (#829) ─────────────────────────────────────────
+    # É o `SELF_SIGNED_CERT_IN_CHAIN` da issue: a cadeia do pooler não está na
+    # trust store padrão. O erro cru não diz o que fazer, então este ramo fala o
+    # que falta — com o NOME da variável — antes de qualquer outra hipótese.
+    # Só mensagem de CERTIFICADO entra aqui, nunca qualquer "SSL": senha errada
+    # com a segunda tentativa citando "SSL connection is required" tem de cair
+    # no ramo da senha, e "SSL SYSCALL error" é queda de rede. As mensagens de
+    # verificação da libpq que conhecemos citam "certificate"; o
+    # ca-supabase-tls.test.sh prende a classificação pelo comportamento.
+    *[Cc]ertificate*|*[Cc]ertificado*|*SELF_SIGNED_CERT*)
+      echo "   👉 $(t "O Postgres recusou o certificado TLS: a cadeia dele não está na trust store desta máquina (SELF_SIGNED_CERT_IN_CHAIN).")"
+      if ca_do_supabase >/dev/null 2>&1; then
+        echo "      $(t "SUPABASE_SSL_ROOT_CERT já está declarada — confira se o arquivo é o prod-ca-2021.crt oficial do Supabase e se o hostname da connection string bate com o certificado.")"
+      else
+        echo "      $(t "Declare SUPABASE_SSL_ROOT_CERT no .env, apontando para a CA oficial do Supabase:")"
+        echo "      curl -fsSL -o /root/certs/prod-ca-2021.crt https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt"
+        echo "      SUPABASE_SSL_ROOT_CERT=/root/certs/prod-ca-2021.crt"
+      fi;;
     *"could not translate host name"*)
       echo "   👉 $(t "Quase sempre é a senha com caractere especial: na URL ela precisa ser codificada.")"
       echo "      $(t "Troque  @ por %40   :  por %3A   /  por %2F   ?  por %3F   #  por %23")";;
@@ -709,10 +821,21 @@ unico_traefik() {  # unico_traefik  < linhas "nome|projeto|imagem|portas"  → e
 #     mesmo criaria — "network <projeto>_internal declared as external, but could
 #     not be found" numa instalação nova; (2) a `internal` tem o redis SEM SENHA,
 #     e a rede do proxy é a única que um dia pode receber contêiner de fora.
+#
+#   Traefik em MAIS DE UMA rede  → a `coolify` se ela estiver entre elas; senão
+#     vazio, e quem chama recusa pedindo TRAEFIK_NETWORK. O docker lista as redes
+#     em ordem alfabética, então "a primeira" é a que vence o alfabeto, não a que
+#     o painel usa para os sites — medido numa VPS com Coolify: com uma rede
+#     `aaa-simulado` pendurada no coolify-proxy, esta função devolveu
+#     `aaa-simulado`. O que aconteceria com o domínio NÃO foi medido; o risco de
+#     escolher às cegas é ligar o CRM à rede de outro projeto, ou a uma rede
+#     `internal`/não-attachable que derruba o `up -d`.
 rede_do_traefik() {  # rede_do_traefik <NetworkMode do contêiner> <redes do contêiner> <bridge do projeto>
   local netmode="${1:-}" redes="${2:-}" nossa="${3:-}"
   [ "$netmode" = host ] && { printf '%s' "$nossa"; return 0; }
-  printf '%s' "$redes" | awk '{print $1}'
+  set -- $redes
+  [ $# -le 1 ] && { printf '%s' "${1:-}"; return 0; }
+  case " $* " in *" coolify "*) printf 'coolify' ;; esac
 }
 
 # Como o Traefik da hospedagem CHAMA as portas 80 e 443. Os nomes `web` e
@@ -924,6 +1047,25 @@ if [ -f "$PARTIAL_FILE" ]; then
   c_dim "$(t "  (o token do Supabase é de conta e nunca entra no rascunho: ele é perguntado de novo. Enter pula)")"
 fi
 
+# ARM64: resolver uma release publicada e conferir as quatro imagens e a WAHA
+# efetiva no índice OCI ANTES de criar projeto Supabase, rede, .env ou schema.
+# Uma tag Git pode existir antes do CI. Em AMD64 a versão segue a cascata de
+# sempre (mais abaixo): a sonda exige `docker buildx`, e toda imagem publicada
+# já tem amd64.
+PLATAFORMA_HOST="$(plataforma_oci_do_host "$(uname -m 2>/dev/null || true)" 2>/dev/null || true)"
+if [ "$PLATAFORMA_HOST" = linux/arm64 ]; then
+  RELEASE_TAG="$(ultima_release_estavel)"
+  VERSAO_ALVO="${RELEASE_TAG#v}"
+  WAHA_EFETIVA="${WAHA_IMAGE:-$(imagem_waha_padrao_para_host)}"
+  if [ -z "$RELEASE_TAG" ] || ! preflight_instalacao "$VERSAO_ALVO" "$PLATAFORMA_HOST" "$WAHA_EFETIVA"; then
+    c_red "$(t "✖ Não há release numérica completa para ARM64, ou a WAHA escolhida não oferece ARM64.")"
+    c_red "$(t "  Confira registry, visibilidade das quatro imagens e WAHA_IMAGE; depois repita.")"
+    # O painel genérico sugeriria down -v/drop schema antes de qualquer efeito.
+    trap - EXIT
+    exit 1
+  fi
+fi
+
 # ── Proxy reverso: quem está com as portas 80 e 443? ────────────────────────
 # Fica AQUI, logo depois de ler o .env e ANTES de qualquer coisa cara: era a
 # última etapa da fase 2, então quem esbarrava neste problema já tinha criado um
@@ -1089,6 +1231,31 @@ e, se for mesmo um Traefik, ponha REVERSE_PROXY=traefik no .env e rode de novo."
   esac
 fi
 
+# ── Cloudflare Tunnel: escolha manual, atrás de NAT ─────────────────────────
+# `cloudflared` NÃO entra em `decide_proxy`: não há nada para detectar. Quem
+# está atrás de NAT (ou de CGNAT, ou numa rede que proíbe inbound) declara
+# `REVERSE_PROXY=cloudflared` no .env, do mesmo modo manual do NPM. Aqui só se
+# confere que o token veio junto e que o modo não é incompatível.
+#
+# A recusa no single-server é de DESENHO, não de preguiça: lá o Caddy publica
+# também as seis APIs do Supabase (Auth, REST, Realtime, Storage...) pelo
+# Caddyfile.single-server. Sem Caddy, o túnel não tem para onde mandar
+# /auth/v1*, /rest/v1* e o Supabase deixa de funcionar — um site que "sobe" e
+# não loga. Até existir um Caddyfile do túnel que roteie as APIs, recusar é a
+# resposta honesta.
+if [ "${REVERSE_PROXY:-}" = "cloudflared" ]; then
+  if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+    die "$(t "REVERSE_PROXY=cloudflared não é suportado no modo single-server, porque o Supabase self-hosted depende do Caddy para publicar as APIs (Auth, REST, Storage...). Use o proxy padrão (Caddy) ou o Cloudflare Tunnel apenas com o Supabase na nuvem.")"
+  fi
+  if [ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+    die "$(t "REVERSE_PROXY=cloudflared exige CLOUDFLARE_TUNNEL_TOKEN no .env.
+Crie o túnel em Zero Trust > Networks > Tunnels, copie o token para essa linha
+e rode de novo. Em Public Hostnames, aponte o seu domínio para http://app:3000.")"
+  fi
+  c_grn "$(t "✓ Cloudflare Tunnel: o Caddy fica desligado e o cloudflared publica por app:3000")"
+  c_dim "$(t "  (lembre de bloquear /api/v1/webhooks/waha no WAF da Cloudflare — ver docker-compose.cloudflared.yml)")"
+fi
+
 # Fica FORA do `case` porque quem põe REVERSE_PROXY=traefik no .env à mão — o
 # caminho que o painel de bloqueio logo acima ENSINA — pula o `case` inteiro e
 # chegava no bloco da rede com a variável vazia, para morrer em "Não consegui
@@ -1235,7 +1402,8 @@ fi
 # que a versão não era nomeável.
 #
 # Resolvido no REMOTO porque o clone é `--depth 1` e não traz tag nenhuma.
-VERSAO_ALVO="$(ultima_versao_publicada "$REPO_URL")"
+# Em ARM64 a versão já foi resolvida e conferida pelo pré-voo, lá em cima.
+[ "$PLATAFORMA_HOST" = linux/arm64 ] || VERSAO_ALVO="$(ultima_versao_publicada "$REPO_URL")"
 
 # A tag do git é condição NECESSÁRIA, não suficiente: ela nasce minutos antes
 # das imagens, e `deskcomm-worker`/`deskcomm-scheduler` só passaram a existir
@@ -1247,7 +1415,9 @@ VERSAO_ALVO="$(ultima_versao_publicada "$REPO_URL")"
 # Cascata, do mais específico ao mais disponível. Cada nível pergunta pelas TRÊS
 # imagens juntas, porque instalar com elas desalinhadas é o defeito, não a
 # solução.
-if [ -n "$VERSAO_ALVO" ] && trio_publicado "$VERSAO_ALVO"; then
+if [ "$PLATAFORMA_HOST" = linux/arm64 ]; then
+  : # pré-voo OCI já passou
+elif [ -n "$VERSAO_ALVO" ] && trio_publicado "$VERSAO_ALVO"; then
   : # o caminho normal: as três publicadas na última versão
 elif trio_publicado "stable"; then
   c_ylw "$(t "⚠ A versão {1} ainda não tem as três imagens publicadas." "${VERSAO_ALVO:-$(t "mais recente")}")"
@@ -1305,7 +1475,7 @@ FIELDS=(
   # comportamento de sempre para quem não tem marca própria.
   "APP_ACCENT_HEX|Cor da sua marca em hex, ex.: #7a5cd6 (Enter usa a cor do sistema)||v_hex||opcional"
   "SUPPORT_EMAIL|E-mail de suporte que SEUS clientes veem (Enter pula)||v_email||opcional"
-  "RESEND_API_KEY|Chave da Resend — envia convite e e-mail de LGPD (resend.com/api-keys, Enter pula)|||secret|opcional"
+  "RESEND_API_KEY|Chave da Resend — envia convite e e-mail de LGPD (resend.com/api-keys; Enter pula: dá para configurar depois, em Admin → E-mail)|||secret|opcional"
   "RESEND_FROM_EMAIL|Remetente dos e-mails, de um domínio verificado na Resend (Enter pula)||v_email||opcional"
 )
 
@@ -1428,6 +1598,9 @@ if [ "$REVERSE_PROXY" = "traefik" ] && [ -z "${TRAEFIK_NETWORK:-}" ] && [ -n "$t
     c_dim "$(t "  (o Traefik roda em modo host, então o CRM publica numa rede própria: {1})" "$TRAEFIK_NETWORK")"
 fi
 if [ "$REVERSE_PROXY" = "traefik" ] && [ -z "${TRAEFIK_NETWORK:-}" ]; then
+  [ "$(printf '%s' "${traefik_redes:-}" | wc -w)" -gt 1 ] && \
+    die "$(t "O seu Traefik está em mais de uma rede Docker ({1}) e não sei por qual ele alcança os sites.
+Ponha TRAEFIK_NETWORK=<nome> no .env com a rede certa antes de tentar de novo." "${traefik_redes% }")"
   die "$(t "Não consegui descobrir a rede Docker do seu Traefik. Rode 'docker network ls',
 identifique a rede dele e ponha TRAEFIK_NETWORK=<nome> no .env antes de tentar de novo.")"
 fi
@@ -1614,8 +1787,15 @@ esac
   printf '# modo). Em "npm" entra o docker-compose.npm.yml, que também desliga o Caddy\n'
   printf '# e fixa o app na rede/IP que o Proxy Host espera (PROXY_NETWORK_* só é lido\n'
   printf '# nesse modo, e é sempre configuração manual — não há como detectar o NPM\n'
-  printf '# sozinho, ao contrário do Traefik).\n'
+  printf '# sozinho, ao contrário do Traefik). Ou "cloudflared" (a instalação está\n'
+  printf '# atrás de NAT: o Caddy é desligado e o acesso sai pelo Cloudflare Tunnel —\n'
+  printf '# entra o docker-compose.cloudflared.yml, e só CLOUDFLARE_TUNNEL_TOKEN é\n'
+  printf '# lido nesse modo; a configuração do túnel vive no painel da Cloudflare).\n'
   envq REVERSE_PROXY "$REVERSE_PROXY"
+  # Só consumido pelo contêiner `cloudflared` (nunca pelo app), então não entra
+  # em lib/env.ts. Gravado SEMPRE (vazio fora do modo cloudflared) para o laço
+  # que preserva chave alheia reconhecê-lo e uma re-execução não apagá-lo.
+  envq CLOUDFLARE_TUNNEL_TOKEN "${CLOUDFLARE_TUNNEL_TOKEN:-}"
   # O default mora aqui, junto dos irmãos TRAEFIK_* logo abaixo, e não numa
   # atribuição solta lá atrás: em modo caddy ninguém DECIDE esta variável, e
   # depender de uma linha distante para ela existir é o tipo de laço que um
@@ -1781,12 +1961,9 @@ esac
   printf '# Sem isto o número segue pareado no volume e MUDO até alguém abrir a tela\n'
   printf '# e clicar Reconectar — nada entra nem sai nesse meio-tempo.\n'
   envq WHATSAPP_RESTART_ALL_SESSIONS "${WHATSAPP_RESTART_ALL_SESSIONS:-True}"
-  # PINADA. Sem a tag, `devlikeapro/waha` é `:latest`, e esta linha gravava isso
-  # no .env de todo cliente — por cima do default pinado do compose, que então
-  # nunca chegava a ninguém. O `dc pull` de cada update entregava qualquer versão
-  # que o upstream tivesse publicado, sem ninguém ter testado.
-  # `latest-2026.7.2` é o mesmo digest de `latest` hoje (65e593e30bb7…).
-  envq WAHA_IMAGE "${WAHA_IMAGE:-devlikeapro/waha:latest-2026.7.2}"
+  # WAHA publica variantes x86 e ARM separadas para NOWEB. O padrão acompanha
+  # uname -m; uma WAHA_IMAGE escolhida pelo operador continua prevalecendo.
+  envq WAHA_IMAGE "${WAHA_IMAGE:-$(imagem_waha_padrao_para_host)}"
   envq WAHA_DEFAULT_ENGINE "${WAHA_DEFAULT_ENGINE:-NOWEB}"
   envq UPSTASH_REDIS_REST_URL "http://srh:80"
   envq UPSTASH_REDIS_REST_TOKEN "$UPSTASH_REDIS_REST_TOKEN"
@@ -2057,6 +2234,50 @@ $(c_ylw "  ─── $(t "A IA ainda não atende — falta cadastrar a chave") �
 PEND
 }
 
+# ── A pendência do ENVIO de e-mail, quando nada ficou no .env ───────────────
+# A issue #1110 registrou a ponta que o #714 deixou visível: o campo da Resend é
+# `opcional` desde então, mas quem pulava terminava sem saber que o caminho de
+# volta existe. A tela final é a única que a pessoa lê inteira (mesma régua do
+# `pendencia_da_ia`), e o aviso diz ONDE configurar e O QUE ainda não sai.
+#
+# Critério: nenhum remetente DE AMBIENTE — nem a chave da Resend, nem o host do
+# SMTP. Quem cadastrou pela tela `/admin/email` (banco, que PREVALECE sobre o
+# .env) reconhece o aviso e ignora; o kit não lê o banco aqui.
+#
+# A topologia muda o que falar: num Supabase PRÓPRIO o GoTrue usa o SMTP do CRM
+# para "esqueci a senha" e confirmação de cadastro, então a tela só alcança o
+# login por e-mail depois do `update.sh`. Na nuvem, esses e-mails são do
+# Supabase e o que falta é só o envio do produto.
+pendencia_do_email() {
+  [ -n "${RESEND_API_KEY:-}" ] && return 0
+  [ -n "${SMTP_HOST:-}" ] && return 0
+
+  cat <<PEND
+
+$(c_ylw "  ─── $(t "O envio de e-mail ainda não funciona") ─────────────────────")
+
+  $(t "Você deixou a chave da Resend para depois e não preencheu um SMTP. O CRM")
+  $(t "está no ar; o que não sai é o convite para a equipe e o e-mail com o PDF")
+  $(t "de LGPD.")
+
+  $(t "Para ligar, cadastre em Admin → E-mail o servidor SMTP próprio ou o")
+  $(t "serviço externo (Resend). O que a tela salva fica CIFRADO no banco e")
+  $(t "prevalece sobre o .env.")
+PEND
+
+  case "${NEXT_PUBLIC_SUPABASE_URL:-}" in
+    https://*.supabase.co*) return 0 ;;
+  esac
+
+  cat <<PEND
+
+  $(t "No SEU Supabase, os e-mails de acesso (senha, cadastro) também saem pelo")
+  $(t "SMTP do CRM. Depois de salvar na tela, rode:")
+
+      bash hostgator-setup-kit/update.sh
+PEND
+}
+
 PENDENCIA_EMAIL="$(mktemp)"
 PENDENCIA_ARQUIVO="$PENDENCIA_EMAIL" \
   SUPABASE_ACCESS_TOKEN="${SUPABASE_ACCESS_TOKEN:-}" \
@@ -2200,13 +2421,43 @@ if ! dc pull; then
   c_ylw "$(t "⚠ Não consegui puxar todas as imagens do registro.")"
   c_ylw "$(t "  Sigo assim mesmo: o que faltar é construído aqui (mais lento, mesmo resultado).")"
 fi
-# O "sigo assim mesmo" acima vale para o worker e o scheduler, que têm `build:`
-# ao lado do `image:` — mas NÃO para o app, que não tem: se a imagem dele não
-# veio do registro (arquitetura da VPS diferente da das imagens publicadas, tag
-# ainda publicando, pacote privado), o `up -d` morre e a instalação acabava sem
-# CRM no ar. A promessa da frase acima só se sustenta com esta guarda.
+# A frase de cima só é verdade com rede de segurança embaixo dela. Worker,
+# scheduler e voz têm `build:` ao lado do `image:` e o Compose os constrói em
+# QUALQUER falha de pull (medido, não só na de arquitetura); o `app` não tem,
+# de propósito (#1060). Se a imagem dele não veio do registro (arquitetura da
+# VPS diferente da das imagens publicadas, tag ainda publicando, pacote
+# privado, registro fora), o `up -d` morre e a instalação acabava sem CRM no
+# ar — e a resposta a qualquer falha era construir.
+#
+# ── O PORTÃO DO BUILD LOCAL, AQUI TAMBÉM (#1955, #2631) ──────────────────────
+# O gatilho continua sendo o CÓDIGO DE SAÍDA do `up -d` (nunca o texto do erro
+# — arquitetura, tag publicando, pacote privado e registro fora caem todos no
+# mesmo caminho), mas quem DECIDE se constrói é `build_local_permitido`, o
+# mesmo portão que o update.sh consultava sozinho. A assimetria é o defeito:
+# uma instalação nova com o registro fora do ar construía o `app` na VPS do
+# mesmo jeito, e o OOM do `next-build` (#1955) derruba o resto da VPS junto —
+# não há serviço no ar para proteger numa instalação, mas há uma memória para
+# não gastar.
+#
+# Quem tem registro respondendo continua se recuperando sozinho: é a
+# recuperação de arquitetura do #1060/#1143 e ela não pode sumir. Quem quer
+# construir de propósito pede com DESKCOMM_BUILD_LOCAL=1.
+#
+# Na instalação não há versão anterior para onde voltar (o update.sh devolve a
+# anterior e aponta o diagnóstico), então a recusa é UM die com a mensagem da
+# instalação — e o que ela DIZ sobre o motivo é separado (#2648): o veredito
+# 'indisponivel' que o portão lê junta causas com diagnósticos OPOSTOS (sem
+# buildx, registro fora, tag ainda publicando, sonda estourada no prazo), e a
+# mesma separação que o preflight do update.sh já fazia agora cabe aqui. Quem
+# decide a frase é `motivo_da_recusa_do_build_local` (em _common.sh), na mesma
+# ordem em que o portão decide: o operador sem buildx recebe "instale o
+# buildx", não "mexa na rede". A saída de propósito continua sendo o
+# DESKCOMM_BUILD_LOCAL=1.
 CONSTRUIU_AQUI=""
 if ! dc up -d; then
+  if ! build_local_permitido "$VERSAO_ALVO"; then
+    die "$(t "Não coloquei o CRM no ar: {1} A construção local segue fechada por padrão, e numa instalação não há versão anterior para onde voltar. Para construir as imagens aqui DE PROPÓSITO (mais lento, exige memória): {2}" "$(motivo_da_recusa_do_build_local "$VERSAO_ALVO")" "DESKCOMM_BUILD_LOCAL=1 bash hostgator-setup-kit/install.sh --yes")"
+  fi
   if construir_aqui_e_subir "$VERSAO_ALVO"; then
     CONSTRUIU_AQUI=1
   else
@@ -2278,8 +2529,9 @@ setup_update_agent_cron
 # "instalação nova" de "instalação que já está no ar", e ela não pode usar
 # "tem compose e tem `.env`" como prova: o `.env` chega pronto numa instalação
 # NOVA (copiado, gerado por automação, ou deixado por um `--yes` que parou no
-# meio), e com esse critério uma VPS ARM nova começava a instalação construindo
-# as imagens na própria VPS — o que a guarda existe para impedir.
+# meio), e com esse critério uma VPS numa arquitetura sem imagens publicadas
+# começava a instalação construindo as imagens na própria VPS — o que a guarda
+# existe para impedir.
 #
 # O marcador vai aqui, e não antes, porque só a partir daqui é verdade que a
 # instalação EXISTE: os contêineres subiram e o app respondeu. Gravar antes
@@ -2290,7 +2542,7 @@ setup_update_agent_cron
 # contêiner, que é o mesmo que ela usava para quem instalou numa versão
 # anterior.
 if [ "${APP_SAUDAVEL:-0}" = 1 ]; then
-  marcar_instalacao_feita "$VERSAO_ALVO" || c_ylw "$(t "⚠ Não consegui gravar o marcador desta instalação (arquivo .deskcomm-instalado). O CRM está no ar; numa VPS ARM a atualização pode pedir a VPS x86_64 até o marcador existir.")"
+  marcar_instalacao_feita "$VERSAO_ALVO" || c_ylw "$(t "⚠ Não consegui gravar o marcador desta instalação (arquivo .deskcomm-instalado). O CRM está no ar; numa arquitetura sem imagens publicadas, a atualização pode pedir uma VPS suportada até o marcador existir.")"
 fi
 
 # ── Final ───────────────────────────────────────────────────────────────────
@@ -2300,6 +2552,37 @@ fi
 # que existe para quem parou no MEIO. Aqui nada ficou pela metade: a config
 # está salva e a stack está de pé; falta o app responder.
 if [ "${APP_SAUDAVEL:-0}" != 1 ]; then
+  # `tls_recusado` (lib/net/alcance.ts) = o app não confiou no certificado do
+  # PRÓPRIO domínio. Num domínio recém-apontado é o cadeado que ainda não saiu
+  # (medido atrás do Coolify em 14/10/2026: o 1º pedido ao Let's Encrypt falhou
+  # e o certificado saiu ~3 min depois). Mandar procurar chave no .env aqui é
+  # mandar a pessoa consertar o que não está quebrado.
+  if printf '%s' "${health_body:-}" | grep -q '"tls_recusado"'; then
+    cat <<SEM_CADEADO
+
+$(c_ylw "═══════════════════════════════════════════════════════")
+$(c_ylw " $(t "Quase lá — falta o cadeado (HTTPS) do seu domínio")")
+$(c_ylw "═══════════════════════════════════════════════════════")
+
+  $(t "A configuração está salva e os contêineres estão no ar. Você NÃO precisa")
+  $(t "refazer nada — o certificado de {1} ainda não saiu." "${DOMAIN}")
+  $(t "Isso leva alguns minutos depois que o domínio aponta para esta VPS.")
+
+  $(t "Espere alguns minutos e confira (o certo é responder 307):")
+
+       curl -sSI https://${DOMAIN}/app | head -1
+
+  $(t "Quando der 307, rode de novo o mesmo comando de instalação: ele confere")
+  $(t "o que falta e termina, sem apagar nada.")
+
+  $(t "Travou? Leve o log para a comunidade — tem gente que já passou por isso:")
+
+       ${COMUNIDADE_URL}
+
+SEM_CADEADO
+    trap apaga_temporarios EXIT
+    exit 1
+  fi
   cat <<INCOMPLETO
 
 $(c_ylw "═══════════════════════════════════════════════════════")
@@ -2329,8 +2612,8 @@ $(c_ylw "═══════════════════════�
 
 INCOMPLETO
   # Sai != 0 para que automação (e o --yes) saiba que não terminou saudável,
-  # mas sem o trap: a receita de "apague tudo e recomece" não cabe aqui.
-  trap - EXIT
+  # mas sem o show_recovery: a receita de "apague tudo e recomece" não cabe aqui.
+  trap apaga_temporarios EXIT
   exit 1
 fi
 
@@ -2355,6 +2638,7 @@ $(c_grn " $(t "Instalação concluída!")")
 $(c_grn "═══════════════════════════════════════════════════════")
 
 $(pendencia_dos_emails)
+$(pendencia_do_email)
 $(pendencia_da_ia)
   1. $(t "Acesse:")  https://${DOMAIN}
      $(t "(o SSL leva ~1min pra emitir no primeiro acesso)")

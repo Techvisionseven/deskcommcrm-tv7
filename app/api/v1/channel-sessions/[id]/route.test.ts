@@ -16,18 +16,23 @@ import { NextRequest } from "next/server";
 import { audit } from "@/lib/audit";
 import { fail } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
-import { loadAuthUser, resolveActiveOrg } from "@/lib/auth/server";
+import { loadAuthUser, orgAtivaSemPortao } from "@/lib/auth/server";
 import type { AuthUser } from "@/lib/auth/types";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getWahaClient } from "@/lib/waha/client";
+import { apagarAssinaturaSocial } from "@/lib/channels/social/store";
 import { logger } from "@/lib/logger";
 import { decryptWebhookSecret } from "@/lib/webhooks/secrets";
 
-vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
+// `orgAtivaDaApi` REAL (sobre o `orgAtivaSemPortao` mockado): é ela que decide o 403 da org suspensa.
+vi.mock("@/lib/auth/require-role", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  requireRole: vi.fn(),
+}));
 vi.mock("@/lib/auth/server", () => ({
   loadAuthUser: vi.fn(),
-  resolveActiveOrg: vi.fn(),
+  orgAtivaSemPortao: vi.fn(),
   mfaEmDivida: vi.fn(async () => false),
 }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
@@ -37,6 +42,10 @@ vi.mock("@/lib/waha/client", () => ({
   getWahaClient: vi.fn(),
   wahaFriendlyError: (m: string) => m,
 }));
+// A assinatura do Zernio morre no provedor, não no dublê de banco: aqui só
+// interessa que a rota PEÇA para apagar antes de mexer na linha — apagar de
+// verdade é do módulo, coberto em `lib/channels/social/apagar-assinatura.test.ts`.
+vi.mock("@/lib/channels/social/store", () => ({ apagarAssinaturaSocial: vi.fn() }));
 // A credencial da linha chega CIFRADA: aqui só interessa que a rota peça para
 // decifrar a coluna intacta — decifrar de verdade é do módulo, não desta rota.
 vi.mock("@/lib/webhooks/secrets", async (importOriginal) => {
@@ -227,7 +236,7 @@ function authOk(): void {
     org: { orgId: ORG, name: "Org", role: "admin" },
   });
   vi.mocked(loadAuthUser).mockResolvedValue(user);
-  vi.mocked(resolveActiveOrg).mockResolvedValue({ orgId: ORG, name: "Org", role: "admin" });
+  vi.mocked(orgAtivaSemPortao).mockResolvedValue({ orgId: ORG, name: "Org", role: "admin", org_status: "active" });
 }
 
 /** Transporte do canal pareado por QR, registrando a ordem junto com o banco. */
@@ -492,6 +501,77 @@ describe("DELETE /api/v1/channel-sessions/[id]", () => {
     const { DELETE } = await import("./route");
     expect((await DELETE(reqDelete(), ctx())).status).toBe(500);
   });
+
+  /**
+   * ⭐ #2419 — excluir canal social pela Central deixava a assinatura de webhook
+   * viva no Zernio: a assinatura é por chave, não por conta, e a rota arquivava
+   * a linha e rotacionava o token sem removê-la — o provedor seguia entregando
+   * numa URL que virou 404, sem erro do nosso lado.
+   */
+  describe("canal SOCIAL → apaga a assinatura no Zernio ANTES de mexer na linha", () => {
+    const social = (over: Linha = {}) =>
+      canal({ provider: "zernio_social", waha_session_name: null, ...over });
+
+    it("apaga a assinatura antes da escrita e registra na auditoria", async () => {
+      authOk();
+      const db = makeDb({ sessions: [social({ webhook_path_token: "tokenantigo" })] });
+      vi.mocked(apagarAssinaturaSocial).mockImplementation(async () => {
+        db.eventos.push("social:apagar-assinatura");
+        return "apagada";
+      });
+      const waha = wahaOk(db);
+      const { DELETE } = await import("./route");
+      const res = await DELETE(reqDelete(), ctx());
+
+      expect(res.status).toBe(200);
+      expect(apagarAssinaturaSocial).toHaveBeenCalledWith(expect.anything(), ORG, CANAL);
+      // Revoga ANTES de mexer no banco — se a ordem invertesse, a reconciliação
+      // pela URL do token não acharia mais a assinatura.
+      expect(db.eventos[0]).toBe("social:apagar-assinatura");
+      expect(waha.logoutSession).not.toHaveBeenCalled();
+      expect(vi.mocked(decryptWebhookSecret)).not.toHaveBeenCalled();
+      expect(audit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({ social_webhook: "apagada" }),
+        }),
+      );
+    });
+
+    it("provedor fora do ar → best-effort: 200 e a falha vai para a auditoria", async () => {
+      authOk();
+      const db = makeDb({ sessions: [social()] });
+      vi.mocked(apagarAssinaturaSocial).mockRejectedValue(new Error("zernio_500"));
+      wahaOk(db);
+      const { DELETE } = await import("./route");
+      const res = await DELETE(reqDelete(), ctx());
+
+      expect(res.status).toBe(200);
+      expect(db.escritas).not.toHaveLength(0);
+      expect(audit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({ social_webhook: "falhou" }),
+        }),
+      );
+    });
+
+    it("no arquivamento rotaciona o token da URL sem tocar na credencial da Meta", async () => {
+      authOk();
+      const db = makeDb({
+        sessions: [social({ webhook_path_token: "tokenantigo" })],
+        rows: { conversations: [{ id: "c1", organization_id: ORG, channel_session_id: CANAL }] },
+      });
+      vi.mocked(apagarAssinaturaSocial).mockResolvedValue("apagada");
+      wahaOk(db);
+      const { DELETE } = await import("./route");
+      const res = await DELETE(reqDelete(), ctx());
+
+      expect((await res.json()).data.archived).toBe(true);
+      const patch = db.escritas[0]?.patch as Linha;
+      expect(patch.webhook_path_token).toMatch(/^[a-f0-9]{32}$/);
+      expect(patch.webhook_path_token).not.toBe("tokenantigo");
+      expect(patch).not.toHaveProperty("meta_token_encrypted");
+    });
+  });
 });
 
 describe("GET /api/v1/channel-sessions/[id]", () => {
@@ -637,6 +717,56 @@ describe("#1023 — a conexão removida fecha o próprio aviso", () => {
     expect(audit).toHaveBeenCalledWith(
       expect.objectContaining({
         action: "channel.archived",
+        metadata: expect.objectContaining({ avisos_fechados: "resolvido" }),
+      }),
+    );
+  });
+
+  /**
+   * O ramo que o relato descreve: a conexão foi EXCLUÍDA de vez, não arquivada —
+   * canal sem histórico nem configuração dá `outcome: "delete"` e cai no
+   * `.delete()` da rota. É o único ramo em que a linha de saúde já nem existe
+   * mais (o `on delete cascade` levou junto), então o resquício que pode sobrar
+   * é SÓ o item da Central — e é ele que o fecho tem de alcançar, vindo DEPOIS
+   * da exclusão. Sem esta chamada neste ramo, o teste falha: a exclusão de uma
+   * conexão virgem deixaria o crítico aberto para sempre, que é o sintoma da
+   * issue.
+   */
+  it("⭐ canal EXCLUÍDO de vez com aviso aberto → nenhum aviso daquela conexão sobra", async () => {
+    authOk();
+    const db = makeDb({
+      rows: {
+        agent_inbox_items: [
+          avisoAberto(CANAL, "i1"),
+          avisoAberto("99999999-9999-4999-8999-999999999999", "i2"),
+        ],
+      },
+    });
+    wahaOk(db);
+    const { DELETE } = await import("./route");
+    const res = await DELETE(reqDelete(), ctx());
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    // Hard delete de verdade: a linha some, ninguém ganha `archived_at`.
+    expect(body.data.archived).toBe(false);
+    expect(db.linhas("channel_sessions")).toEqual([]);
+    // O fecho roda DEPOIS da exclusão — é o que separa este ramo do arquivamento.
+    expect(db.eventos).toEqual([
+      "waha:logout",
+      "waha:delete",
+      "delete:channel_sessions",
+      "update:agent_inbox_items",
+    ]);
+    expect(
+      db.linhas("agent_inbox_items").filter((l) => l.ref_id === CANAL && l.status === "open"),
+    ).toEqual([]);
+    // O aviso de OUTRA conexão segue aberto: o fecho é por `ref_id`, nunca por org.
+    expect(db.linhas("agent_inbox_items").find((l) => l.id === "i2")?.status).toBe("open");
+    // A auditoria diz o que aconteceu, e não só que a exclusão saiu.
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "channel.deleted",
         metadata: expect.objectContaining({ avisos_fechados: "resolvido" }),
       }),
     );

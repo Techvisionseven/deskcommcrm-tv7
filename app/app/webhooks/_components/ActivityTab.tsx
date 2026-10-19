@@ -96,15 +96,44 @@ const MOTIVO_DA_PARADA: Record<string, string> = {
     "A pessoa escolhida como responsável não é atendente desta equipe. Escolha outra pessoa na automação.",
   invalid_owner:
     "A pessoa escolhida como responsável não pode atender — o papel dela é só de visualização. Escolha um atendente.",
+  /* #2041 — o modo rodízio de `assign_owner`. Nascem em
+     fn_automation_rodizio_atribuir e saem literais de lib/automation/actions/assign-owner.ts. */
+  ninguem_disponivel:
+    "Ninguém da fila do rodízio pode receber agora: todos estão pausados, saíram da equipe ou só visualizam. O lead ficou sem responsável.",
+  fila_vazia: "A fila do rodízio desta automação está vazia. Abra a automação e escolha quem entra no rodízio.",
+  sem_rodizio:
+    "A automação foi alterada e não tem mais o rodízio que disparou esta ação. Nada foi atribuído.",
+  lead_nao_encontrado: "O lead deste evento não foi encontrado nesta organização, então ninguém foi atribuído.",
   missing_input:
     "A ação não recebeu o que precisava (o lead do evento ou a pessoa configurada). Abra a automação e revise.",
   no_tags: "Esta ação não tem nenhuma etiqueta escolhida. Abra a automação e escolha pelo menos uma.",
   no_target: "O evento que disparou a regra não trouxe um lead nem um contato para etiquetar.",
   no_lead_or_contact: "O evento que disparou a regra não trouxe um lead para criar ou mover.",
   cross_pipeline_move_not_allowed: "Mover um lead para outro funil está desligado nesta organização.",
+  /*
+   * #2769 — o caso específico do ganho, com frase própria: a porta está aberta
+   * (a ação é permitida em `lead.won`), então "mover para outro funil está
+   * desligado" seria mentira. O diagnóstico é outro e o conserto é uma linha:
+   * apontar a ação para o funil de pós-venda. Emitido por
+   * lib/automation/actions/create-or-move-lead.ts como `error`, o mesmo canal
+   * de `cross_pipeline_move_not_allowed` (canal cobrado pela guarda da #1090).
+   */
+  continuacao_exige_outro_funil:
+    "A continuação de um negócio ganho só nasce em OUTRO funil. Aponte esta ação para o funil de pós-venda — nada foi movido.",
+  lead_already_transferred_in_event:
+    "Outra regra deste mesmo evento já levou o lead para outro funil. Vale a primeira regra; esta não transfere de novo.",
   flow_not_active:
     "O funil escolhido não está ativo, então a inscrição não foi feita. Ative o funil ou escolha outro na automação.",
   live_enrollment_exists: "O contato já está em um funil ativo — esta ação não inscreve duas vezes.",
+  /* #2647 — o roteiro de ATENDIMENTO alcançado pela MESMA ação. Os dois motivos
+     nascem em lib/automation/actions/start-message-flow.ts e chegam pelos
+     mesmos dois canais (`detail.reason` e `action.error`). */
+  banco_do_roteiro_indisponivel:
+    "O roteiro de atendimento não começou: esta instalação não tem a conexão direta do banco configurada, e é por ela que o roteiro é conduzido. Configure-a e execute a regra de novo.",
+  modulo_desligado:
+    "O roteiro de atendimento não começou: o módulo Fluxos de atendimento está desligado nesta instalação.",
+  roteiro_nao_iniciado:
+    "O roteiro de atendimento não começou para este contato: o fluxo pode não estar publicado, o contato já pode ter um roteiro em andamento, ou já ter concluído este sem poder recomeçar.",
   consent_declined: "O contato não autorizou o recebimento de mensagens de marketing.",
   fora_do_pre_go_live:
     "O número deste canal ainda não entrou no pré-go-live, então a mensagem escrita pela IA não sai por ele.",
@@ -116,6 +145,9 @@ const MOTIVO_DA_PARADA: Record<string, string> = {
   missing_url: "Esta ação de webhook não tem endereço configurado. Abra a automação e preencha.",
   unknown_action:
     "A regra usa um tipo de ação que esta instalação não tem (pode ter saído em uma atualização). Abra a automação e escolha outra ação.",
+  // #1528 — o motor pula atribuir/mover nos gatilhos do trigger (laço).
+  acao_fecharia_laco:
+    "Neste gatilho esta ação não roda: atribuir responsável ou mover o lead dispararia a automação de novo, sem fim. Abra a automação e tire a ação.",
   /*
    * #1540 — a ação criar tarefa. Estes quatro não passam por literal nenhum
    * em lib/automation: nascem em lib/tarefas/criar-tarefa.ts como
@@ -133,6 +165,59 @@ const MOTIVO_DA_PARADA: Record<string, string> = {
     "A tarefa não foi criada: o título ficou vazio depois de preencher os campos do texto. Escreva um título que não dependa só de dado que faltou.",
   falha:
     "A tarefa não foi criada: o banco recusou a gravação. Tente de novo em alguns minutos; se persistir, abra a tarefa na agenda para ver o detalhe.",
+  /*
+   * #1752 — o PLANO de tarefas. Mesmo caminho dos quatro acima: nasce em
+   * `lib/tarefas/plano.ts` como `resultado.codigo` e chega pelo `reason` da
+   * ação `apply_task_plan` (declaração em ORIGENS, no teste da guarda). Só
+   * este é novo — os outros quatro já têm frase por virem do criar-tarefa.
+   */
+  plano_nao_encontrado:
+    "O plano não foi aplicado: o plano escolhido nesta regra não existe mais na lista da organização. Abra a automação e escolha outro plano.",
+  /* #1970 — a ação ai_decide. Estes quatro nascem aqui em lib/automation/actions/ai-decide.ts
+     e chegam ao run por `detail.reason`/`action.error` (mesmo casal de canais da guarda). */
+  custo_de_token_nao_registrado:
+    "A ação não rodou: a regra foi gravada sem declarar o gasto de IA (custo_de_token). Corrija a regra pela API; este passo ainda não tem tela.",
+  config_invalida:
+    "A ação não rodou: a instrução ou as opções estão incompletas. Abra a automação e revise o texto e as alternativas.",
+  escolha_fora_do_conjunto:
+    "A IA devolveu uma opção que não está na lista desta ação, então nada foi executado. Corrija a instrução da regra para deixar as opções mais claras.",
+  acao_alvo_desconhecida:
+    "A opção escolhida aponta para uma ação que esta instalação não tem (pode ter saído em uma atualização). Abra a automação e escolha outra ação.",
+  /* #2367 — o interruptor POR EMPRESA: o quinto motivo que nasce no mesmo arquivo,
+     e o único que a tela pode consertar por aqui (o caminho está na própria frase). */
+  ai_decide_desligado_na_empresa:
+    "A ação não rodou: o interruptor desta empresa desligou todos os passos a IA decide, então o modelo não foi consultado e nada foi executado. Ligue o interruptor em Configurações, na tela Automações.",
+  /* #2367 — o mesmo interruptor, mas ILEGÍVEL: erro de leitura não vira "ligado"
+     (o operador pode ter desligado) nem "desligado" (a tela mentiria sobre quem). */
+  ai_decide_interruptor_ilegivel:
+    "A ação não rodou: não deu para ler agora o interruptor da IA desta empresa, então o modelo não foi consultado e nada foi executado. As próximas execuções tentam de novo.",
+  /* vêm do decider (lib/automation/decider.ts) pelo mesmo `decisao.motivo`. */
+  resposta_vazia: "A IA não devolveu nenhuma escolha entre as opções desta ação. Tente de novo ou corrija a instrução.",
+  sem_json: "A IA respondeu fora do formato esperado e nada foi executado. Tente de novo em alguns minutos.",
+  escolha_ausente: "A IA respondeu sem dizer qual opção escolher, então nada foi executado. Tente de novo ou corrija a instrução.",
+  /* #2726 — a ação `send_email`. Os sete nascem em
+     lib/automation/actions/send-email.ts e chegam aos DOIS canais da tela:
+     `detail.reason` nas recusas (pelo `para.motivo`, origem declarada em
+     ORIGENS no teste da guarda — `no_contact`, `contact_blocked` e
+     `consent_declined` já moravam aqui, `no_email` e `dono_sem_email` são
+     novos) e `action.error` nos cinco códigos do provedor (pelo
+     `codigoDaFalha`, literal no resultado). Sem frase aqui quem operava a
+     automação lia o código cru. */
+  no_email: "O contato não tem e-mail cadastrado, então não havia endereço para onde enviar.",
+  dono_sem_email:
+    "O negócio não tem responsável com e-mail cadastrado, então não havia endereço para onde enviar. Escolha outro destinatário na automação.",
+  dono_fora_da_equipe:
+    "O responsável do negócio não faz mais parte da equipe, então o e-mail não foi enviado. Troque o responsável do negócio ou escolha outro destinatário na automação.",
+  email_nao_configurado:
+    "Nenhum e-mail está configurado nesta instalação: ligue o servidor em Admin › E-mail ou conecte o serviço externo de envio.",
+  email_recusado:
+    "O servidor de e-mail recusou a mensagem. O detalhe técnico abaixo traz o motivo que o provedor devolveu.",
+  email_limite_atingido:
+    "O provedor de e-mail limitou os envios por causa do volume. Tente de novo mais tarde.",
+  remetente_recusado:
+    "O servidor recusou o endereço de quem envia. Confira o remetente em Admin › E-mail.",
+  dominio_nao_verificado:
+    "O domínio do remetente não está verificado na Resend. Verifique o domínio na conta Resend e tente de novo.",
 };
 
 function explicacaoDe(
@@ -140,6 +225,14 @@ function explicacaoDe(
   t: (texto: string) => string,
 ): string | null {
   const detail = action.detail ?? {};
+  // A vez do rodízio (#2041) leva nome e posição: a frase pronta em
+  // `explicacao` muda a cada lead e nunca casaria com o dicionário. Traduz o
+  // molde e só depois cola os valores.
+  if (typeof detail.nome === "string" && typeof detail.posicao === "number") {
+    return t("Vez de {nome}, posição {posicao} da fila do rodízio.")
+      .replace("{nome}", detail.nome)
+      .replace("{posicao}", String(detail.posicao));
+  }
   if (typeof detail.explicacao === "string") return t(detail.explicacao);
   // O motivo chega por DOIS canais: `detail.reason` (quem monta o detalhe) e
   // `action.error` (quem devolve só o código — `user_not_in_org` e

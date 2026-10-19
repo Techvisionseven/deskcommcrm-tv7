@@ -178,6 +178,8 @@ interface Cenario {
   agenteGrudado?: string | null;
   /** Só o agente legado da clínica, sem versão publicada (instalação nova). */
   somenteLegado?: boolean;
+  /** Os dois agentes pausados pelo dono — a equipe atende sozinha. */
+  todosPausados?: boolean;
 }
 
 function montarBanco(c: Cenario): Banco {
@@ -192,6 +194,7 @@ function montarBanco(c: Cenario): Banco {
     created_at: "2026-01-01T00:00:00.000Z",
     published_version_id: c.somenteLegado === true ? null : VERSAO_CLINICA,
     archived_at: null,
+    paused_at: c.todosPausados === true ? "2026-09-25T17:21:17.840Z" : null,
   };
   const tecnica: Linha = {
     id: AGENTE_TECNICA,
@@ -204,6 +207,7 @@ function montarBanco(c: Cenario): Banco {
     created_at: "2026-06-01T00:00:00.000Z",
     published_version_id: VERSAO_TECNICA,
     archived_at: null,
+    paused_at: c.todosPausados === true ? "2026-09-25T17:21:17.840Z" : null,
   };
 
   return {
@@ -223,6 +227,9 @@ function montarBanco(c: Cenario): Banco {
         organization_id: ORG,
         channel_session_id: c.sessaoDaConversa,
         active_ai_agent_id: c.agenteGrudado ?? null,
+        // O embed que o portão de elegibilidade lê: sem status a empresa não
+        // opera, e o worker pula antes de classificar (a régua do handoff).
+        organizations: { status: "active" },
       },
     ],
     ai_agents: c.somenteLegado === true ? [clinica] : [clinica, tecnica],
@@ -362,5 +369,25 @@ describe("limiar de sentimento — o agente da conversa é quem manda (#486)", (
       r.agenteDoCusto,
       "atribuiu o custo a um agente que não atende esta conversa",
     ).toBeNull();
+  });
+});
+
+describe("sem nenhum agente no ar, o sentimento não roda", () => {
+  it("agentes pausados: não classifica, não cobra e não dispara o aviso de 'não há atendente'", async () => {
+    // Medido numa VPS (set/2026): com os três agentes pausados e a equipe
+    // respondendo pelo celular, o handoff por sentimento mandava ao cliente
+    // "Não há atendente disponível neste instante — sua conversa entrou na fila".
+    const rpcs: Linha[] = [];
+    vi.mocked(createAdminClient).mockReturnValue(
+      fazerAdmin(montarBanco({ sessaoDaConversa: SESSAO_CLINICA, todosPausados: true }), rpcs) as unknown as ReturnType<
+        typeof createAdminClient
+      >,
+    );
+
+    const resultado = await processSentiment(evento);
+
+    expect(resultado).toMatchObject({ skipped: true, reason: "nenhum_agente_no_ar" });
+    expect(generateObject).not.toHaveBeenCalled();
+    expect(rpcs.filter((r) => r["p_event_type"] === "ai.sentiment_alert")).toHaveLength(0);
   });
 });

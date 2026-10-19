@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { PRIORIDADES_DA_TAREFA } from '@/lib/tarefas/tipos';
+import { ehOpDeData, OPS_DE_DATA } from './condicao-por-data';
 
 /**
  * Flow graph schema for the follow-up automation system.
@@ -21,6 +22,13 @@ export const NODE_TYPES = [
   // que advocacia, saúde e serviços regulados precisam — o sistema lembra a
   // equipe, a mensagem sai de uma pessoa.
   'internal_task',
+  // #2065: dois tipos de ACAO que não falam com o cliente — o fluxo deixa de
+  // só mandar mensagem. `move_lead` move o card para outra etapa (o mesmo
+  // escritor de etapa do board/automação), `edit_lead_tag` grava tag no lead
+  // (a MESMA `add_tag` do motor de automação). "Disparar campanha" ficou de
+  // fora desta fatia e é o passo seguinte da issue.
+  'move_lead',
+  'edit_lead_tag',
   'end',
 ] as const;
 export type NodeType = (typeof NODE_TYPES)[number];
@@ -240,6 +248,13 @@ export const actionConfigSchema = z.discriminatedUnion('mode', [
   z.strictObject({
     mode: z.literal('text'),
     body: z.string().min(1).max(4000),
+    /**
+     * #2734 — MÍDIA OPCIONAL (imagem ou PDF) por URL. Presente, o `body` vira a
+     * LEGENDA. Opcional de propósito: os grafos publicados não têm a chave e
+     * continuam válidos byte a byte (o `strictObject` só recusa o que ELE não
+     * conhece; um campo novo e opcional é aceito pelos antigos).
+     */
+    media_url: z.string().url().max(2000).optional(),
   }),
   z.strictObject({
     mode: z.literal('ai_message'),
@@ -273,23 +288,97 @@ export const internalTaskConfigSchema = z.strictObject({
 });
 
 /**
+ * Nó `move_lead` (#2065) — mover o card para outra etapa do MESMO funil.
+ *
+ * Só a etapa, sem `pipeline_id`: quem escolhe o destino é o SELETOR de etapas
+ * da tela, e quem RECUSA troca de funil é a casa — `moveLeadHandler`
+ * (`app/api/v1/leads/_handler`) devolve `pipeline_immutable_use_clone` quando a
+ * etapa não é do funil do lead, a mesma régua do board, das automações e da
+ * tool MCP. Repetir aqui a pergunta de funil seria uma segunda régua para a
+ * mesma regra.
+ *
+ * `stage_id` aceita vazio porque o rascunho é validado SÓ estruturalmente
+ * (`flowGraphSchema`) e o nó nasce sem destino — quem exige etapa escolhida é o
+ * `validate-publish` (`etapa_destino_ausente`), como a condição com regra em
+ * branco.
+ *
+ * `lost_reason` é opcional para não invalidar grafo já publicado: quem montou
+ * o fluxo antes desta régua continua válido, e quem publica com destino em
+ * etapa de perda precisa preenchê-lo (`motivo_da_perda_ausente`).
+ */
+export const moveLeadConfigSchema = z.strictObject({
+  stage_id: z.string().max(64),
+  lost_reason: z.string().max(500).optional(),
+});
+
+/**
+ * Nó `edit_lead_tag` (#2065) — grava tag no lead, o merge idempotente da ação
+ * `add_tag` do motor de automação (`lib/automation/actions/add-tag.ts`), com os
+ * MESMOS limites do schema de webhook (`lib/schemas/webhooks.ts`): até 10 tags
+ * de até 60 caracteres.
+ *
+ * Lista vazia é rascunho em construção (mesma degradação do `stage_id`); o
+ * publish recusa (`tag_ausente`) — um nó que não grava nada não pode ser
+ * publicado como se gravasse.
+ */
+export const editLeadTagConfigSchema = z.strictObject({
+  tags: z
+    .array(z.string().max(60, "Tag muito longa: máximo de 60 caracteres."))
+    .max(10, "No máximo 10 tags por caixa."),
+});
+
+/**
  * One rule of a `condition` node. In `branching: 'per_check'` it IS a branch,
  * so it carries the stable id an edge references and the label the handle shows
  * — identity lives on the rule itself, never in a parallel array that would
  * desync the moment the user reorders the rules.
  */
-export const conditionCheckSchema = z.strictObject({
-  id: declaredBranchIdSchema.optional(),
-  label: z.string().min(1).max(60).optional(),
-  field: z.enum([
-    'lead_stage',
-    'tag',
-    'steps_taken',
-    'last_outcome',
-  ]),
-  op: z.enum(['eq', 'neq', 'gte', 'lte', 'contains']),
-  value: z.union([z.string(), z.number()]),
-});
+export const conditionCheckSchema = z
+  .strictObject({
+    id: declaredBranchIdSchema.optional(),
+    label: z.string().min(1).max(60).optional(),
+    field: z.enum([
+      'lead_stage',
+      'tag',
+      'steps_taken',
+      'last_outcome',
+      // Data relativa sobre um campo personalizado do negócio — ver
+      // `condicao-por-data.ts`. É o que permite perguntar "o período de teste
+      // terminou?", que nenhum dos quatro campos acima alcança.
+      'lead_date',
+    ]),
+    op: z.enum(['eq', 'neq', 'gte', 'lte', 'contains', ...OPS_DE_DATA]),
+    value: z.union([z.string(), z.number()]),
+    /**
+     * A chave em `crm_leads.custom_fields` que a regra lê (ex.: `fim_teste`).
+     * Só `lead_date` usa, e para ele é OBRIGATÓRIA no PUBLISH: regra de data
+     * sem campo não tem o que comparar, e deixá-la passar daria uma condição
+     * que responde sempre `false` sem dizer por quê. Aqui, no rascunho, a
+     * chave VAZIA passa — ver o aviso logo abaixo.
+     */
+    key: z.string().max(60, 'Nome do campo muito longo: máximo de 60 caracteres.').optional(),
+  })
+  // ⚠️ `key` VAZIA PASSA AQUI, de propósito, e isso foi achado pela prova de
+  // tela. O rascunho é validado SÓ estruturalmente — a mesma razão pela qual
+  // `move_lead.stage_id` e `edit_lead_tag.tags` aceitam vazio: quem escolhe o
+  // campo de data ainda não digitou o nome dele, e o painel grava a cada
+  // tecla (`commit` → `safeParse`). Exigir a chave aqui fazia aparecer um erro
+  // no instante em que a pessoa escolhia «Data de um campo do negócio», antes
+  // de ela ter chance de preencher — e a regra nem era persistida, então o nó
+  // continuava com a regra ANTERIOR enquanto a tela mostrava a nova.
+  //
+  // Quem exige é o publish (`campo_de_data_ausente` em `validate-publish.ts`),
+  // como exige etapa de destino e tag. O mesmo vale para o prazo: limpar o
+  // campo para redigitar passa por um valor vazio, e o publish é que recusa
+  // (`check_value_not_number`).
+  .refine((c) => c.field !== 'lead_date' || ehOpDeData(c.op), {
+    message: `uma regra de data usa ${OPS_DE_DATA.join(' ou ')}`,
+    path: ['op'],
+  })
+  .refine((c) => c.field === 'lead_date' || !ehOpDeData(c.op), {
+    message: 'passou_ha e falta_para existem só para regra de data',
+    path: ['op'],
+  });
 
 export type ConditionCheck = z.infer<typeof conditionCheckSchema>;
 
@@ -517,6 +606,28 @@ export const flowNodeSchema = z.discriminatedUnion('type', [
     }),
     config: internalTaskConfigSchema,
   }),
+  // Nó de ação (#2065): move o card para outra etapa do funil
+  z.strictObject({
+    id: z.string().min(1),
+    type: z.literal('move_lead'),
+    label: z.string().min(1).max(60),
+    position: z.strictObject({
+      x: z.number(),
+      y: z.number(),
+    }),
+    config: moveLeadConfigSchema,
+  }),
+  // Nó de ação (#2065): grava tag no lead, sem mensagem
+  z.strictObject({
+    id: z.string().min(1),
+    type: z.literal('edit_lead_tag'),
+    label: z.string().min(1).max(60),
+    position: z.strictObject({
+      x: z.number(),
+      y: z.number(),
+    }),
+    config: editLeadTagConfigSchema,
+  }),
   // End node: terminal state
   z.strictObject({
     id: z.string().min(1),
@@ -591,6 +702,13 @@ export const flowSettingsSchema = z.strictObject({
    * roteiro abandonado voltava a perguntar semanas depois (prova do #1130).
    */
   expira_em_horas: z.number().int().min(1).max(720).optional(),
+  /**
+   * O roteiro pode começar de novo para um cliente que JÁ o concluiu (#1130,
+   * decisão do doc 69: cada roteiro escolhe). Ausente = NÃO recomeça: repetir a
+   * palavra-gatilho de um cadastro já feito reabria as mesmas perguntas.
+   * Agendamento, que precisa repetir, liga.
+   */
+  pode_recomecar: z.boolean().optional(),
   /**
    * SOMENTE INTERNO (#1540): o fluxo inteiro não fala com o cliente. A
    * publicação (`validate-publish.ts`) recusa qualquer nó de ENVIO num fluxo

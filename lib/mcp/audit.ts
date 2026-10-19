@@ -19,6 +19,12 @@ interface AuditMcpToolCallInput {
   errorMessage?: string;
   resultSummary?: string;
   /**
+   * Tamanho, em bytes, do JSON devolvido ao modelo (`tamanhoDoResultado`). Só o
+   * NÚMERO: é ele que custa token, e o conteúdo pode ter dado pessoal. Ausente =
+   * a chamada não teve resposta a medir (erro, recusa) ou não deu para medir.
+   */
+  resultBytes?: number;
+  /**
    * Vazio DECLARADO pela tool ("não achei"), quando o `success: false` é isso e
    * não erro técnico. A tool diz qual vazio foi (`motivo`).
    *
@@ -30,6 +36,17 @@ interface AuditMcpToolCallInput {
    */
   desfecho?: "sem_resultado";
   motivo?: string;
+  /**
+   * O TERMO desta chamada, quando a tool declara um (`termoBuscado`). É o que
+   * permite a leitura por termo (`fn_agent_tool_usage_por_termo`) contar "não
+   * achei por termo" em vez de só "falhou por tool" (#484).
+   *
+   * O termo já viaja em `metadata.args` (`redactArgs`, linha 71), mas sob o nome
+   * do argumento de cada tool — o leitor no banco teria de gravar esse nome. Um
+   * campo próprio dá à leitura uma chave única, independente da tool, e sobrevive
+   * a uma tool que redija os próprios args (`redigirParaAuditoria`).
+   */
+  termo?: string;
 }
 
 const ARGS_REDACT_KEYS = new Set([
@@ -55,7 +72,7 @@ function redactArgs(args: Record<string, unknown>): Record<string, unknown> {
 }
 
 export async function auditMcpToolCall(input: AuditMcpToolCallInput): Promise<void> {
-  const { ctx, toolName, args, durationMs, success, errorMessage, resultSummary, desfecho, motivo } =
+  const { ctx, toolName, args, durationMs, success, errorMessage, resultSummary, resultBytes, desfecho, motivo, termo } =
     input;
 
   const metadata: Record<string, unknown> = {
@@ -68,9 +85,18 @@ export async function auditMcpToolCall(input: AuditMcpToolCallInput): Promise<vo
   };
 
   if (resultSummary) metadata.result_summary = resultSummary.slice(0, 280);
+  if (typeof resultBytes === "number" && Number.isFinite(resultBytes) && resultBytes >= 0) {
+    metadata.result_bytes = Math.floor(resultBytes);
+  }
   if (errorMessage) metadata.error = errorMessage.slice(0, 500);
   if (desfecho) metadata.desfecho = desfecho;
   if (motivo) metadata.motivo = motivo.slice(0, 200);
+  // O termo, para a contagem "não achei POR TERMO" (`fn_agent_tool_usage_por_termo`).
+  // Mesmo corte do motivo: é texto do cliente e o audit não guarda romance.
+  if (termo) metadata.termo = termo.slice(0, 200);
+  // O contato da conversa, quando o turno o injetou no ctx (hoje: ferramenta
+  // de servidor MCP externo em turno de atendimento, #2147).
+  if (ctx.contatoDoTurno) metadata.contact_id = ctx.contatoDoTurno;
   if (ctx.actor.type === "ai_agent" && ctx.actor.api_token_id) {
     metadata.actor_api_token_id = ctx.actor.api_token_id;
   }

@@ -22,10 +22,7 @@ import { randomUUID } from "node:crypto";
 import { ok, fail } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
 import { createClient } from "@/lib/supabase/server";
-import {
-  EXPLICACAO_DA_ORIGEM,
-  resolverChaveDeEmbedding,
-} from "@/lib/ai/embeddings/chave";
+import { montarEstadoDaChave } from "@/lib/ai/embeddings/estado";
 
 export const dynamic = "force-dynamic";
 
@@ -36,26 +33,13 @@ export async function GET(): Promise<Response> {
   if (!authz.ok) return authz.response;
   const { org: activeOrg } = authz;
 
-  const chave = await resolverChaveDeEmbedding(activeOrg.orgId);
-
-  const supabase = await createClient();
-  const { data: credenciais } = await supabase
-    .from("ai_provider_credentials_safe")
-    .select("id, provider, label, api_key_last4, validated_at, validation_error, is_active")
-    .eq("organization_id", activeOrg.orgId)
-    .in("provider", ["openai", "openrouter"])
-    .order("created_at", { ascending: true });
+  const estado = await montarEstadoDaChave(await createClient(), activeOrg.orgId);
 
   return ok(
     {
-      pode_indexar: chave !== null,
-      origem: chave?.origem ?? null,
-      explicacao: chave ? EXPLICACAO_DA_ORIGEM[chave.origem] : null,
-      chave_em_uso: chave?.rotulo ?? null,
-      avisos: chave?.avisos ?? [],
-      credenciais_embedding: credenciais ?? [],
+      ...estado,
       // Compatibilidade com clientes da rota anterior.
-      credenciais_openai: (credenciais ?? []).filter((c) => c.provider === "openai"),
+      credenciais_openai: estado.credenciais_embedding.filter((c) => c.provider === "openai"),
     },
     { requestId },
   );

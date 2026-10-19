@@ -125,7 +125,16 @@ describe("o marcador da contagem é o da lista — uma régua só", () => {
   });
 
   it.each([CONTAGEM, LISTA])("%s consome a régua", (caminho) => {
-    expect(readFileSync(caminho, "utf8")).toContain("aplicarMarcador(");
+    // ⚠️ `aplicarMarcadores` (o PLURAL) desde #1274: quem lista e quem conta
+    // precisam aplicar a MESMA função, e a plural é a que sabe o E/OU e o caso
+    // de uma etiqueta só. Se a cerca aceitasse as duas, uma rota que voltasse
+    // ao singular passaria aqui e perderia o E/OU — que é o filtro inteiro.
+    const src = readFileSync(caminho, "utf8");
+    expect(src).toContain("aplicarMarcadores(");
+    expect(
+      src,
+      "a rota voltou ao caminho singular — o filtro de VÁRIAS etiquetas (E/OU) seria ignorado",
+    ).not.toMatch(/aplicarMarcador\((?!s)/);
   });
 
   it.each([CONTAGEM, LISTA])("%s não escreve o predicado à mão", (caminho) => {
@@ -177,7 +186,7 @@ describe("nenhuma contagem é montada por fora da fábrica", () => {
 
   it("a fábrica aplica os auxiliares E o não-lidas", () => {
     const fabrica = fonte.slice(
-      fonte.indexOf("const countExact = () =>"),
+      fonte.indexOf("const countExact = ("),
       fonte.indexOf("await Promise.all(["),
     );
     expect(fabrica).toContain("organization_id");
@@ -190,10 +199,10 @@ describe("nenhuma contagem é montada por fora da fábrica", () => {
     // a contagem ignora o marcador em silêncio — e o badge passa a contar o que a
     // aba não mostra, que é o defeito que este arquivo existe para pegar.
     const fabrica = fonte.slice(
-      fonte.indexOf("const countExact = () =>"),
+      fonte.indexOf("const countExact = ("),
       fonte.indexOf("await Promise.all(["),
     );
-    expect(fabrica, "o marcador não entra na fábrica").toContain("aplicarMarcador(");
+    expect(fabrica, "o marcador não entra na fábrica").toContain("aplicarMarcadores(");
   });
 
   it("a aba Fechadas TEM contagem — o concorrente mostra 8067 e nós mostrávamos nada", () => {

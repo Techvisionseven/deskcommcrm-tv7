@@ -10,6 +10,10 @@ import type { NextRequest } from "next/server";
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
+import {
+  MENSAGEM_CAMPO_DE_DATA_DO_CONTATO,
+  campoDoGatilhoDeDataEhDoContato,
+} from "@/lib/automation/campo-do-gatilho-de-data";
 import { createAutomationRuleSchema } from "@/lib/schemas";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -70,6 +74,29 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   const supabase = await createClient();
+  const webhookSourceId = parsed.data.trigger_config?.webhook_source_id;
+  if (typeof webhookSourceId === "string") {
+    const { data: source, error: sourceError } = await supabase
+      .from("webhook_sources")
+      .select("id")
+      .eq("id", webhookSourceId)
+      .eq("organization_id", activeOrg.orgId)
+      .maybeSingle();
+    if (sourceError) return fail("internal_error", sourceError.message, 500, { requestId });
+    if (!source) {
+      return fail("invalid_request", t("A fonte escolhida não pertence a esta empresa."), 422, { requestId });
+    }
+  }
+  const campoDeData = await campoDoGatilhoDeDataEhDoContato(
+    supabase,
+    activeOrg.orgId,
+    parsed.data.trigger_event,
+    parsed.data.trigger_config,
+  );
+  if ("erro" in campoDeData) return fail("internal_error", campoDeData.erro, 500, { requestId });
+  if (campoDeData.doContato) {
+    return fail("invalid_request", t(MENSAGEM_CAMPO_DE_DATA_DO_CONTATO), 422, { requestId });
+  }
   const { data: created, error: insErr } = await supabase
     .from("automation_rules")
     .insert({

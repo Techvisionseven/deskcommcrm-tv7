@@ -290,7 +290,7 @@ async function montarContexto(
   if (contactId) {
     const { data: contato } = await deps.supabase
       .from("contacts")
-      .select("id, name, phone_number, email")
+      .select("id, name, phone_number, email, display_name")
       .eq("id", contactId)
       .eq("organization_id", deps.organizationId)
       .maybeSingle();
@@ -298,6 +298,25 @@ async function montarContexto(
   }
 
   return contexto;
+}
+
+/**
+ * O contato dono de um negócio desta organização, ou `null` — negócio que não
+ * existe aqui e negócio sem contato dão o MESMO `null`, de propósito: quem
+ * compara com o contato do turno não deve conseguir distinguir os dois.
+ */
+export async function contatoDoNegocio(
+  deps: DepsDaOperacao,
+  leadId: string,
+): Promise<string | null> {
+  const { data, error } = await deps.supabase
+    .from("crm_leads")
+    .select("contact_id")
+    .eq("id", leadId)
+    .eq("organization_id", deps.organizationId)
+    .maybeSingle();
+  if (error) throw new ApiError(500, "internal_error", undefined, deps.requestId, error.message);
+  return (data as { contact_id: string | null } | null)?.contact_id ?? null;
 }
 
 /** As marcações do corpo, sem repetição e na ordem em que aparecem. */

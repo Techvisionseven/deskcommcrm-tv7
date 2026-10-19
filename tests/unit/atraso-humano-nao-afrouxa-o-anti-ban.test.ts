@@ -142,20 +142,44 @@ const FONTE_INBOUND = fs.readFileSync(
   "utf8",
 );
 
-describe("fiação — o \"digitando…\" cobre o tempo do modelo", () => {
-  it("acende ANTES da chamada principal ao modelo, só em turno que fala com o lead", () => {
-    // Medido numa instalação real: 7s de LLM contra ~2s de alvo — a pausa humana
-    // zera, e espera zero não acende presença. Sem esta chamada o cliente esperava
-    // o modelo inteiro sem indicador nenhum.
+describe("fiação — o \"digitando…\" cobre o turno inteiro até a 1ª bolha", () => {
+  it("acende no INÍCIO do trabalho (antes dos auxiliares e do modelo), só em turno que fala com o lead", () => {
+    // Medido numa VPS real: 67s entre a mensagem do lead e a resposta. O sinal
+    // único, aceso só na chamada ao modelo, deixava os auxiliares sem indicador
+    // e apagava no meio do caminho (o WhatsApp o segura ~25s).
     const modelo = FONTE_INBOUND.indexOf("    const turn = await runModelCall(");
+    const auxiliares = FONTE_INBOUND.indexOf("await Promise.all([", FONTE_INBOUND.indexOf("    let jailbreakLevel: JailbreakLevel = 'none';"));
+    const inicio = FONTE_INBOUND.indexOf("  let mcpCleanup: (() => Promise<void>) | null = null;\n  try {");
     expect(modelo).toBeGreaterThan(-1);
-    // Entre a montagem das mensagens de abertura e a chamada — nada roda no meio.
-    const abertura = FONTE_INBOUND.lastIndexOf("    const openingMessages: ModelMessage[] =", modelo);
-    expect(abertura).toBeGreaterThan(-1);
-    const janela = FONTE_INBOUND.slice(abertura, modelo);
-    expect(janela).toMatch(
-      /if \(channel\?\.signalTyping && turnoVaiFalarComOLead\(liveJob\(\)\)\) \{\s*acenderDigitando\(/,
+    expect(auxiliares).toBeGreaterThan(-1);
+    expect(inicio).toBeGreaterThan(-1);
+    const acende = FONTE_INBOUND.indexOf("pararDigitando = manterDigitando(", inicio);
+    expect(acende).toBeGreaterThan(inicio);
+    expect(acende).toBeLessThan(auxiliares);
+    expect(acende).toBeLessThan(modelo);
+    expect(FONTE_INBOUND.slice(inicio, acende)).toMatch(
+      /if \(channel\?\.signalTyping && turnoVaiFalarComOLead\(liveJob\(\)\)\) \{\s*$/,
     );
+  });
+
+  it("para de renovar antes de toda bolha sair e no `finally` do turno", () => {
+    // Renovar depois da mensagem leria como uma segunda resposta a caminho.
+    const envios = FONTE_INBOUND.match(/send: \(finalBody: string\) => \{\n\s*pararDigitando\(\);/g) ?? [];
+    const todos = FONTE_INBOUND.match(/send: \(finalBody: string\) => \{/g) ?? [];
+    expect(todos.length).toBeGreaterThan(0);
+    expect(envios.length).toBe(todos.length);
+    expect(FONTE_INBOUND).toMatch(/\} finally \{\n\s*\/\/[^\n]*\n\s*pararDigitando\(\);\n\s*await mcpCleanup\?\.\(\);/);
+  });
+
+  it("a passagem para a equipe para de renovar ANTES do aviso de escalação sair", () => {
+    // O aviso do piso (`seq === 0`) vai ao canal por `avisarLeadDaEscalacao`, que
+    // NÃO passa pelos `send` acima. Sem parar aqui, a renovação de 10s reacendia
+    // o "digitando…" depois do "vou te passar para a equipe".
+    const tool = FONTE_INBOUND.indexOf("    request_human_handoff: tool({");
+    expect(tool).toBeGreaterThan(-1);
+    const aviso = FONTE_INBOUND.indexOf("avisarLeadDaEscalacao(", tool);
+    expect(aviso).toBeGreaterThan(tool);
+    expect(FONTE_INBOUND.slice(tool, aviso)).toMatch(/^\s*pararDigitando\(\);$/m);
   });
 });
 
@@ -183,10 +207,15 @@ describe("fiação — a espera humana é paga UMA vez por turno", () => {
     expect(doSendMessage).toBeGreaterThan(-1);
     const i = FONTE_INBOUND.indexOf("send: (finalBody: string) =>", doSendMessage);
     expect(i).toBeGreaterThan(-1);
-    const janela = FONTE_INBOUND.slice(i, i + 1600);
+    const janela = FONTE_INBOUND.slice(i, i + 2400);
     // Os dois convivem: o jitter é throttle anti-ban entre mensagens físicas, o
     // atraso humano é a pausa do turno. Perder o primeiro é afrouxar o anti-ban.
-    expect(janela).toMatch(/jitter\s*[:=]\s*\(\)\s*=>\s*1200 \+ Math\.floor\(Math\.random\(\) \* 800\)/);
+    // Desde a 0499 o jitter LÊ os knobs da conexão (throttleMs + jitterMaxMs,
+    // defaults 1200/800) em vez do literal `1200 + rand*800` — mesma proteção,
+    // agora configurável por número.
+    expect(janela).toMatch(/const jitter = \(\) =>/);
+    expect(janela).toMatch(/pacingDoTurno\?\.knobs\.throttleMs \?\? 1200/);
+    expect(janela).toMatch(/Math\.floor\(Math\.random\(\) \* \(pacingDoTurno\?\.knobs\.jitterMaxMs \?\? 800\)\)/);
     expect(janela).toContain("sendInBubbles(texto, {");
     // Issue #654: a pausa humana saiu daqui. Ela era paga no `antesDaPrimeira`, que
     // rodava dentro do callback `send` — isto é, com o `pg_advisory_xact_lock` do

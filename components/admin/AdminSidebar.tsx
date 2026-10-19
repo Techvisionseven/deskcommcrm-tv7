@@ -21,6 +21,8 @@ import {
   ArrowRight,
   Lock,
   PuzzlePiece,
+  Stack,
+  Receipt,
 } from "@/lib/ui/icons";
 import type { Icon as PhosphorIcon } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
@@ -28,11 +30,14 @@ import { SimboloDoProduto } from "@/components/branding/MarcaDoProduto";
 import { marcaEhADoProduto } from "@/lib/branding";
 import { useMarcaDaInstalacao } from "@/lib/branding/contexto";
 import { useT } from "@/hooks/i18n/useT";
+import type { ModuloOpcional } from "@/lib/instalacao/modulos";
 
 interface NavItem {
   href: string;
   label: string;
   icon: PhosphorIcon;
+  /** Só aparece com este módulo da instalação ligado (spec da cobrança §9). */
+  modulo?: ModuloOpcional;
 }
 
 const NAV_ITEMS: NavItem[] = [
@@ -69,9 +74,12 @@ const NAV_ITEMS: NavItem[] = [
   { href: "/admin/email", label: "E-mail", icon: EnvelopeSimple },
   // A porta da tela do COMPORTAMENTO da instalação (issue #1034) — mesma razão
   // das três de cima: são chaves da INSTALAÇÃO, e /admin tem navegação própria.
-  // O rótulo é o do assunto da tela para quem chega por aqui sabendo o que foi
-  // mexer, e não o nome de um arquivo de configuração.
-  { href: "/admin/sistema", label: "Comportamento", icon: Gear },
+  //
+  // Rótulo "Recursos opcionais", e não mais "Comportamento" (doc 80): era aqui
+  // que se ligavam os módulos, e o mantenedor procurou onde ligar recursos sem
+  // achar — "Comportamento" não sugere "ligar recursos". A tela agora junta os
+  // módulos, as chaves de comportamento e o que depende do servidor.
+  { href: "/admin/sistema", label: "Recursos opcionais", icon: Gear },
   // A porta da tela que libera endereços da rede interna (decisão 22-d, #1004).
   // Mesma razão das de cima: o objeto é a MÁQUINA, não uma empresa — e a
   // decisão pede explicitamente que o lugar onde o dono controla seja visível.
@@ -97,16 +105,29 @@ const NAV_ITEMS: NavItem[] = [
   // (`lib/navigation/catalogo.ts`), de propósito: são duas vistas do mesmo
   // assunto, e ícones diferentes fariam parecer dois assuntos.
   { href: "/admin/extensoes", label: "Extensões", icon: PuzzlePiece },
+  // A PORTA QUE FALTAVA (achado da revisão do PR #1578): a tela existia e as
+  // rotas de honorários já apontavam o operador para cá na mensagem de erro
+  // ("instale em Configurações da instalação › Módulos"), mas só se chegava
+  // digitando a URL — a mesma classe de defeito que a entrada de cima corrigiu
+  // para Extensões, só que `tests/unit/navegacao-completude.test.ts` não cobre
+  // `/admin/**`, então nada acusava.
+  { href: "/admin/modulos", label: "Módulos", icon: Stack },
+  // A porta da cobrança do revendedor (spec §9, §13): a tela só existe com a
+  // chave `cobranca` ligada — desligada, `/admin/cobranca` responde 404 e o
+  // menu do dono segue igual.
+  { href: "/admin/cobranca", label: "Cobrança", icon: Receipt, modulo: "cobranca" },
 ];
 
 interface AdminSidebarProps {
   userEmail: string;
+  /** Módulos ligados na instalação: decidem as entradas com `modulo`. Padrão: nenhum. */
+  modulosLigados?: readonly ModuloOpcional[];
   /** "mobile" = conteúdo desta MESMA navegação dentro do drawer que `AdminShell`
    * abre abaixo de `lg` — mesmo padrão de `components/shell/Sidebar.tsx`. */
   variant?: "desktop" | "mobile";
 }
 
-export function AdminSidebar({ userEmail, variant = "desktop" }: AdminSidebarProps) {
+export function AdminSidebar({ userEmail, variant = "desktop", modulosLigados = [] }: AdminSidebarProps) {
   const t = useT();
   const isMobile = variant === "mobile";
   const pathname = usePathname();
@@ -137,7 +158,7 @@ export function AdminSidebar({ userEmail, variant = "desktop" }: AdminSidebarPro
         </div>
       </div>
       <nav className="flex-1 space-y-1 overflow-y-auto p-2" aria-label={t("Navegação plataforma")}>
-        {NAV_ITEMS.map((item) => {
+        {NAV_ITEMS.filter((item) => !item.modulo || modulosLigados.includes(item.modulo)).map((item) => {
           const isActive =
             pathname === item.href || pathname.startsWith(item.href + "/");
           const Icon = item.icon;

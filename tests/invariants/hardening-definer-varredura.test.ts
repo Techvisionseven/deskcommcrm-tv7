@@ -67,6 +67,41 @@ const ANON_PERMITIDO: readonly Excecao[] = [];
  */
 const AUTHENTICATED_PERMITIDO: readonly Excecao[] = [
   {
+    fn: "encrypt_cpf(text)",
+    razao:
+      "POST/PATCH app/api/v1/contacts/route.ts e app/api/v1/contacts/[id]/route.ts, " +
+      "e POST app/api/v1/contacts/import/route.ts — os três montam o client com " +
+      "createClient de lib/supabase/server (sessão; _handler.ts:961 registra que " +
+      "\"nenhum service role entra aqui\"). Definer porque a chave vem de " +
+      "private.app_secrets('cpf_key'), que o papel anon não alcança. NÃO escreve: " +
+      "devolve só o ciphertext do CPF que a MESMA requisição enviou, então não há " +
+      "dado de outro tenant no retorno; volátil porque relê a chave a cada chamada " +
+      "(GUC app.cpf_key é por conexão). Sem ela o CHECK contacts_cpf_consistency " +
+      "recusa a linha e o contato é salvo sem CPF (#2522).",
+  },
+  {
+    fn: "decrypt_cpf(uuid)",
+    razao:
+      "GET app/api/v1/contacts/[id]/route.ts → getContactHandler (_handler.ts:418) " +
+      "é o único call site, com o client de sessão — e ele só CHEGA ali depois de " +
+      "ler user_organizations do contato e exigir roleAtLeast(manager). Definer " +
+      "porque lê contacts.cpf_encrypted e ESCREVE o audit contact.cpf_decrypted em " +
+      "api_audit_log antes de devolver o texto. A guarda de tenant é a da casa: " +
+      "fora de fn_user_org_ids() a função levanta forbidden_org (platform admin " +
+      "passa), então cross-org nunca lê CPF (#2522).",
+  },
+  {
+    fn: "fn_honorarios_parcela_pagar(uuid,uuid,uuid,uuid)",
+    razao:
+      "POST app/api/v1/honorarios/parcelas/[id]/pagar/route.ts usa createClient da " +
+      "sessão. Definer porque insere em financial_entries (fora da policy de escrita " +
+      "de honorarios_parcelas) e atualiza a parcela sob FOR UPDATE na mesma transação " +
+      "— exatamente o desenho de fn_finalizar_comanda logo abaixo, e pela mesma razão: " +
+      "sem o lock, dois cliques na mesma parcela liam 'pendente' nos dois e cada um " +
+      "lançava o SEU financial_entries, pagando em dobro no caixa. Exige " +
+      "fn_role_at_least(p_org, 'manager'), mesmo papel da RLS de honorarios_parcelas.",
+  },
+  {
     fn: "fn_finalizar_comanda(uuid,uuid,uuid,integer)",
     razao:
       "POST app/api/v1/financeiro/comandas/[id]/finalizar/route.ts e " +
@@ -121,8 +156,8 @@ const AUTHENTICATED_PERMITIDO: readonly Excecao[] = [
       "service_role negado, suporte readonly/expirado, MFA e retomada.",
   },
   {
-    fn: "fn_set_channel_routing(uuid,uuid,uuid[],boolean)",
-    razao: "PATCH app/api/v1/settings/routing/channels/route.ts usa createClient da sessão; RPC exige manager, suporte de escrita, MFA e canal/membros da org na mesma transação. tests/invariants/channel-routing.test.ts prova viewer, tenants A/B, membro revogado, policy vazia e MFA platform aal1/aal2.",
+    fn: "fn_set_channel_routing(uuid,uuid,uuid[],boolean,text,uuid)",
+    razao: "PATCH app/api/v1/settings/routing/channels/route.ts usa createClient da sessão; RPC exige manager, suporte de escrita, MFA e canal/membros da org na mesma transação. Os dois últimos parâmetros (#2331) acrescentam o modo do número e o atendente de destino padrão à MESMA escrita dos responsáveis; a assinatura antiga de 4 argumentos foi derrubada na migration 0663, e a de 4 continua atendida pelos DEFAULTs. tests/invariants/channel-routing.test.ts prova viewer, tenants A/B, membro revogado, policy vazia, MFA platform aal1/aal2, modo fora da lista e destino que não é membro recusados sem gravar, e a entrega direta ao destino padrão.",
   },
   {
     fn: "fn_reserve_channel_connection(uuid,uuid,text,text,boolean)",
@@ -183,6 +218,17 @@ const AUTHENTICATED_PERMITIDO: readonly Excecao[] = [
       "e da org vizinha, com a configuração intacta depois das recusas.",
   },
   {
+    fn: "fn_definir_google_meet_acesso_aberto(uuid,boolean)",
+    razao:
+      "app/actions/settings/definirMeetAberto.ts chama por rpc com o " +
+      "createClient da SESSÃO, e a própria função reconfere auth.uid(), " +
+      "manager, suporte de escrita e MFA comprovado antes de gravar — a " +
+      "mesma guarda da irmã fn_definir_colegas_podem_mexer_na_agenda acima. " +
+      "Só escreve uma chave de topo de organizations.settings " +
+      "(google_meet_acesso_aberto) e devolve {ligado,mudou}; a leitura é " +
+      "meetAbertoLigado (lib/schemas/settings.ts), sem nenhuma exposição.",
+  },
+  {
     fn: "fn_definir_cliente_pela_agenda(uuid,boolean)",
     razao:
       "app/actions/settings/definirClientePelaAgenda.ts chama com createClient da sessão; " +
@@ -222,7 +268,7 @@ const AUTHENTICATED_PERMITIDO: readonly Excecao[] = [
       "com segurança sem medir o disparo de cada trigger.",
   },
   {
-    fn: "fn_definir_aviso_de_caso(uuid,uuid,text,text,boolean,boolean)",
+    fn: "fn_definir_aviso_de_caso(uuid,uuid,text,text,boolean,boolean,boolean)",
     razao:
       "A ÚNICA porta de escrita de `config_aviso_de_caso` — a tabela não tem " +
       "INSERT/UPDATE/DELETE para authenticated, só `grant select` sob RLS de " +

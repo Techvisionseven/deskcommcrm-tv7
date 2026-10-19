@@ -55,6 +55,108 @@ export const CONVERSAS_IGNORADAS = {
 } as const;
 
 /**
+ * O ACERVO DO NÚMERO — o histórico que existe ANTES da vinculação.
+ *
+ * ─── O defeito (issue #999) ────────────────────────────────────────────────
+ *
+ * A sessão do NOWEB nascia só com o filtro: `config: { ignore }`. O padrão da
+ * engine é `store { enabled: false, fullSync: false }` e não há variável de
+ * ambiente que o mude — quem cria a sessão é que precisa PEDIR. Sem o pedido,
+ * o canal não guarda nem entrega o que já estava no aparelho: só o que
+ * acontece depois da vinculação. Medido na instalação da issue: 3 conversas e
+ * 1 MB, contra 825 conversas e 57 MB com o acervo pedido.
+ *
+ * ─── Por que `fullSync` e não só `enabled` ─────────────────────────────────
+ *
+ * `fullSync` manda baixar o histórico ANTERIOR à vinculação. Ligando só
+ * `enabled`, o acervo só enche a partir de agora — o mesmo defeito com outra
+ * roupa. O custo é real e é do pareamento: na vinculação de um número
+ * movimentado, o canal baixa o passado inteiro (tempo, CPU e disco DELE, no
+ * teto de memória do contêiner). Quem não quer esse custo não liga a opção.
+ *
+ * ─── Desligado por padrão: decisão do mantenedor, não descuido ─────────────
+ *
+ * A #999 reabriu com decisão registrada na issue: desligado por padrão, com
+ * opção POR CONEXÃO. O acervo guarda dado pessoal fora do alcance da
+ * anonimização do CRM (ela limpa o banco do CRM, não o do canal), e o que ele
+ * destrava hoje é pouco — o CRM ainda não lê o histórico de volta. Por isso a
+ * constante abaixo NÃO entra no corpo sozinha: quem liga é a conexão
+ * (`channel_sessions.metadata.guardar_historico`, sem migration).
+ *
+ * `resolvePhoneForLid`, mais abaixo neste arquivo, depende do store — a tabela
+ * que traduz `<lid>` em telefone só existe com ele ligado. O caminho que cria
+ * a sessão dispensava o que outro caminho do mesmo arquivo exigia.
+ */
+export const ACERVO_DO_HISTORICO = {
+  /** Liga o acervo: sem isto o canal não guarda nem entrega o que já passou. */
+  enabled: true,
+  /** Baixa o histórico anterior à vinculação, não só o que vier depois. */
+  fullSync: true,
+} as const;
+
+/**
+ * O que a CONEXÃO pede ao canal na criação/reconfiguração da sessão.
+ *
+ * `undefined`/`{}` = o corpo continua idêntico ao de antes da #999. O nome da
+ * opção é o do botão na tela, para o leitor do chamador reconhecer a decisão.
+ *
+ * Três estados, não dois: `true` liga, `false` desliga, e AUSENTE não toca no
+ * `store` — deixa como encontrou. A reconexão de quem não tem a chave no
+ * `metadata` chega sem a opção, e a sessão dela pode ter o store ligado por
+ * fora (pelo painel do canal, ou criada enquanto o #1000 esteve na main). A
+ * doc do NOWEB avisa: "Do not change the values after you scanned QR, it can
+ * lead to the loss of the chat history". Desligar só com `false` explícito,
+ * que vem do PATCH /acervo — escolha de quem administra, na tela.
+ */
+export interface OpcoesDeAcervo {
+  /** Guarda (`true`) ou desliga (`false`) o acervo; ausente = não mexe. */
+  guardarHistorico?: boolean;
+}
+
+/** O `store` que a sessão TEM hoje — `null` = a engine está no default (desligado). */
+function storeDaSessao(config: Record<string, unknown> | null | undefined) {
+  const noweb = config?.noweb;
+  if (!noweb || typeof noweb !== "object" || Array.isArray(noweb)) return null;
+  const store = (noweb as Record<string, unknown>).store;
+  if (!store || typeof store !== "object" || Array.isArray(store)) return null;
+  return store as { enabled?: unknown; fullSync?: unknown };
+}
+
+/**
+ * A sessão já está do jeito que a conexão PEDIU?
+ *
+ * `guardar=false` conforma com o default da engine (sem `noweb.store`, ou com
+ * `enabled: false`); `guardar=true` exige `enabled: true`. É a régua de AMBOS
+ * os lados: ela decide se a convergência precisa de um PUT, e um PUT reinicia
+ * a sessão — ninguém pode pagar restart por uma opção que não mudou.
+ */
+function acervoEstaConferido(config: Record<string, unknown> | null | undefined, guardar: boolean | undefined): boolean {
+  if (guardar === undefined) return true;
+  const ligado = storeDaSessao(config)?.enabled === true;
+  return guardar ? ligado : !ligado;
+}
+
+/** Grava (ou desliga) o acervo na config que vai no PUT, sem tocar no resto do `noweb`. */
+function aplicarAcervoNaConfig(config: Record<string, unknown>, guardar: boolean | undefined): void {
+  if (acervoEstaConferido(config, guardar)) return;
+  const atual = config.noweb;
+  const noweb = atual && typeof atual === "object" && !Array.isArray(atual)
+    ? { ...(atual as Record<string, unknown>) }
+    : {};
+  noweb.store = guardar ? ACERVO_DO_HISTORICO : { enabled: false, fullSync: false };
+  config.noweb = noweb;
+}
+
+/**
+ * As chaves do filtro que o CRM IMPÕE. `groups` fica de fora de propósito: desde a
+ * funcionalidade de grupos na inbox, quem decide `groups` é `definirRecebimentoDeGrupos`,
+ * a partir de `channel_session_groups`. Compatibilidade e convergência não a tocam.
+ */
+export const CHAVES_DO_FILTRO_FIXAS = Object.fromEntries(
+  Object.entries(CONVERSAS_IGNORADAS).filter(([k]) => k !== "groups"),
+) as Omit<typeof CONVERSAS_IGNORADAS, "groups">;
+
+/**
  * Teto de relógio das chamadas ao WAHA.
  *
  * 15s não é número escolhido aqui: é o que `docs/specs/03-spec-whatsapp-waha.md`
@@ -235,16 +337,21 @@ export class WahaClient {
     const ignore = session.config.ignore;
     if (ignore === undefined) return true; // sessão legada; convergência preserva webhooks
     if (!ignore || typeof ignore !== "object" || Array.isArray(ignore)) return false;
-    return Object.entries(CONVERSAS_IGNORADAS).every(([key, value]) =>
+    return Object.entries(CHAVES_DO_FILTRO_FIXAS).every(([key, value]) =>
       !(key in ignore) || (ignore as Record<string, unknown>)[key] === value);
   }
 
   /** Porta granular para a futura reserva: created nunca significa ownership. */
-  async createSession(name: string): Promise<{ created: boolean; session: WahaSessionSnapshot }> {
+  async createSession(name: string, opcoes: OpcoesDeAcervo = {}): Promise<{ created: boolean; session: WahaSessionSnapshot }> {
+    // O acervo vai JUNTO com o filtro, mas SÓ quando a conexão pediu (opção
+    // desligada por padrão — decisão do mantenedor na issue #999). Sem a opção,
+    // o corpo é byte a byte o de sempre. Ver ACERVO_DO_HISTORICO.
+    const config: Record<string, unknown> = { ignore: CONVERSAS_IGNORADAS };
+    if (opcoes.guardarHistorico) config.noweb = { store: ACERVO_DO_HISTORICO };
     const res = await this.fetchComTeto(`${this.baseUrl}/api/sessions`, {
       method: "POST",
       headers: { "X-Api-Key": this.apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ name, start: false, config: { ignore: CONVERSAS_IGNORADAS } }),
+      body: JSON.stringify({ name, start: false, config }),
     });
     if (!res.ok && !knownSessionConflict(await res.json().catch(() => null), res.status, "create", name)) {
       throw new WahaSessionError("create", res.status);
@@ -257,12 +364,18 @@ export class WahaClient {
   }
 
   /** Compatível com os callers: cria se necessário e inicia, confirmando GET. */
-  async startSession(name: string): Promise<{ qr?: string; status: string }> {
-    const creation = await this.createSession(name);
+  async startSession(name: string, opcoes: OpcoesDeAcervo = {}): Promise<{ qr?: string; status: string }> {
+    const creation = await this.createSession(name, opcoes);
     const ignore = creation.session.config?.ignore;
-    const filtersCurrent = ignore && typeof ignore === "object" && Object.entries(CONVERSAS_IGNORADAS)
+    const filtersCurrent = ignore && typeof ignore === "object" && Object.entries(CHAVES_DO_FILTRO_FIXAS)
       .every(([key, value]) => (ignore as Record<string, unknown>)[key] === value);
-    if (!creation.created && !filtersCurrent) await this.convergirConfigDaSessao(name);
+    // Sessão que JÁ existe: `POST /api/sessions` responde 422 e a config não é
+    // aplicada nesse caminho. Então quem ligou a opção em um número já pareado
+    // só consegue o acervo pela convergência (guardando daqui em diante: o
+    // fullSync é da vinculação). Sem a opção, o critério é o de sempre
+    // e o store fica como estava (ver OpcoesDeAcervo).
+    const acervoFalta = !acervoEstaConferido(creation.session.config, opcoes.guardarHistorico);
+    if (!creation.created && (!filtersCurrent || acervoFalta)) await this.convergirConfigDaSessao(name, opcoes);
     return this.startExistingSession(name);
   }
 
@@ -340,7 +453,7 @@ export class WahaClient {
    * que não conheça a rota faria toda reconexão falhar por causa de uma
    * economia — trocar mensagem por byte é o negócio errado.
    */
-  async convergirConfigDaSessao(name: string): Promise<void> {
+  async convergirConfigDaSessao(name: string, opcoes: OpcoesDeAcervo = {}): Promise<boolean> {
     const url = `${this.baseUrl}/api/sessions/${encodeURIComponent(name)}`;
     try {
       const atual = await this.fetchComTeto(url, { headers: { "X-Api-Key": this.apiKey } });
@@ -348,17 +461,36 @@ export class WahaClient {
         logger.warn("[waha] não li a config da sessão; não vou reescrevê-la", {
           status: atual.status,
         });
-        return;
+        return false;
       }
       const parsed = sessionSnapshotSchema.safeParse(await atual.json().catch(() => null));
-      if (!parsed.success || parsed.data.name !== name || !(await this.compatibleSession(parsed.data))) {
-        logger.warn("[waha] a sessão respondeu sem identidade/config compatíveis; não vou reescrevê-la", {});
-        return;
+      if (!parsed.success || parsed.data.name !== name) {
+        logger.warn("[waha] a sessão respondeu sem identidade correta; não vou reescrevê-la", {});
+        return false;
       }
       const sessao = parsed.data;
-      if (!sessao.config) return;
+      if (!sessao.config) return false;
 
-      const config = { ...sessao.config, ignore: CONVERSAS_IGNORADAS };
+      // Checa só o ENGINE aqui, não `compatibleSession()` inteiro: aquele também
+      // exige que o filtro JÁ esteja correto, e o trabalho deste método é
+      // justamente corrigir um filtro que drift ou — o caso comum — entrou
+      // como `{}` numa sessão legada. Recusar converger porque o filtro está
+      // errado seria recusar o próprio propósito da função.
+      const engine = typeof sessao.engine === "string" ? sessao.engine : sessao.engine?.engine;
+      const actualEngine = engine ?? (await this.getServerVersion()).engine;
+      if (actualEngine !== "NOWEB") {
+        logger.warn("[waha] engine incompatível; não vou reescrever o filtro da sessão", {});
+        return false;
+      }
+
+      // `groups` NÃO entra no que este método impõe: desde a funcionalidade de
+      // grupos na inbox, quem decide `groups` é `definirRecebimentoDeGrupos`.
+      // Preserva o valor atual (ou o default de criação, se a sessão nunca
+      // teve a chave) em vez de reescrevê-lo às cegas.
+      const ignoreAtual = (typeof sessao.config.ignore === "object" && sessao.config.ignore !== null
+        ? sessao.config.ignore
+        : {}) as Record<string, unknown>;
+      const groupsAtual = typeof ignoreAtual.groups === "boolean" ? ignoreAtual.groups : CONVERSAS_IGNORADAS.groups;
       // Já está como queremos: não reiniciar a sessão à toa. Este caminho roda
       // em TODA reconexão, e um restart desnecessário por rodada seria pior que
       // o gasto que ele evita.
@@ -366,13 +498,14 @@ export class WahaClient {
       // à ORDEM das chaves, então o dia em que o WAHA devolver o mesmo objeto
       // com as chaves noutra sequência, esta guarda passa a dizer "mudou" e a
       // sessão reinicia a cada reconexão — sem que nada tenha mudado.
-      const jaConvergida =
-        typeof sessao.config.ignore === "object" &&
-        sessao.config.ignore !== null &&
-        Object.entries(CONVERSAS_IGNORADAS).every(
-          ([k, v]) => (sessao.config!.ignore as Record<string, unknown>)[k] === v,
-        );
-      if (jaConvergida) return;
+      const guardarHistorico = opcoes.guardarHistorico;
+      const filtroConferido = Object.entries(CHAVES_DO_FILTRO_FIXAS).every(([k, v]) => ignoreAtual[k] === v);
+      // O acervo entra na MESMA régua do filtro: sem isto, quem ligou a opção em
+      // um número já pareado nunca teria o PUT (o filtro já estava certo), e
+      // quem desligou levaria um restart para reafirmar o default da engine.
+      if (filtroConferido && acervoEstaConferido(sessao.config, guardarHistorico)) return true;
+      const config: Record<string, unknown> = { ...sessao.config, ignore: { ...CHAVES_DO_FILTRO_FIXAS, groups: groupsAtual } };
+      aplicarAcervoNaConfig(config, guardarHistorico);
 
       const res = await this.fetchComTeto(url, {
         method: "PUT",
@@ -381,7 +514,9 @@ export class WahaClient {
       });
       if (!res.ok) {
         logger.warn("[waha] não consegui convergir a config da sessão", { status: res.status });
+        return false;
       }
+      return true;
     } catch (err) {
       // Rede fora aqui não é assunto de quem só quer iniciar a sessão — a
       // convergência é oportunista e a sessão sobe do mesmo jeito. Mas os
@@ -391,7 +526,110 @@ export class WahaClient {
       logger.warn("[waha] não consegui falar com o WAHA para convergir a config", {
         erro: err instanceof Error ? err.message : "unknown",
       });
+      return false;
     }
+  }
+
+  /**
+   * Grupos em que o número está. Medido no WAHA real (Task 0,
+   * `.superpowers/sdd/2026-09-23-grupos-na-inbox/task-0-report.md`):
+   * `GET /api/{session}/groups` devolve um OBJETO chaveado por id de grupo,
+   * não um array — mas a tolerância a array também fica, para não quebrar
+   * contra uma versão futura do WAHA que volte a ele.
+   *
+   * `group.id` é sempre string simples (nunca `{ _serialized }`), em dois
+   * formatos: moderno (`<18 dígitos>@g.us`) e legado
+   * (`<telefone>-<timestamp>@g.us`, 34/98 grupos reais medidos). Os dois
+   * terminam em `@g.us`, e é essa a única checagem — não `18 dígitos`.
+   */
+  async listarGrupos(session: string): Promise<Array<{ chatId: string; subject: string | null }>> {
+    const res = await this.fetchComTeto(`${this.baseUrl}/api/${encodeURIComponent(session)}/groups`, {
+      headers: { "X-Api-Key": this.apiKey },
+    });
+    if (!res.ok) throw new Error(`waha_groups_${res.status}`);
+    const bruto = (await res.json().catch(() => null)) as unknown;
+    const lista = Array.isArray(bruto) ? bruto : bruto && typeof bruto === "object" ? Object.values(bruto) : [];
+    const grupos: Array<{ chatId: string; subject: string | null }> = [];
+    for (const item of lista) {
+      if (!item || typeof item !== "object") continue;
+      const o = item as Record<string, unknown>;
+      const id = o.id;
+      const chatId =
+        typeof id === "string" ? id
+        : id && typeof id === "object" && typeof (id as Record<string, unknown>)._serialized === "string"
+          ? ((id as Record<string, unknown>)._serialized as string)
+          : typeof o.JID === "string" ? (o.JID as string) : null;
+      if (!chatId || !chatId.endsWith("@g.us")) continue;
+      const subject = typeof o.subject === "string" ? o.subject : typeof o.name === "string" ? o.name : null;
+      grupos.push({ chatId, subject });
+    }
+    return grupos;
+  }
+
+  /**
+   * Liga ou desliga o recebimento de grupos NESTA sessão. Só devolve `true` quando o GET
+   * seguinte confirma a troca: o WAHA já respondeu 200 para operação que não aconteceu
+   * (medido na issue melgarafael/DeskcommCRM#1428).
+   *
+   * ─── Por que não chama `startExistingSession` ──────────────────────────────
+   *
+   * A Task 0 mediu o WAHA real (2026.7.2, NOWEB): o `PUT` já muda o status para
+   * `STARTING` sozinho, como efeito colateral, e a sessão volta a `WORKING` por
+   * conta própria em poucos segundos (≤5s, 6/6 polls) — sem pedido de restart
+   * manual. Chamar `startExistingSession` aqui seria um segundo restart em cima
+   * do que o próprio WAHA já dispara.
+   *
+   * O que este método faz em vez disso: espera, com teto, a sessão sair de
+   * `STARTING`, e só então confirma `ignore.groups`. Devolver `true` com a
+   * sessão ainda reiniciando seria aceitável SE o valor já estivesse
+   * confirmado — mas medir enquanto ainda está `STARTING` arriscaria ler um
+   * `config` transitório, então a espera vem antes da leitura que decide.
+   */
+  async definirRecebimentoDeGrupos(name: string, receber: boolean): Promise<boolean> {
+    const url = `${this.baseUrl}/api/sessions/${encodeURIComponent(name)}`;
+    const ler = async () => {
+      const r = await this.fetchComTeto(url, { headers: { "X-Api-Key": this.apiKey } });
+      if (!r.ok) return null;
+      const p = sessionSnapshotSchema.safeParse(await r.json().catch(() => null));
+      return p.success && p.data.name === name ? p.data : null;
+    };
+    const atual = await ler();
+    if (!atual?.config) return false;
+    // IDEMPOTENTE: já está como pedido → confirma sem PUT. O PUT reinicia a
+    // sessão (vai a STARTING), e este método é chamado em TODO "ligar grupo" e
+    // em toda (re)conexão do número — escrever sem mudança seria um reinício
+    // de sessão por clique.
+    const ignoreAtual = typeof atual.config.ignore === "object" && atual.config.ignore
+      ? (atual.config.ignore as Record<string, unknown>)
+      : null;
+    if (ignoreAtual && ignoreAtual.groups === !receber) return true;
+    const ignore = {
+      ...((typeof atual.config.ignore === "object" && atual.config.ignore) || {}),
+      ...CHAVES_DO_FILTRO_FIXAS,
+      groups: !receber,
+    };
+    const put = await this.fetchComTeto(url, {
+      method: "PUT",
+      headers: { "X-Api-Key": this.apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ name, config: { ...atual.config, ignore } }),
+    });
+    if (!put.ok) return false;
+    // Teto de ~10s no total, em passos de 2s: bounded, e curto o bastante para
+    // não prender a rota que chama isto. Só espera quando a sessão realmente
+    // está reiniciando (STARTING); no caso comum (fica WORKING o tempo todo,
+    // como a Task 0 mediu em produção) o laço nem entra.
+    const TETO_DE_ESPERA_MS = 10_000;
+    const PASSO_MS = 2_000;
+    const inicio = Date.now();
+    let depois = await ler();
+    while (depois?.status === "STARTING" && Date.now() - inicio < TETO_DE_ESPERA_MS) {
+      await new Promise((r) => setTimeout(r, PASSO_MS));
+      depois = await ler();
+    }
+    const g = depois?.config && typeof depois.config.ignore === "object" && depois.config.ignore
+      ? (depois.config.ignore as Record<string, unknown>).groups
+      : undefined;
+    return g === !receber;
   }
 
   /** Remoção só converge depois de GET da identidade exata confirmar ausência. */
@@ -512,6 +750,32 @@ export class WahaClient {
     });
     if (!res.ok) throw new Error(`waha_${res.status}`);
     return res.json();
+  }
+
+  /**
+   * O visto azul: marca como lida a conversa (`Send Seen` da API do WAHA).
+   *
+   * `POST /api/sendSeen` — a sessão vai no CORPO, como em `sendText`, e não no
+   * caminho, como a família de presença (`/api/{session}/presence`). Sem
+   * `messageIds`, o pedido é "li esta conversa": o WAHA marca as não lidas dos
+   * últimos 7 dias (até 30 numa conversa individual, 100 num grupo), que é o
+   * que "respondi, então li" quer dizer — e sem precisar navegar pelos ids que
+   * só o webhook conhece.
+   *
+   * LANÇA `waha_<status>`, como os vizinhos, e a decisão de falhar macio é de
+   * QUEM CHAMA: `marcarConversaComoLida` (`./send`) engole e loga, e o põe
+   * DEPOIS do envio para a resposta nunca esperar por enfeite de conversa.
+   */
+  async sendSeen(session: string, chatId: string): Promise<void> {
+    const res = await this.fetchComTeto(`${this.baseUrl}/api/sendSeen`, {
+      method: "POST",
+      headers: {
+        "X-Api-Key": this.apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ session, chatId }),
+    });
+    if (!res.ok) throw new Error(`waha_${res.status}`);
   }
 
   /** O id completo identifica a mensagem no WAHA; o id curto do sendText não basta. */

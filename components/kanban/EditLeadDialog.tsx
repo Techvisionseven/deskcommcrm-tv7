@@ -2,6 +2,7 @@
 import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
+import { useActiveOrg } from "@/hooks/auth/AuthProvider";
 import { useT } from "@/hooks/i18n/useT";
 import {
   Dialog,
@@ -18,14 +19,21 @@ import { Textarea } from "@/components/ui/textarea";
 import { useEditLead } from "@/hooks/kanban/useUpdateLead";
 import type { Lead } from "@/lib/types/leads";
 import { updateLeadSchema, type UpdateLeadInput } from "@/lib/schemas/leads";
-import { parseReaisToCents } from "@/lib/money";
+import { MOEDA_PADRAO, parseReaisToCents, simboloDaMoeda } from "@/lib/money";
+import { ContactTagsEditor } from "@/components/inbox/ContactTagsEditor";
 import { EcoDoValor } from "./EcoDoValor";
 
+/**
+ * As etiquetas do negócio SAÍRAM deste formulário (#2979): quem as edita é o
+ * `ContactTagsEditor`, que grava na hora em `crm_leads.tags`. Manter um
+ * `tagsRaw` aqui seria pior do que redundância — "Salvar" reenviaria a lista
+ * carregada na abertura do diálogo e DESFARIA em silêncio a etiqueta que a
+ * pessoa acabou de criar no editor.
+ */
 interface FormShape {
   title: string;
   description: string;
   valueReais: string;
-  tagsRaw: string;
   expected_close_date: string;
 }
 
@@ -43,6 +51,10 @@ function centsToReais(cents: number | null | undefined): string {
 
 export function EditLeadDialog({ open, onOpenChange, lead, pipelineId }: Props) {
   const t = useT();
+  const org = useActiveOrg();
+  // A moeda do negócio JÁ GRAVADO vence: trocar a moeda da empresa não
+  // reescreve o que nasceu antes, e o cartão e o dossiê mostram a persistida.
+  const moedaDoValor = lead.currency ?? org?.currency ?? MOEDA_PADRAO;
   const edit = useEditLead(pipelineId);
 
   const form = useForm<FormShape>({
@@ -50,7 +62,6 @@ export function EditLeadDialog({ open, onOpenChange, lead, pipelineId }: Props) 
       title: lead.title,
       description: lead.description ?? "",
       valueReais: centsToReais(lead.value_cents),
-      tagsRaw: (lead.tags ?? []).join(", "),
       expected_close_date: lead.expected_close_date ?? "",
     },
   });
@@ -61,7 +72,6 @@ export function EditLeadDialog({ open, onOpenChange, lead, pipelineId }: Props) 
         title: lead.title,
         description: lead.description ?? "",
         valueReais: centsToReais(lead.value_cents),
-        tagsRaw: (lead.tags ?? []).join(", "),
         expected_close_date: lead.expected_close_date ?? "",
       });
     }
@@ -69,11 +79,6 @@ export function EditLeadDialog({ open, onOpenChange, lead, pipelineId }: Props) 
   }, [open, lead.id]);
 
   async function onSubmit(values: FormShape) {
-    const tags = values.tagsRaw
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-
     const reais = values.valueReais.trim();
     let valueCents: number | null = null;
     if (reais.length > 0) {
@@ -88,7 +93,6 @@ export function EditLeadDialog({ open, onOpenChange, lead, pipelineId }: Props) 
       title: values.title.trim(),
       description: values.description.trim() ? values.description.trim() : null,
       value_cents: valueCents,
-      tags,
       expected_close_date: values.expected_close_date || null,
     };
 
@@ -136,14 +140,16 @@ export function EditLeadDialog({ open, onOpenChange, lead, pipelineId }: Props) 
 
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
-              <Label htmlFor="valueReais">{t("Valor (R$)")}</Label>
+              {/* O rótulo segue a moeda do NEGÓCIO (a organização é a reserva):
+                  `R$` em duro mentia para quem opera em euro. */}
+              <Label htmlFor="valueReais">{t("Valor")} ({simboloDaMoeda(moedaDoValor)})</Label>
               <Input
                 id="valueReais"
                 inputMode="decimal"
                 placeholder="0,00"
                 {...form.register("valueReais")}
               />
-              <EcoDoValor control={form.control} />
+              <EcoDoValor control={form.control} moeda={moedaDoValor} />
               {form.formState.errors.valueReais && (
                 <p className="text-xs text-error-fg">
                   {form.formState.errors.valueReais.message}
@@ -161,8 +167,19 @@ export function EditLeadDialog({ open, onOpenChange, lead, pipelineId }: Props) 
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="tagsRaw">{t("Tags (separadas por vírgula)")}</Label>
-            <Input id="tagsRaw" placeholder="vip, recompra" {...form.register("tagsRaw")} />
+            {/* A etiqueta do NEGÓCIO (#2979): o MESMO editor do Inbox, gravando
+                na OUTRA caixa — `crm_leads.tags` por `PATCH /api/v1/leads/{id}`,
+                nunca o perfil do contato (`lib/types/leads.ts`). Ele grava na
+                hora, como no Inbox; por isso este formulário não carrega mais
+                o campo de texto livre que substituía a lista inteira. */}
+            <p className="text-sm font-medium">{t("Tags do negócio")}</p>
+            <ContactTagsEditor
+              entityType="lead"
+              entityId={lead.id}
+              pipelineId={pipelineId}
+              orgId={org?.orgId ?? ""}
+              tags={lead.tags ?? []}
+            />
           </div>
 
           <DialogFooter>

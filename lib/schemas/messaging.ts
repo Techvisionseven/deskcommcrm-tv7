@@ -7,6 +7,10 @@
  */
 import { z } from "zod";
 import { COMANDOS_DO_BANCO, type ComandoDoBanco } from "@/lib/inbox/comando-da-conversa";
+import {
+  MAXIMO_DE_ETIQUETAS_NO_FILTRO,
+  MODOS_DE_ETIQUETA,
+} from "@/lib/inbox/marcador-da-conversa";
 import { PISO_DA_BUSCA, buscaValeConsulta } from "@/lib/inbox/termo-de-busca";
 
 /**
@@ -178,6 +182,54 @@ export const patchConversationSchema = z
 
 export type PatchConversationInput = z.infer<typeof patchConversationSchema>;
 
+/**
+ * POST /api/v1/conversations/bulk (#2484, fatia F1) — ações em lote na Inbox.
+ *
+ * UMA rota para todas as ações, discriminada por `action` (o mesmo desenho do
+ * `bulkLeadActionSchema`). O lote NÃO tem permissão própria, org própria nem
+ * auditoria própria: cada id é encaminhado ao MESMO handler da conversa
+ * individual (`POST [id]/close`, `PATCH [id]`, `POST [id]/transfer`,
+ * `POST [id]/mark-read`, `POST [id]/pause-ai`, `POST [id]/reactivate-bot`), e
+ * é ele que resolve role, organização da SESSÃO e auditoria — por item. A
+ * organização portanto NUNCA vem do corpo: o schema não tem campo para ela.
+ *
+ * O teto de ids é política da ROTA (`TETO_DO_LOTE`), não do schema: quem
+ * estoura recebe 422 `bulk_too_large` com o número na mensagem, e não um
+ * `validation_error` genérico.
+ */
+export const bulkConversationActionSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("close"),
+    ids: z.array(z.string().uuid()).min(1),
+  }),
+  z.object({
+    action: z.literal("archive"),
+    ids: z.array(z.string().uuid()).min(1),
+  }),
+  z.object({
+    action: z.literal("mark-read"),
+    ids: z.array(z.string().uuid()).min(1),
+  }),
+  z.object({
+    action: z.literal("pause-ai"),
+    ids: z.array(z.string().uuid()).min(1),
+  }),
+  z.object({
+    action: z.literal("reactivate-bot"),
+    ids: z.array(z.string().uuid()).min(1),
+  }),
+  z.object({
+    action: z.literal("transfer"),
+    ids: z.array(z.string().uuid()).min(1),
+    // Mesmo contrato do `transferConversationSchema` — o destino é membro
+    // agent+ da org da sessão, validado pelo handler da conversa.
+    to_user_id: z.string().uuid(),
+    reason: z.string().trim().min(1).max(500).optional(),
+  }),
+]);
+
+export type BulkConversationActionInput = z.infer<typeof bulkConversationActionSchema>;
+
 /** POST /conversations/open-with-contact — abrir inbox a partir de cartão de contato. */
 export const openConversationWithContactSchema = z
   .object({
@@ -325,7 +377,51 @@ export const listConversationsQuerySchema = z.object({
   exclude_finished: z.boolean().optional(),
   assigned_to: z.union([z.string().uuid(), z.literal("me"), z.literal("unassigned")]).optional(),
   channel_session_id: z.string().uuid().optional(),
-  tag: conversationTagSchema.optional(),
+  /**
+   * O MARCADOR, e agora VÁRIOS (#1274).
+   *
+   * Aceita `string` OU `string[]`, e a repetição na URL (`?tag=vip&tag=orçamento`)
+   * é lida por `getAll`. Aceitar as DUAS formas é o que mantém o `?tag=vip`
+   * singular funcionando byte a byte: `get` devolve string e `getAll` devolve
+   * array de um, e os dois precisam passar pelo MESMO schema — se este só
+   * aceitasse array, toda chamada antiga de API quebraria com 422.
+   *
+   * A lista é normalizada (trim/lowercase) item a item, pela MESMA razão de
+   * `conversationTagSchema` normalizar: o `?tag=VIP` tem de achar o que foi
+   * gravado como `vip` (issue #1224). Teto de 20, o mesmo da escrita.
+   */
+  tag: z
+    .union([conversationTagSchema, z.array(conversationTagSchema).max(MAXIMO_DE_ETIQUETAS_NO_FILTRO)])
+    .optional()
+    .transform((v) => {
+      if (v === undefined) return undefined;
+      const lista = Array.isArray(v) ? v : [v];
+      // Lista VAZIA vira `undefined`, e não `[]`. O `getAll` devolve `[]` numa
+      // URL sem o parâmetro, e `[]` dentro de um `cs` é um filtro que NÃO CASA
+      // NADA: a tela responderia "nenhuma conversa" com o filtro desligado, sem
+      // erro nenhum. `undefined` é o que "sem filtro" significa.
+      return lista.length > 0 ? lista : undefined;
+    }),
+  /**
+   * E ou OU entre as etiquetas escolhidas (#1274). `e` é o padrão, e é o que
+   * uma etiqueta só já significava — logo, o parâmetro só importa havendo duas.
+   *
+   * `z.enum` RECUSA o valor fora dos dois, e a recusa vira 422. Aqui a escolha é
+   * deliberada — o inverso do `status`/`comando`, que transformam lista vazia em
+   * `undefined`: `?modo=xou` é quase sempre alguém copiando o nome do parâmetro
+   * errado, e responder 422 ensina o integrador a corrigir. Na TELA quem chama
+   * é `modoDeEtiqueta`, que devolve `undefined` e cai no `e` — uma tela não pode
+   * quebrar por um parâmetro inventado.
+   */
+  modo: z.enum(MODOS_DE_ETIQUETA).optional(),
+  /**
+   * A aba "Grupos" do inbox (Task 10). `"true"`/`"false"` como STRING — vem de
+   * `searchParams`, que só conhece texto — e não `z.coerce.boolean()`, que
+   * transformaria QUALQUER string não-vazia (inclusive `"false"`) em `true`.
+   * Ausente = sem filtro, a lista mostra tudo, como hoje; presente decide o
+   * `.eq("is_group", …)` no handler.
+   */
+  is_group: z.enum(["true", "false"]).optional(),
   /**
    * Só as que têm mensagem não lida para o dono.
    *
@@ -355,6 +451,23 @@ export const listConversationsQuerySchema = z.object({
       message: `A busca precisa de pelo menos ${PISO_DA_BUSCA} caracteres.`,
     })
     .optional(),
+  /**
+   * Só as conversas DESTE contato — e o filtro é do BANCO, não da página (#2184).
+   *
+   * `crm_list_conversations` vinha filtrando o contato em memória, sobre a
+   * página que o handler já tinha truncado (10 por padrão, até 50): o
+   * `has_more: false` que saía junto dizia ao agente que não havia mais nada,
+   * e uma conversa MAIS ANTIGA do mesmo cliente, fora daquela página, ficava
+   * inalcançável. O filtro por `input.contact_id` tinha o mesmo defeito — só
+   * que mantinha o cursor, o que é pior: o cursor seguia descrevendo a
+   * varredura da ORGANIZAÇÃO, e a próxima página voltava a ser varredura.
+   *
+   * Estando no schema, a chave atravessa as quatro peças com a cerca
+   * `rota-le-todo-filtro-do-schema` cobrindo a rota, e o predicado compõe com
+   * os demais antes do `.limit` — cursor e `has_more` passam a ser honestos
+   * para o conjunto do contato.
+   */
+  contact_id: z.string().uuid().optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });

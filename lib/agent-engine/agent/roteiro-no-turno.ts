@@ -145,7 +145,11 @@ export async function prepararRoteiroDoTurno(
     if (estado === null) {
       const porGatilho =
         t.flowPointerDoRoteador === null
-          ? await escolherFluxoPeloGatilho(deps.pool, { organizationId: t.organizationId, texto })
+          ? await escolherFluxoPeloGatilho(deps.pool, {
+              organizationId: t.organizationId,
+              contactId: t.contactId,
+              texto,
+            })
           : null;
       const alvo = t.flowPointerDoRoteador ?? porGatilho?.id ?? null;
       if (alvo !== null) {
@@ -293,6 +297,26 @@ export async function prepararRoteiroDoTurno(
     });
     return montar(atual, iniciado);
   }
+}
+
+/**
+ * O turno foi DESCARTADO (guard `resposta_obsoleta`, #1940): o cliente escreveu
+ * de novo enquanto o modelo pensava. NADA mais deve sair dele — nem a pergunta
+ * do roteiro. O turno da mensagem nova lê a conversa inteira, e a pergunta
+ * pendente segue feita para ELE. Sem esta porta, o #1940 dava resposta dupla no
+ * caso específico do roteiro: a guarda recusava o envio do modelo, `corposEnviados`
+ * ficava vazio e a trava "a pergunta saiu?" mandava ela assim mesmo (#1943).
+ */
+export function perguntaDoRoteiroPodeSair(args: {
+  /** O turno foi descartado como obsoleto — a pergunta NÃO sai. */
+  turnoDescartado: boolean;
+  /** Mensagens físicas já enviadas neste turno (`seq` do closure). */
+  seq: number;
+  /** Teto de mensagens físicas por turno (F2-15b). */
+  maxSendsPerTurn: number;
+}): boolean {
+  if (args.turnoDescartado) return false;
+  return args.seq < args.maxSendsPerTurn;
 }
 
 /**

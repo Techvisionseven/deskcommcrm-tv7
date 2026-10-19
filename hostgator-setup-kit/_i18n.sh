@@ -33,11 +33,12 @@ _I18N_TABELA=0
 if [ $((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1])) -ge "${I18N_BASH_MINIMO:-404}" ]; then
 _I18N_TABELA=1
 declare -A _ES=(
-  ["Este servidor usa arquitetura '{1}', mas as imagens publicadas do DeskcommCRM hoje são linux/amd64."]="Este servidor usa arquitectura '{1}', pero las imágenes publicadas de DeskcommCRM hoy son linux/amd64."
-  ["  Use uma VPS x86_64/amd64. Repetir o download não resolve; ARM64 só será suportado quando houver imagens multi-arquitetura."]="  Usa una VPS x86_64/amd64. Repetir la descarga no soluciona nada; ARM64 solo se admitirá cuando existan imágenes multiarquitectura."
-  ["Este servidor usa arquitetura '{1}', e as imagens publicadas do DeskcommCRM são só linux/amd64."]="Este servidor usa arquitectura '{1}', y las imágenes publicadas de DeskcommCRM son solo linux/amd64."
+  ["Este servidor usa arquitetura '{1}', mas o DeskcommCRM não publica imagens para ela (linux/amd64 e linux/arm64 estão disponíveis)."]="Este servidor usa arquitectura '{1}', pero DeskcommCRM no publica imágenes para ella (linux/amd64 y linux/arm64 están disponibles)."
+  ["  Use uma VPS x86_64/amd64 ou ARM64/aarch64. Repetir o download não resolve."]="  Usa una VPS x86_64/amd64 o ARM64/aarch64. Repetir la descarga no soluciona nada."
+  ["Este servidor usa arquitetura '{1}', e as imagens publicadas do DeskcommCRM são linux/amd64 e linux/arm64."]="Este servidor usa arquitectura '{1}', y las imágenes publicadas de DeskcommCRM son linux/amd64 y linux/arm64."
+  ["  (WAHA trocado para a variante oficial ARM64: {1})"]="  (WAHA cambiado a la variante oficial ARM64: {1})"
   ["Como esta instalação JÁ EXISTE, sigo em frente: as imagens da versão alvo serão construídas nesta própria VPS."]="Como esta instalación YA EXISTE, sigo adelante: las imágenes de la versión destino se construirán en esta misma VPS."
-  ["Leva de 15 a 25 minutos. Uma instalação NOVA nesta arquitetura precisaria de imagens multi-arquitetura, que o DeskcommCRM ainda não publica."]="Tarda de 15 a 25 minutos. Una instalación NUEVA en esta arquitectura necesitaría imágenes multiarquitectura, que DeskcommCRM todavía no publica."
+  ["Leva de 15 a 25 minutos. Uma instalação NOVA exige x86_64/amd64 ou ARM64/aarch64 com imagens publicadas."]="Tarda de 15 a 25 minutos. Una instalación NUEVA requiere x86_64/amd64 o ARM64/aarch64 con imágenes publicadas."
   ["  (rede '{1}' criada — é por ela que o Traefik alcança o CRM)"]="  (red '{1}' creada: por ella Traefik llega al CRM)"
   ["A rede Docker '{1}' (a do Nginx Proxy Manager) não existe.
 Rode 'docker network ls', identifique a rede do seu NPM (Settings > a que o
@@ -67,6 +68,14 @@ la línea TRAEFIK_NETWORK del .env: el kit crea y usa la red '{3}'.
 Si no, ejecuta 'docker network ls' y pon la bridge correcta en TRAEFIK_NETWORK en el .env.
 Si es una overlay de Swarm, tiene que haberse creado con --attachable —
 sin eso un contenedor de compose común no puede entrar en ella."
+  ["REVERSE_PROXY=cloudflared não é suportado no modo single-server, porque o Supabase self-hosted depende do Caddy para publicar as APIs (Auth, REST, Storage...). Use o proxy padrão (Caddy) ou o Cloudflare Tunnel apenas com o Supabase na nuvem."]="REVERSE_PROXY=cloudflared no es compatible con el modo single-server, porque el Supabase self-hosted depende de Caddy para publicar las APIs (Auth, REST, Storage...). Usa el proxy por defecto (Caddy), o el Cloudflare Tunnel solo con el Supabase en la nube."
+  ["REVERSE_PROXY=cloudflared exige CLOUDFLARE_TUNNEL_TOKEN no .env.
+Crie o túnel em Zero Trust > Networks > Tunnels, copie o token para essa linha
+e rode de novo. Em Public Hostnames, aponte o seu domínio para http://app:3000."]="REVERSE_PROXY=cloudflared exige CLOUDFLARE_TUNNEL_TOKEN en el .env.
+Crea el túnel en Zero Trust > Networks > Tunnels, copia el token a esa línea
+y vuelve a ejecutar. En Public Hostnames, apunta tu dominio a http://app:3000."
+  ["✓ Cloudflare Tunnel: o Caddy fica desligado e o cloudflared publica por app:3000"]="✓ Cloudflare Tunnel: Caddy queda apagado y cloudflared publica por app:3000"
+  ["  (lembre de bloquear /api/v1/webhooks/waha no WAF da Cloudflare — ver docker-compose.cloudflared.yml)"]="  (recuerda bloquear /api/v1/webhooks/waha en el WAF de Cloudflare — ver docker-compose.cloudflared.yml)"
   ["Pausando o sistema para mexer no banco com segurança."]="Pausando el sistema para modificar la base de datos con seguridad."
   ["⛔ PEÇAS DO BANCO NÃO VOLTARAM depois da atualização:"]="⛔ PARTES DE LA BASE DE DATOS NO VOLVIERON después de la actualización:"
   ["   Enquanto elas estiverem paradas, o CRM não consegue ler nem gravar."]="   Mientras estén detenidas, el CRM no puede leer ni escribir."
@@ -110,6 +119,9 @@ sin eso un contenedor de compose común no puede entrar en ella."
   ["✓ chave de cifra dos segredos gerada e gravada no .env"]="✓ Clave de cifrado de los secretos generada y guardada en el .env"
   ["✓ chave de cifra ativa no banco (segredos de webhook são guardados cifrados)"]="✓ Clave de cifrado activa en la base de datos (los secretos de webhook se guardan cifrados)"
   ["⚠ não consegui semear a chave de cifra no banco — segredos de webhook não poderão ser salvos até rodar update.sh de novo."]="⚠ No pude sembrar la clave de cifrado en la base de datos — los secretos de webhook no podrán guardarse hasta volver a ejecutar update.sh."
+  ["✓ chave de cifra do CPF gerada e gravada no .env"]="✓ Clave de cifrado del CPF generada y guardada en el .env"
+  ["✓ chave de cifra do CPF ativa no banco (contato com CPF é salvo cifrado)"]="✓ Clave de cifrado del CPF activa en la base de datos (el contacto con CPF se guarda cifrado)"
+  ["⚠ não consegui semear a chave de cifra do CPF no banco — o contato será salvo sem CPF até rodar update.sh de novo."]="⚠ No pude sembrar la clave de cifrado del CPF en la base de datos — el contacto se guardará sin CPF hasta volver a ejecutar update.sh."
 
   # ── install.sh: banner() e show_recovery() ──────────────────────────────
   ["  Agentes de IA que atendem no WhatsApp, dentro do seu CRM."]="  Agentes de IA que atienden por WhatsApp, dentro de tu CRM."
@@ -120,7 +132,7 @@ sin eso un contenedor de compose común no puede entrar en ella."
   ["derruba o que subiu"]="derriba lo que se levantó"
   ["começa de novo"]="empieza de nuevo"
   ["apaga o marcador desta instalação"]="borra el marcador de esta instalación"
-  ["⚠ Não consegui gravar o marcador desta instalação (arquivo .deskcomm-instalado). O CRM está no ar; numa VPS ARM a atualização pode pedir a VPS x86_64 até o marcador existir."]="⚠ No pude escribir el marcador de esta instalación (archivo .deskcomm-instalado). El CRM está en línea; en una VPS ARM la actualización puede pedir la VPS x86_64 hasta que el marcador exista."
+  ["⚠ Não consegui gravar o marcador desta instalação (arquivo .deskcomm-instalado). O CRM está no ar; numa arquitetura sem imagens publicadas, a atualização pode pedir uma VPS suportada até o marcador existir."]="⚠ No pude escribir el marcador de esta instalación (archivo .deskcomm-instalado). El CRM está en línea; en una arquitectura sin imágenes publicadas, la actualización puede pedir una VPS compatible hasta que exista el marcador."
   ["Se o schema chegou a ser aplicado e você quer o banco limpo de novo,"]="Si el esquema llegó a aplicarse y quieres la base de datos limpia de nuevo,"
   ["abra o Supabase > SQL Editor e rode (ATENÇÃO: apaga todos os dados):"]="abre Supabase > SQL Editor y ejecuta (ATENCIÓN: borra todos los datos):"
 
@@ -135,6 +147,7 @@ sin eso un contenedor de compose común no puede entrar en ella."
   ["A URL precisa começar com https://. Na nuvem ela fica em Settings > API > Project URL (termina em .supabase.co); num Supabase próprio, é o endereço do seu servidor."]="La URL debe empezar con https://. En la nube está en Settings > API > Project URL (termina en .supabase.co); en un Supabase propio, es la dirección de tu servidor."
   ["O modo single-server exige SUPABASE_INTERNAL_URL com http:// ou https:// para validar o Supabase local."]="El modo single-server requiere SUPABASE_INTERNAL_URL con http:// o https:// para validar el Supabase local."
   ["Não consegui alcançar {1} — confira se o projeto existe, está ativo (projeto pausado não responde) e se o VPS tem internet."]="No pude conectar con {1} — revisa que el proyecto exista, esté activo (un proyecto pausado no responde) y que la VPS tenga internet."
+  ["{1} respondeu (HTTP {2}), mas não é o Supabase: o serviço de login dele não atendeu em /auth/v1/verify. Confira o endereço (e a porta, se houver outro painel no servidor)."]="{1} respondió (HTTP {2}), pero no es Supabase: su servicio de login no atendió en /auth/v1/verify. Revisa la dirección (y el puerto, si hay otro panel en el servidor)."
   ["Essa é a chave '{1}', e aqui eu preciso da '{2}'. Em Settings > API elas ficam uma embaixo da outra — confira qual copiou."]="Esa es la clave '{1}', y aquí necesito la '{2}'. En Settings > API están una debajo de la otra — revisa cuál copiaste."
   ["Essa chave é de OUTRO projeto Supabase ({1}), e a URL que você deu é do projeto {2}. Copie as duas do mesmo projeto."]="Esa clave es de OTRO proyecto de Supabase ({1}), y la URL que diste es del proyecto {2}. Copia las dos del mismo proyecto."
   ["Isso não parece uma chave do Supabase (elas começam com 'eyJ' ou 'sb_'). Pegue em Settings > API."]="Esto no parece una clave de Supabase (empiezan con 'eyJ' o 'sb_'). Consíguela en Settings > API."
@@ -147,6 +160,9 @@ sin eso un contenedor de compose común no puede entrar en ella."
   ["Volte em Settings > Database e copie a do Session pooler (o host termina em .pooler.supabase.com)."]="Vuelve a Settings > Database y copia la del Session pooler (el host termina en .pooler.supabase.com)."
   ["Essa connection string é do projeto '{1}', mas a URL que você deu é do projeto '{2}'. Precisam ser o mesmo projeto."]="Esa connection string es del proyecto '{1}', pero la URL que diste es del proyecto '{2}'. Tienen que ser el mismo proyecto."
   ["Não consegui conectar no banco. O Postgres respondeu:"]="No pude conectar con la base de datos. Postgres respondió:"
+  ["O Postgres recusou o certificado TLS: a cadeia dele não está na trust store desta máquina (SELF_SIGNED_CERT_IN_CHAIN)."]="Postgres rechazó el certificado TLS: su cadena no está en el trust store de esta máquina (SELF_SIGNED_CERT_IN_CHAIN)."
+  ["SUPABASE_SSL_ROOT_CERT já está declarada — confira se o arquivo é o prod-ca-2021.crt oficial do Supabase e se o hostname da connection string bate com o certificado."]="SUPABASE_SSL_ROOT_CERT ya está declarada — comprueba que el archivo es el prod-ca-2021.crt oficial de Supabase y que el hostname de la connection string coincide con el certificado."
+  ["Declare SUPABASE_SSL_ROOT_CERT no .env, apontando para a CA oficial do Supabase:"]="Declara SUPABASE_SSL_ROOT_CERT en el .env, apuntando a la CA oficial de Supabase:"
   ["Quase sempre é a senha com caractere especial: na URL ela precisa ser codificada."]="Casi siempre es la contraseña con un carácter especial: en la URL debe estar codificada."
   ["Troque  @ por %40   :  por %3A   /  por %2F   ?  por %3F   #  por %23"]="Cambia  @ por %40   :  por %3A   /  por %2F   ?  por %3F   #  por %23"
   ["Senha do banco errada. É a senha do PROJETO (definida ao criá-lo), não a da sua conta Supabase."]="Contraseña de la base de datos incorrecta. Es la contraseña del PROYECTO (definida al crearlo), no la de tu cuenta de Supabase."
@@ -272,6 +288,8 @@ y, si de verdad es un Traefik, pon REVERSE_PROXY=traefik en el .env y vuelve a e
   ["  Rode 'bash hostgator-setup-kit/update.sh' quando a próxima versão sair."]="  Ejecuta 'bash hostgator-setup-kit/update.sh' cuando salga la próxima versión."
   ["⚠ Não consegui descobrir a última versão publicada (rede?)."]="⚠ No pude averiguar la última versión publicada (¿red?)."
   ["  Instalando pelo canal 'latest'. Depois rode: bash hostgator-setup-kit/update.sh"]="  Instalando por el canal 'latest'. Después ejecuta: bash hostgator-setup-kit/update.sh"
+  ["✖ Não há release numérica completa para ARM64, ou a WAHA escolhida não oferece ARM64."]="✖ No hay una release numérica completa para ARM64, o la WAHA elegida no ofrece ARM64."
+  ["  Confira registry, visibilidade das quatro imagens e WAHA_IMAGE; depois repita."]="  Revisa el registry, la visibilidad de las cuatro imágenes y WAHA_IMAGE; después repite."
 
   # ── install.sh: FIELDS[] — los prompts de la entrevista, vía field_at() ──
   ["Domínio do CRM (ex: crm.suaempresa.com.br)"]="Dominio del CRM (ej: crm.tuempresa.com.mx)"
@@ -292,7 +310,7 @@ y, si de verdad es un Traefik, pon REVERSE_PROXY=traefik en el .env y vuelve a e
   ["Idioma do sistema — 1) Português  2) Español (Enter = Português)"]="Idioma del sistema — 1) Português  2) Español (Enter = Português)"
   ["Cor da sua marca em hex, ex.: #7a5cd6 (Enter usa a cor do sistema)"]="Color de tu marca en hex, ej.: #7a5cd6 (Enter usa el color del sistema)"
   ["E-mail de suporte que SEUS clientes veem (Enter pula)"]="Correo de soporte que ven TUS clientes (Enter lo salta)"
-  ["Chave da Resend — envia convite e e-mail de LGPD (resend.com/api-keys, Enter pula)"]="Clave de Resend — envía invitación y correo de LGPD (resend.com/api-keys, Enter la salta)"
+  ["Chave da Resend — envia convite e e-mail de LGPD (resend.com/api-keys; Enter pula: dá para configurar depois, em Admin → E-mail)"]="Clave de Resend — envía invitación y correo de LGPD (resend.com/api-keys; Enter la salta: puedes configurarlo después, en Admin → E-mail)"
   ["Remetente dos e-mails, de um domínio verificado na Resend (Enter pula)"]="Remitente de los correos, de un dominio verificado en Resend (Enter lo salta)"
 
   # ── install.sh: entrevista y pantalla de confirmación ────────────────────
@@ -310,6 +328,9 @@ y, si de verdad es un Traefik, pon REVERSE_PROXY=traefik en el .env y vuelve a e
 
   # ── install.sh: red del Traefik, telemetría, escritura del .env ─────────
   ["  (o Traefik roda em modo host, então o CRM publica numa rede própria: {1})"]="  (Traefik corre en modo host, así que el CRM publica en una red propia: {1})"
+  ["O seu Traefik está em mais de uma rede Docker ({1}) e não sei por qual ele alcança os sites.
+Ponha TRAEFIK_NETWORK=<nome> no .env com a rede certa antes de tentar de novo."]="Tu Traefik está en más de una red Docker ({1}) y no sé por cuál llega a los sitios.
+Pon TRAEFIK_NETWORK=<nombre> en el .env con la red correcta antes de volver a intentarlo."
   ["Não consegui descobrir a rede Docker do seu Traefik. Rode 'docker network ls',
 identifique a rede dele e ponha TRAEFIK_NETWORK=<nome> no .env antes de tentar de novo."]="No pude averiguar la red Docker de tu Traefik. Ejecuta 'docker network ls',
 identifica su red y pon TRAEFIK_NETWORK=<nombre> en el .env antes de volver a intentarlo."
@@ -404,6 +425,17 @@ identifica su red y pon TRAEFIK_NETWORK=<nombre> en el .env antes de volver a in
   ["Quando tiver a chave da {1}, cadastre em:"]="Cuando tengas la clave de {1}, regístrala en:"
   ["A chave fica CIFRADA no banco — não precisa mexer no .env nem reiniciar nada."]="La clave queda CIFRADA en la base de datos — no hace falta tocar el .env ni reiniciar nada."
 
+  # ── install.sh: pendencia_do_email() ─────────────────────────────────────
+  ["O envio de e-mail ainda não funciona"]="El envío de correo todavía no funciona"
+  ["Você deixou a chave da Resend para depois e não preencheu um SMTP. O CRM"]="Dejaste la clave de Resend para después y no completaste un SMTP. El CRM"
+  ["está no ar; o que não sai é o convite para a equipe e o e-mail com o PDF"]="está activo; lo que no sale es la invitación para el equipo y el correo con el PDF"
+  ["de LGPD."]="de LGPD."
+  ["Para ligar, cadastre em Admin → E-mail o servidor SMTP próprio ou o"]="Para activarlo, registra en Admin → E-mail el servidor SMTP propio o el"
+  ["serviço externo (Resend). O que a tela salva fica CIFRADO no banco e"]="servicio externo (Resend). Lo que la pantalla guarda queda CIFRADO en la base de datos y"
+  ["prevalece sobre o .env."]="prevalece sobre el .env."
+  ["No SEU Supabase, os e-mails de acesso (senha, cadastro) também saem pelo"]="En TU Supabase, los correos de acceso (contraseña, registro) también salen por el"
+  ["SMTP do CRM. Depois de salvar na tela, rode:"]="SMTP del CRM. Después de guardar en la pantalla, ejecuta:"
+
   # ── install.sh: creación del admin, arranque de la stack, healthcheck ───
   ["✓ dono criado e promovido a super-admin"]="✓ dueño creado y promovido a super-admin"
   ["Não consegui promover o admin. Confira a service_role key, a URL e a connection string do Supabase.
@@ -415,6 +447,10 @@ identifica su red y pon TRAEFIK_NETWORK=<nombre> en el .env antes de volver a in
   ["Puxando a imagem e subindo os serviços"]="Descargando la imagen y levantando los servicios"
   ["⚠ Não consegui puxar todas as imagens do registro."]="⚠ No pude descargar todas las imágenes del registro."
   ["  Sigo assim mesmo: o que faltar é construído aqui (mais lento, mesmo resultado)."]="  Continúo de todas formas: lo que falte se construye aquí (más lento, mismo resultado)."
+  ["Não coloquei o CRM no ar: {1} A construção local segue fechada por padrão, e numa instalação não há versão anterior para onde voltar. Para construir as imagens aqui DE PROPÓSITO (mais lento, exige memória): {2}"]="No pude poner el CRM en línea: {1} La construcción local sigue cerrada por defecto, y en una instalación no hay versión anterior a la que volver. Para construir las imágenes AQUÍ A PROPÓSITO (más lento, requiere memoria): {2}"
+  ["a construção local foi desligada por você mesmo nesta execução (DESKCOMM_BUILD_LOCAL={1}), e o portão obedece — tire a variável ou troque o valor por 1 para construir de propósito."]="la construcción local la desactivaste tú mismo en esta ejecución (DESKCOMM_BUILD_LOCAL={1}), y el portón obedece — quita la variable o cambia el valor a 1 para construir a propósito."
+  ["o plugin buildx do Docker não está instalado nesta VPS, e é com ele que confiro se a versão {1} está publicada — sem ele a sonda falha nas quatro imagens e o veredito sai como 'registro fora', o diagnóstico errado para uma VPS cuja rede está boa. Instale o pacote {2} e rode este install.sh de novo."]="el plugin buildx de Docker no está instalado en esta VPS, y con él verifico si la versión {1} está publicada — sin él la sonda falla en las cuatro imágenes y el veredicto sale como 'registro fuera', el diagnóstico equivocado para una VPS cuya red funciona bien. Instala el paquete {2} y ejecuta este install.sh de nuevo."
+  ["o registro de imagens não respondeu para a versão {1} (DNS/rede, ou a tag ainda sem nenhuma imagem publicada — de fora os dois se parecem, e o kit não adivinha pelo texto do erro). Sem resposta do registro a construção aqui gastaria a memória desta VPS à toa, que é o defeito da #1955. Rode este install.sh de novo em alguns minutos."]="el registro de imágenes no respondió para la versión {1} (DNS/red, o la tag todavía sin ninguna imagen publicada — desde afuera los dos se parecen, y el kit no adivina por el texto del error). Sin respuesta del registro la construcción aquí gastaría la memoria de esta VPS sin motivo, que es el defecto de la #1955. Ejecuta este install.sh de nuevo en unos minutos."
   ["Não coloquei o CRM no ar: nem as imagens prontas desta versão nem a construção aqui funcionaram. O erro está logo acima; para reproduzir só a construção: {1}"]="No pude poner el CRM en línea: ni las imágenes listas de esta versión ni la construcción local funcionaron. El error está justo arriba; para reproducir solo la construcción: {1}"
   ["✓ containers no ar"]="✓ contenedores en línea"
   ["  (as três imagens desta versão foram construídas aqui nesta VPS: as prontas"]="  (las tres imágenes de esta versión se construyeron aquí en esta VPS: las ya"
@@ -438,6 +474,13 @@ identifica su red y pon TRAEFIK_NETWORK=<nombre> en el .env antes de volver a in
   ["Diagnóstico completo dos serviços:"]="Diagnóstico completo de los servicios:"
   ["Depois de corrigir o .env, é só subir de novo (nada é perdido):"]="Después de corregir el .env, solo levántalo de nuevo (no se pierde nada):"
   ["Travou? Leve o log para a comunidade — tem gente que já passou por isso:"]="¿Se atascó? Lleva el log a la comunidad — hay gente que ya pasó por esto:"
+  # variante "quase lá" sem certificado: o app no confió en el HTTPS de su propio dominio
+  ["Quase lá — falta o cadeado (HTTPS) do seu domínio"]="Ya casi — falta el candado (HTTPS) de tu dominio"
+  ["refazer nada — o certificado de {1} ainda não saiu."]="rehacer nada — el certificado de {1} todavía no salió."
+  ["Isso leva alguns minutos depois que o domínio aponta para esta VPS."]="Eso tarda algunos minutos después de que el dominio apunta a esta VPS."
+  ["Espere alguns minutos e confira (o certo é responder 307):"]="Espera algunos minutos y verifica (lo correcto es que responda 307):"
+  ["Quando der 307, rode de novo o mesmo comando de instalação: ele confere"]="Cuando dé 307, vuelve a ejecutar el mismo comando de instalación: revisa"
+  ["o que falta e termina, sem apagar nada."]="lo que falta y termina, sin borrar nada."
 
   # ── install.sh: telemetria_no_banner() ───────────────────────────────────
   ["  Telemetria: DESLIGADA — nenhum relatório de erro sai desta instalação."]="  Telemetría: DESACTIVADA — ningún reporte de error sale de esta instalación."

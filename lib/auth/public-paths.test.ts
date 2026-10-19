@@ -71,4 +71,44 @@ describe("isPublicPath", () => {
   it("nem um sub-path do lead (clone, move, lose, win, …) passa de carona", () => {
     expect(isPublicPath("/api/v1/leads/11111111-1111-4111-8111-111111111111/clone")).toBe(false);
   });
+
+  it("libera somente as portas de routers que autenticam sessão ou Bearer no handler", () => {
+    const router = "11111111-1111-4111-8111-111111111111";
+    expect(isPublicPath("/api/v1/ai/routers")).toBe(true);
+    expect(isPublicPath(`/api/v1/ai/routers/${router}`)).toBe(true);
+    expect(isPublicPath(`/api/v1/ai/routers/${router}/members`)).toBe(true);
+    expect(isPublicPath(`/api/v1/ai/routers/${router}/test`)).toBe(true);
+  });
+
+  it("não dá carona a ids inválidos nem a sub-paths futuros de routers", () => {
+    const router = "11111111-1111-4111-8111-111111111111";
+    expect(isPublicPath("/api/v1/ai/routers/qualquer")).toBe(false);
+    expect(isPublicPath(`/api/v1/ai/routers/${router}/members/extra`)).toBe(false);
+    expect(isPublicPath(`/api/v1/ai/routers/${router}/test/extra`)).toBe(false);
+    expect(isPublicPath(`/api/v1/ai/routers/${router}/publish`)).toBe(false);
+  });
+
+  /**
+   * `/account-suspended` NÃO é mais rota pública (issue #2016). Quem cai nela
+   * vem do redirect do layout de `/app` quando a organização está suspensa —
+   * já com sessão. Ser pública fazia o `proxy` sair ANTES do `getUser()`, que é
+   * quem renova o cookie da sessão; e o refresh que a própria página tenta no
+   * Server Component é ignorado (`lib/supabase/server.ts`: `setAll` é no-op em
+   * Server Component). Resultado: sessão que expira com a pessoa nessa tela não
+   * é renovada e ela cai deslogada. Fora da lista, o `proxy` revalida e
+   * renova a sessão como em qualquer outra rota da árvore logada.
+   */
+  it("libera a ponte da volta do provedor de pagamento, e nenhum sub-path dela", () => {
+    expect(isPublicPath("/cobranca/volta")).toBe(true);
+    expect(isPublicPath("/cobranca/volta/x")).toBe(false);
+    expect(isPublicPath("/cobranca")).toBe(false);
+  });
+
+  it("NÃO libera /account-suspended — o proxy precisa renovar a sessão nela", () => {
+    expect(isPublicPath("/account-suspended")).toBe(false);
+  });
+
+  it("e não libera nenhum sub-path dela de carona", () => {
+    expect(isPublicPath("/account-suspended/qualquer")).toBe(false);
+  });
 });

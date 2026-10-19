@@ -19,6 +19,8 @@ import { ConditionForm } from "./forms/ConditionForm";
 import { EndForm } from "./forms/EndForm";
 import { InternalTaskForm } from "./forms/InternalTaskForm";
 import { MatchReplyForm } from "./forms/MatchReplyForm";
+import { MoveLeadForm } from "./forms/MoveLeadForm";
+import { EditLeadTagForm } from "./forms/EditLeadTagForm";
 import { RepeatForm } from "./forms/RepeatForm";
 import { SkillForm } from "./forms/SkillForm";
 import { WaitForm } from "./forms/WaitForm";
@@ -155,6 +157,16 @@ export function NodeConfigPanel({
         {type === "internal_task" && (
           <InternalTaskForm
             config={node.data.config as ConfigOf<"internal_task">}
+            onChange={(config) => onChange({ config })}
+          />
+        )}
+        {/* #2065 — os dois nós de ação que não falam com o cliente. */}
+        {type === "move_lead" && (
+          <MoveLeadForm config={node.data.config as ConfigOf<"move_lead">} onChange={(config) => onChange({ config })} />
+        )}
+        {type === "edit_lead_tag" && (
+          <EditLeadTagForm
+            config={node.data.config as ConfigOf<"edit_lead_tag">}
             onChange={(config) => onChange({ config })}
           />
         )}
@@ -324,6 +336,31 @@ function ConfiguracoesDoRoteiro({
           }}
         />
         <p className="text-xs text-text-muted">{t("Em branco, o roteiro encerra depois de 72 horas sem resposta.")}</p>
+      </div>
+      {/* #1130 (@vgamkt): o padrão é NÃO recomeçar para quem já concluiu. */}
+      <div className="space-y-1" data-testid="roteiro-pode-recomecar">
+        <label className="flex cursor-pointer items-center gap-2" htmlFor="roteiro-recomeca">
+          <Switch
+            id="roteiro-recomeca"
+            checked={settings?.pode_recomecar === true}
+            onCheckedChange={(v) => {
+              if (v) {
+                gravar({ pode_recomecar: true });
+                return;
+              }
+              const { pode_recomecar: _anterior, ...resto } = atual;
+              onSettingsChange?.(resto);
+            }}
+          />
+          <span className="text-sm font-medium text-text">
+            {t("Pode recomeçar para quem já concluiu")}
+          </span>
+        </label>
+        <p className="text-xs text-text-muted">
+          {t(
+            "Desligado, o cliente que já respondeu tudo não recebe as mesmas perguntas de novo, mesmo repetindo a palavra-gatilho. Ligue para roteiros que se repetem, como agendamento.",
+          )}
+        </p>
       </div>
     </div>
   );
