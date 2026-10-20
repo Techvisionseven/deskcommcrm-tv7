@@ -76,6 +76,13 @@ export GIT_CEILING_DIRECTORIES="$TMP"
 export GIT_AUTHOR_NAME="Teste" GIT_AUTHOR_EMAIL="teste@exemplo.invalid"
 export GIT_COMMITTER_NAME="Teste" GIT_COMMITTER_EMAIL="teste@exemplo.invalid"
 
+# ── isolamento do CI: o número do PR que RODA a suíte não entra nos cenários ──────────
+# O gate tira o próprio PR da lista pelo `GITHUB_REF` (refs/pull/N/merge). Herdado do
+# job, ele fazia o PR de verdade virar "o seu" DENTRO de um cenário que usa o mesmo
+# número. Num repositório com PRs na casa dos milhares nunca coincide; num fork com
+# poucos PRs, sim: no PR #7 de um fork, 9 casos que falam do "#7" ficaram vermelhos.
+unset GITHUB_REF
+
 # ── gh FALSO, para TODOS os casos: sem rede e sem depender do gh de quem roda ──────────
 # Ele HONRA o contrato da chamada real — se ignorasse os argumentos, trocar `--state open`
 # por `--state all` ou esquecer o `--limit` passaria verde (achado da revisão de 19/09):

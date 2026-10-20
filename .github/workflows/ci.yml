@@ -621,8 +621,15 @@ jobs:
         # O token é só para `gh release view`: o test:db confere o update.sh da
         # última release publicada (issue #1909), e a API anônima tem teto de 60
         # consultas/hora por IP — o executor próprio é um IP só.
+        #
+        # Fora do repositório do produto (um fork), a release que roda nas VPS é
+        # a do produto: o fork não publica release nem carrega as tags novas. O
+        # dia em que o fork publicar as próprias releases e o kit dele apontar
+        # para elas, esta linha sai. Razão: cabeçalho de
+        # scripts/conferir-isolamento-do-kit.sh, seção "De qual repositório".
         env:
           GH_TOKEN: ${{ github.token }}
+          CONFERENCIA_KIT_REPOSITORIO: ${{ github.repository != 'melgarafael/DeskcommCRM' && 'https://github.com/melgarafael/DeskcommCRM.git' || '' }}
         run: pnpm test:db
 
       # O `update.sh` do cliente roda sobre um banco COM DADOS, e nenhum gate

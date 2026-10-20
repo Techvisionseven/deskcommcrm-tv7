@@ -55,6 +55,16 @@
 # senão `ultima_release_estavel` do próprio kit (`/releases/latest`). Nunca a maior
 # tag: tag não é release publicada (ver o cabeçalho dessa função em _common.sh).
 # Sem resposta, REPROVA — gate que pula em silêncio não é gate.
+#
+# ## De qual repositório
+#
+# Por padrão, o `origin`: a release e as tags vêm de onde este checkout veio.
+# `CONFERENCIA_KIT_REPOSITORIO=https://github.com/<dono>/<repo>.git` troca as duas
+# perguntas (qual é a última release; qual é o `update.sh` dela) para outro
+# repositório. É o caso de um fork cujas VPS ainda atualizam pelo kit do produto
+# original: o fork não publica release nem carrega as tags novas, e a resposta só
+# existe no repositório de onde a VPS atualiza. Medido num fork: `releases/latest`
+# 404 e nenhuma tag depois da v1.60.0, então a v1.63.0 nem podia ser buscada.
 set -euo pipefail
 
 CONTAINER="${1:?uso: $0 <container> <banco>}"
@@ -62,9 +72,17 @@ BANCO="${2:?uso: $0 <container> <banco>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KIT="$ROOT/hostgator-setup-kit"
 
+REPOSITORIO="${CONFERENCIA_KIT_REPOSITORIO:-}"
+slug=""
+if [ -n "$REPOSITORIO" ]; then
+  slug="$(printf '%s' "$REPOSITORIO" \
+    | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##; s#^https?://[^/]+/##')"
+  export DESKCOMM_RELEASES_LATEST_URL="${DESKCOMM_RELEASES_LATEST_URL:-https://api.github.com/repos/${slug}/releases/latest}"
+fi
+
 release="${CONFERENCIA_KIT_RELEASE:-}"
 if [ -z "$release" ] && [ -n "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
-  release="$(cd "$ROOT" && gh release view --json tagName -q .tagName 2>/dev/null || true)"
+  release="$(cd "$ROOT" && gh release view ${slug:+--repo "$slug"} --json tagName -q .tagName 2>/dev/null || true)"
 fi
 if [ -z "$release" ]; then
   release="$(cd "$ROOT" && bash -c 'source "$1/_common.sh" >/dev/null 2>&1; ultima_release_estavel' _ "$KIT" || true)"
@@ -86,7 +104,7 @@ update_sh_da() {  # update_sh_da <tag> — caminho de uma cópia do update.sh da
   if ! git -C "$ROOT" rev-parse -q --verify "refs/tags/$1^{commit}" >/dev/null; then
     local profundidade=""
     [ "$(git -C "$ROOT" rev-parse --is-shallow-repository)" = true ] && profundidade="--depth=1"
-    git -C "$ROOT" fetch -q --no-tags $profundidade origin "+refs/tags/$1:refs/tags/$1"
+    git -C "$ROOT" fetch -q --no-tags $profundidade "${REPOSITORIO:-origin}" "+refs/tags/$1:refs/tags/$1"
   fi
   git -C "$ROOT" show "$1:hostgator-setup-kit/update.sh" > "$TMP/$1"
   printf '%s' "$TMP/$1"
