@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import { apiClient } from "@/lib/api/client";
+import type { TipoDeIdentificador } from "@/lib/external-db/schemas";
 
 /** Espelha a `_safe` view: sem as três colunas cifradas, jamais. */
 export interface ConexaoExternaRow {
@@ -19,9 +20,17 @@ export interface ConexaoExternaRow {
   max_rows: number;
   max_filters: number;
   max_response_bytes: number;
+  customer_key_column: string | null;
+  customer_key_kind: TipoDeIdentificador | null;
   last_tested_at: string | null;
   last_test_ok: boolean | null;
   last_test_error: string | null;
+  /** `all` = o assistente enxerga tudo que o usuário do banco enxerga; `list` = só o marcado. */
+  source_mode: "all" | "list";
+  /** Quantas fontes estão marcadas (a lista inteira NÃO vem na `_safe`). */
+  sources_count: number;
+  db_type: "postgres" | "mysql";
+  last_test_aviso: string | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;
@@ -65,6 +74,9 @@ export interface EntradaDeConexao {
   max_rows: number;
   max_filters: number;
   max_response_bytes: number;
+  customer_key_column: string | null;
+  customer_key_kind: TipoDeIdentificador | null;
+  db_type?: "postgres" | "mysql";
 }
 
 export type PatchDeConexao = Partial<Omit<EntradaDeConexao, "password">> & {
@@ -92,6 +104,7 @@ export interface ResultadoDeTesteDaConexao {
   ok: boolean;
   erro?: string;
   testado_em?: string;
+  aviso?: string;
 }
 
 export async function testarConexao(id: string): Promise<ResultadoDeTesteDaConexao> {

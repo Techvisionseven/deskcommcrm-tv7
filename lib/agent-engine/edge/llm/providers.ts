@@ -9,6 +9,7 @@ import { createOpenAI } from '@ai-sdk/openai';
 import type { LanguageModel } from 'ai';
 import { MockLanguageModelV3 } from 'ai/test';
 
+import { PROVEDOR_POR_ASSINATURA } from '@/lib/ai/pontos/provedores';
 import { fetchParaDestinoDaOrganizacao } from '@/lib/automation/destinos-internos-autorizados';
 
 import { allowlistedFetch, buildAllowlist } from '../egress';
@@ -60,6 +61,26 @@ export const DEEPSEEK_ENDPOINT = 'https://api.deepseek.com';
  * `https://router.eu.requesty.ai/v1`.
  */
 export const REQUESTY_ENDPOINT = 'https://router.requesty.ai/v1';
+
+/**
+ * O endpoint do CODEX — o mesmo login do ChatGPT, falando a API de resposta.
+ *
+ * A assinatura (`openai-assinatura`) não tem chave: o `access_token` SIWC
+ * viaja como Bearer para a API pública de Responses da OpenAI. A chamada é
+ * transmitida (`stream:true`) por `runModelCall`, sem opções fora do contrato
+ * SIWC, e nunca usa endpoints internos do ChatGPT.
+ *
+ * A allowlist de egress do provider deriva daqui (`contain(...)` abaixo) — mas
+ * o CATRACA de host do `branding.test.ts` é régua à parte: ele exige a linha
+ * declarada em `HOSTS_DECLARADOS`, que está lá, com categoria e motivo.
+ *
+ * A listagem de modelos da assinatura também usa a API pública oficial `/v1/models`,
+ * documentada para Sign in with ChatGPT. Não chamamos endpoints internos do ChatGPT.
+ */
+export const OPENAI_CODEX_ENDPOINT = 'https://api.openai.com/v1';
+
+/** Endpoint oficial de catálogo para tokens de Sign in with ChatGPT. */
+export const OPENAI_MODELS_ENDPOINT = 'https://api.openai.com/v1/models';
 
 /**
  * Cabeçalhos OPCIONAIS de atribuição da OpenRouter.
@@ -193,7 +214,38 @@ export function modeloOpenAIRaciocina(modelId: string): boolean {
   return /^(o\d|gpt-5|gpt-6)/.test(id) && !id.includes('chat');
 }
 
-/** Injeta `reasoning.effort` no corpo, preservando o resto de `reasoning` e da chamada. */
+/**
+ * Da linha 6 em diante nenhum modelo lista `minimal`, e só `gpt-6-luna` e `gpt-6-sol`
+ * listam `none` (doc oficial de cada id em 11/10/2026: o gpt-6.1-sol diz "`none` and
+ * `minimal` reasoning efforts are not supported", o gpt-6-astra lista low…max, o
+ * gpt-6-luna lista none, low…max; o @ai-sdk/openai declara as mesmas listas em
+ * `supportedReasoningEfforts`). Mandar o knob como está seria 400 em toda resposta.
+ *
+ * `none`/`minimal` é pedido de velocidade, então vira `none` onde ele existe e `low`
+ * onde não existe. `minimal` NÃO vira `low` no Luna: medido acima, lá `low` é mais
+ * lento até que o padrão, e `none` é o único que entrega o que o operador pediu.
+ */
+function esforcoAceitoPeloModelo(
+  modelId: string,
+  esforco: EsforcoDeRaciocinioOpenAI,
+): EsforcoDeRaciocinioOpenAI {
+  if (esforco !== 'none' && esforco !== 'minimal') return esforco;
+  const id = modelId.toLowerCase();
+  const major = /^gpt-(\d+)/.exec(id)?.[1];
+  if (major === undefined || Number(major) < 6) return esforco;
+  const aceitaNone = id === 'gpt-6-luna' || id === 'gpt-6-sol';
+  return aceitaNone ? 'none' : 'low';
+}
+
+/**
+ * Injeta `reasoning.effort` no corpo, preservando o resto de `reasoning` e da chamada.
+ *
+ * O knob é o padrão da INSTALAÇÃO, não uma ordem por cima de quem pediu: a
+ * chamada que já traz `reasoning.effort` (a opção `reasoning` de `runModelCall`,
+ * que o SDK só escreve quando alguém pede) fica com o seu. Sem isso, um
+ * `OPENAI_REASONING_EFFORT=high` faria as classificações, que pedem `none`,
+ * voltarem a pensar antes de devolver uma palavra.
+ */
 function comEsforcoDeRaciocinio(inner: typeof fetch, esforco: EsforcoDeRaciocinioOpenAI): typeof fetch {
   return (input, init) => {
     const corpo = init?.body;
@@ -202,6 +254,7 @@ function comEsforcoDeRaciocinio(inner: typeof fetch, esforco: EsforcoDeRaciocini
         const json = JSON.parse(corpo) as Record<string, unknown>;
         const bruto = json['reasoning'];
         const reasoning = bruto !== null && typeof bruto === 'object' ? (bruto as Record<string, unknown>) : {};
+        if (typeof reasoning['effort'] === 'string') return inner(input, init);
         return inner(input, { ...init, body: JSON.stringify({ ...json, reasoning: { ...reasoning, effort: esforco } }) });
       } catch {
         // Corpo não-JSON: repassa intacto — um ajuste de tuning nunca derruba a chamada.
@@ -249,10 +302,32 @@ export function createDefaultRegistry(opts?: {
       const contido = contain(OPENAI_ENDPOINT);
       const fetchFinal =
         esforcoOpenAI && modeloOpenAIRaciocina(modelId)
-          ? comEsforcoDeRaciocinio(contido, esforcoOpenAI)
+          ? comEsforcoDeRaciocinio(contido, esforcoAceitoPeloModelo(modelId, esforcoOpenAI))
           : contido;
       return createOpenAI({ apiKey, fetch: fetchFinal })(modelId);
     },
+    /**
+     * A ASSINATURA (#1639) — mesma fábrica da OpenAI, outro destino e outro
+     * segredo: o `apiKey` aqui é o `access_token` do login por PKCE, nunca uma
+     * chave de API (quem o monta é `resolveOrgLlmConfig`, e só ele).
+     *
+     * Sem `baseUrl`: este provedor não aceita endpoint próprio (`aceitaEndpointProprio:
+     * false` na lista), e honrar um endereço escolhido num provider que a tela
+     * diz não poder ser apontado seria a tela e o runtime discordando.
+     *
+     * Sem injeção de `reasoning.effort` também: o knob é da fábrica `openai`,
+     * e o campo existe onde a OpenAI o documenta — aqui ele só correria o risco
+     * de o backend recusar um parâmetro que não pediu.
+     *
+     * A listagem da conta usa GET /v1/models com o mesmo token SIWC, conforme o
+     * contrato oficial Sign in with ChatGPT; este runtime continua em /v1/responses.
+     */
+    [PROVEDOR_POR_ASSINATURA]: (apiKey, modelId) =>
+      createOpenAI({
+        apiKey,
+        baseURL: OPENAI_CODEX_ENDPOINT,
+        fetch: contain(OPENAI_CODEX_ENDPOINT),
+      })(modelId),
     google: (apiKey, modelId) =>
       createGoogleGenerativeAI({ apiKey, fetch: contain(GOOGLE_ENDPOINT) })(modelId),
     /**

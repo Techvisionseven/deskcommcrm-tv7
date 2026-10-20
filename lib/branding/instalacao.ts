@@ -83,6 +83,8 @@ export type SementeDoAmbiente = {
   readonly app_name: string | null;
   readonly logo_url: string | null;
   readonly accent_hex: string | null;
+  /** A cor do TEMA ESCURO (#2482, migration 0627). Opcional: linha antiga não a tem. */
+  readonly accent_dark_hex?: string | null;
 };
 
 /**
@@ -102,7 +104,7 @@ export type SementeDoAmbiente = {
  * 0155; tratá-la diferente agora criaria duas regras para o mesmo caso.
  */
 const COLUNAS =
-  "app_name, logo_url, logo_path, logo_dark_path, favicon_path, accent_hex, show_powered_by, seeded_from_env, fallback_at, fallback_reason";
+  "app_name, logo_url, logo_path, logo_dark_path, favicon_path, accent_hex, accent_dark_hex, show_powered_by, seeded_from_env, fallback_at, fallback_reason";
 
 /**
  * Códigos de recusa — os que significam "a cor configurada NÃO pintou".
@@ -400,6 +402,16 @@ async function lerLinha(): Promise<LinhaDaMarca | null | "erro"> {
       .from("platform_branding")
       .select(COLUNAS)
       .eq("id", 1)
+      // Fora da deduplicação de `fetch` do Next. Dentro de um render, o `fetch`
+      // do servidor (`createDedupeFetch`, aplicado por `patchFetch`) devolve a
+      // QUALQUER GET repetido a resposta guardada da primeira ida — e um render
+      // chama `marcaDaInstalacao()` várias vezes. Quando uma escrita invalida o
+      // memo entre duas dessas chamadas, a segunda captura a geração NOVA,
+      // recebe a linha de ANTES da escrita, passa pela guarda de geração e a
+      // memoiza por um TTL inteiro: a barra lateral sem o logo recém-subido,
+      // atrás do toast "Logo atualizado." (#1218). Levar um `signal` é o opt-out
+      // que o próprio `dedupe-fetch.js` documenta; este nunca é abortado.
+      .abortSignal(new AbortController().signal)
       .maybeSingle();
     if (error) {
       avisarUmaVez(

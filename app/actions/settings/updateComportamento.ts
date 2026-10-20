@@ -5,11 +5,12 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 
 import { audit } from "@/lib/audit";
-import { requirePlatformAdmin } from "@/lib/auth/requirePlatformAdmin";
+import { escritaDeAdminOuRecusa } from "@/lib/auth/escritaDeAdminOuRecusa";
 import {
   carregarComportamentoDaInstalacao,
   gravarComportamentoDaInstalacao,
 } from "@/lib/instalacao/comportamento-servidor";
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 
 export type UpdateComportamentoResult = { ok: true } | { ok: false; error: string };
 
@@ -43,7 +44,9 @@ const entradaSchema = z.object({
 export async function updateComportamento(
   input: z.infer<typeof entradaSchema>,
 ): Promise<UpdateComportamentoResult> {
-  const { user } = await requirePlatformAdmin();
+  const escrita = await escritaDeAdminOuRecusa();
+  if (!escrita.ok) return escrita;
+  const { user } = escrita.ctx;
 
   const parsed = entradaSchema.safeParse(input);
   if (!parsed.success) return { ok: false, error: "invalid_input" };
@@ -64,7 +67,7 @@ export async function updateComportamento(
     resourceType: "platform_settings",
     metadata: { de: anterior, para: parsed.data },
     requestId: hdrs.get("x-request-id"),
-    ip: hdrs.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null,
+    ip: ipDoCliente(hdrs),
     userAgent: hdrs.get("user-agent"),
   });
 

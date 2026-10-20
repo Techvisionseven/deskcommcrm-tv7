@@ -18,6 +18,8 @@ import { MOTIVO_DA_RECUSA_LABEL, type MotivoDaRecusa } from "@/lib/webhooks/capt
 import type { LeadCaptureRow } from "@/hooks/webhooks/useLeadCaptures";
 import { DESFECHO_LABEL } from "./CapturasTab";
 import { useT } from "@/hooks/i18n/useT";
+import { CadastrarCampo, useCampoDoFunilDaCaptacao } from "./CadastrarCampo";
+import { useWebhookSources } from "@/hooks/webhooks/useWebhookSources";
 
 interface Props {
   captura: LeadCaptureRow | null;
@@ -40,7 +42,13 @@ function Linha({
 }) {
   return (
     <div className="grid grid-cols-[minmax(0,7rem)_1fr] gap-3 py-1.5">
-      <dt className="text-xs text-muted-foreground">{rotulo}</dt>
+      {/* A trilha do rótulo tem TETO de 7rem. Uma chave que o formulário mandou
+          (uma palavra sem espaço: `disposto_investir_1500_reais_por_mes_em_trafego`,
+          ou um UUID de pergunta) não tem onde quebrar, vaza da célula e é pintada
+          por cima do valor ao lado. `wrap-anywhere` (e não `break-words`): só
+          `overflow-wrap: anywhere` reduz o min-content, então o rótulo caiba na
+          trilha quebrando — sem cortá-lo, o que o tornaria ilegível. */}
+      <dt className="wrap-anywhere text-xs text-muted-foreground">{rotulo}</dt>
       <dd className="min-w-0 break-words text-sm text-text">{children}</dd>
     </div>
   );
@@ -56,7 +64,12 @@ function valorLegivel(valor: unknown): string {
 export function CapturaDetail({ captura, onOpenChange }: Props) {
   const tagDoIdioma = useTagDeIdioma();
   const t = useT();
+  // Antes do `return null`: hook não pode ficar depois de retorno condicional.
+  const funil = useCampoDoFunilDaCaptacao(captura?.webhook_source_id ?? null);
+  const { data: fontesRes } = useWebhookSources();
   if (!captura) return null;
+  const camposDaFonte =
+    fontesRes?.data?.find((source) => source.id === captura.webhook_source_id)?.form_fields ?? [];
   const campos = Object.entries(captura.fields ?? {});
   const utms = Object.entries(captura.utm ?? {});
   const motivo = captura.reject_reason
@@ -106,11 +119,25 @@ export function CapturaDetail({ captura, onOpenChange }: Props) {
               <Linha rotulo={t("Nome")}>{captura.captured_name ?? "—"}</Linha>
               <Linha rotulo={t("Telefone")}>{captura.captured_phone ?? "—"}</Linha>
               <Linha rotulo={t("E-mail")}>{captura.captured_email ?? "—"}</Linha>
-              {campos.map(([chave, valor]) => (
-                <Linha key={chave} rotulo={chave}>
-                  {valorLegivel(valor)}
-                </Linha>
-              ))}
+              {campos.map(([chave, valor]) => {
+                // Cadastrado no funil: a tela mostra o rótulo que a equipe escolheu, não a
+                // chave crua do formulário. Não cadastrado: oferece cadastrar aqui mesmo.
+                const definicao = funil.definicoes.find((d) => d.key === chave);
+                const campoDaFonte = camposDaFonte.find((field) => field.key === chave);
+                return (
+                  <Linha key={chave} rotulo={campoDaFonte?.label ?? definicao?.label ?? chave}>
+                    {valorLegivel(valor)}
+                    {!definicao && funil.pronto ? (
+                      <CadastrarCampo
+                        chave={chave}
+                        valor={valor}
+                        tipoInicial={campoDaFonte?.type === "currency" || campoDaFonte?.type === "number" ? campoDaFonte.type : undefined}
+                        cadastrar={funil.cadastrar}
+                      />
+                    ) : null}
+                  </Linha>
+                );
+              })}
             </dl>
             {campos.length === 0 ? (
               <p className="mt-2 text-xs text-muted-foreground">

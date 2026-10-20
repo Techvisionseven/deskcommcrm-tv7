@@ -1,12 +1,17 @@
 "use client";
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import { hashKey, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import { useRealtimeChannel } from "@/hooks/realtime/useRealtimeChannel";
 import { useRefetchDeSeguranca } from "@/hooks/realtime/useRefetchDeSeguranca";
+import { agendarRecargaDasConversas } from "@/hooks/inbox/recargaDasConversas";
 import { apiClient } from "@/lib/api/client";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
+import {
+  type ModoDeEtiqueta,
+  marcadoresEscolhidos,
+} from "@/lib/inbox/marcador-da-conversa";
 import type { Conversation } from "@/lib/types/messaging";
-import type { ComandoDoBanco } from "@/lib/inbox/comando-da-conversa";
+import { ehAFila, type ComandoDoBanco } from "@/lib/inbox/comando-da-conversa";
 
 export interface ContactSummary {
   id: string;
@@ -16,6 +21,8 @@ export interface ContactSummary {
   tags: string[];
   is_blocked: boolean;
   is_anonymized: boolean;
+  /** Spec 21: lido da coluna, nunca de etiqueta (o selo "Pessoal" da fatia 3 lê daqui). */
+  is_personal: boolean;
   /** Caminho da foto no bucket privado. A tela nunca usa este valor como src —
    *  só para saber SE existe foto; a imagem vem de /api/v1/contacts/{id}/avatar,
    *  que assina a URL. Opcional: conversas em cache de antes do campo existir. */
@@ -93,7 +100,19 @@ export interface ConversationsFilters {
    */
   unread?: boolean;
   channel_session_id?: string;
-  tag?: string;
+  /**
+   * A etiqueta, ou VÁRIAS (#1274).
+   *
+   * `string` continua aceito porque é o que o resto da tela (e qualquer chamada
+   * antiga) produz. A lista sai na URL por `append`, nunca por `set` — com
+   * `set`, a segunda etiqueta substituiria a primeira e a tela mostraria duas
+   * escolhas filtrando por uma.
+   */
+  tag?: string | readonly string[];
+  /** E ou OU entre as etiquetas escolhidas (#1274). `e` é o padrão. */
+  tagMode?: ModoDeEtiqueta;
+  /** A aba "Grupos" do inbox (Task 10). Ausente = sem filtro, mostra tudo. */
+  is_group?: boolean;
 }
 
 interface ListResponse {
@@ -101,15 +120,46 @@ interface ListResponse {
   meta?: { cursor?: string | null; has_more?: boolean };
 }
 
+/**
+ * A TROCA DE CHAVE QUE É A MESMA LISTA (#2366): os dois lados são a Fila e só o
+ * `comando` mudou — é o `automatico-ativo` respondendo (`comandosDaFila`), não
+ * uma escolha de quem usa a tela. Qualquer outra troca (aba, busca, etiqueta,
+ * canal) é OUTRA lista, e mostrar a anterior enquanto a nova carrega põe na
+ * tela linhas que não são da aba — clicáveis, e numeradas como Fila.
+ */
+export function soMudouOAutomaticoDaFila(
+  anterior: ConversationsFilters,
+  atual: ConversationsFilters,
+): boolean {
+  const { comando: _comandoAnterior, ...restoAnterior } = anterior;
+  const { comando: _comandoAtual, ...restoAtual } = atual;
+  return ehAFila(anterior) && ehAFila(atual) && hashKey([restoAnterior]) === hashKey([restoAtual]);
+}
+
 export function useConversationsRealtime(
   filters: ConversationsFilters,
   orgId: string | null,
+  /**
+   * A CHAVE AINDA NÃO É A DEFINITIVA (#2365) — `false` segura a consulta.
+   *
+   * A Fila monta o `comando` a partir de um fato org-wide ASSÍNCRONO
+   * (`/ai/automatico-ativo`). Consultar antes de o fato chegar era o que
+   * produzia DUAS buscas em série pela MESMA lista: a primeira saía com
+   * `aguardando`, a resposta do fato trocava a chave para
+   * `aguardando,automatico` e a primeira resposta era DESCARTADA — medido no
+   * trace do #2360 (run 37340942770): 1091ms + 896ms, com a lista fora da tela
+   * no meio. Segurar a consulta até a chave ficar pronta custa a espera do fato
+   * (a MESMA pergunta que a tela já faz, deduplicada pelo react-query) e devolve
+   * UMA requisição com o filtro definitivo.
+   */
+  habilitada = true,
 ) {
   const qc = useQueryClient();
   const queryKey = useMemo(() => ["conversations", filters] as const, [filters]);
 
   const query = useInfiniteQuery({
     queryKey,
+    enabled: habilitada,
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam }) => {
       const qs = new URLSearchParams();
@@ -130,7 +180,16 @@ export function useConversationsRealtime(
       if (filters.search) qs.set("search", filters.search);
       if (filters.unread) qs.set("unread", "true");
       if (filters.channel_session_id) qs.set("channel_session_id", filters.channel_session_id);
-      if (filters.tag) qs.set("tag", filters.tag);
+      // `append`, e não `set` (#1274): o filtro aceita várias etiquetas e cada
+      // uma viaja como um `tag` repetido — que é o que a rota lê com `getAll`.
+      for (const marcador of marcadoresEscolhidos(
+        typeof filters.tag === "string" ? [filters.tag] : (filters.tag ?? []),
+      ))
+        qs.append("tag", marcador);
+      // O `modo` só sai quando é `ou`: `e` é o padrão e não precisa viajar, e um
+      // `&modo=e` colado num link de hoje mudaria a URL sem mudar o sentido.
+      if (filters.tagMode === "ou") qs.set("modo", "ou");
+      if (filters.is_group !== undefined) qs.set("is_group", filters.is_group ? "true" : "false");
       if (pageParam) qs.set("cursor", pageParam);
       qs.set("limit", "50");
       try {
@@ -146,11 +205,27 @@ export function useConversationsRealtime(
     // chega de fora enquanto ninguém olha, e voltar para a aba é quando a
     // defasagem aparece. Segunda rede — a primeira é o Realtime.
     refetchOnWindowFocus: true,
+    // #2366 — A LISTA NÃO VOLTA AO SKELETON NUM REFETCH.
+    //
+    // A chave desta query muda depois de a primeira resposta chegar: quando
+    // `/ai/automatico-ativo` responde, `comandosDaFila` troca `aguardando` por
+    // `aguardando,automatico` e o react-query abre uma query NOVA, que nasce
+    // sem dado. Sem isto a primeira resposta é DESCARTADA, a tela cai no
+    // skeleton e um segundo GET sai ~2 s depois — medido no trace do #2360
+    // (run 37340942770): 1 a 3 s de tela vazia a cada carga do inbox.
+    //
+    // A lista anterior fica na tela até a chave nova responder (ou falhar) SÓ
+    // nessa troca (`soMudouOAutomaticoDaFila`). O `keepPreviousData` puro valia
+    // para toda troca de chave: trocar de aba ou de busca mostrava a lista
+    // anterior, sem aviso, enquanto a nova carregava. Nas outras trocas o
+    // `isLoading` volta e o skeleton aparece — ali ele tem o que dizer.
+    placeholderData: (anterior, queryAnterior) =>
+      queryAnterior && soMudouOAutomaticoDaFila(queryAnterior.queryKey[1], filters)
+        ? anterior
+        : undefined,
   });
 
-  const onChange = useCallback(() => {
-    qc.invalidateQueries({ queryKey: ["conversations"] });
-  }, [qc]);
+  const onChange = useCallback(() => agendarRecargaDasConversas(qc), [qc]);
 
   // G4-01 (visibility_mode): a subscription postgres_changes HERDA a RLS de
   // SELECT de `conversations` — o Supabase Realtime avalia as policies do usuário

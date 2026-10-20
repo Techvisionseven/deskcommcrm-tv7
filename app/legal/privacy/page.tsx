@@ -33,6 +33,14 @@ export default async function PrivacyPage() {
   );
   const t = (texto: string) => traduzir(texto, idioma);
 
+  // O vocabulário legal desta política é o do PAÍS da organização ativa
+  // (issue #2344): no Brasil "controlador", "CNPJ" e "LGPD"; em Portugal
+  // "responsável pelo tratamento" (RGPD art. 4.º, n.º 7), "NIPC" e "RGPD".
+  // Sem sessão ou com a coluna vazia vale o Brasil — o mesmo "vazio" da
+  // coluna `organizations.country`. Cada ramo é um literal em `t()`: chave de
+  // dicionário nas duas direções, nunca frase montada em runtime.
+  const ePortugal = (op.pais ?? "").trim().toUpperCase() === "PT";
+
   return (
     <>
       <header className="space-y-1">
@@ -43,13 +51,22 @@ export default async function PrivacyPage() {
       </header>
 
       <section className="space-y-2">
-        <h2 className="text-base font-semibold">{t("1. Quem é o controlador")}</h2>
+        <h2 className="text-base font-semibold">
+          {ePortugal ? t("1. Quem é o responsável pelo tratamento") : t("1. Quem é o controlador")}
+        </h2>
         <p>
-          {t("O controlador dos dados tratados aqui é")} <strong>{operador}</strong>
-          {op.cnpj ? ` (CNPJ ${op.cnpj})` : ""} —{" "}
-          {t(
-            "quem instalou e opera este sistema. Os autores do software não têm acesso a este servidor nem aos dados guardados nele, e não são controladores nem operadores desses dados.",
-          )}
+          {ePortugal
+            ? t("O responsável pelo tratamento dos dados tratados aqui é")
+            : t("O controlador dos dados tratados aqui é")}{" "}
+          <strong>{operador}</strong>
+          {op.cnpj ? ` (${ePortugal ? "NIPC" : "CNPJ"} ${op.cnpj})` : ""} —{" "}
+          {ePortugal
+            ? t(
+                "quem instalou e opera este sistema. Os autores do software não têm acesso a este servidor nem aos dados guardados nele, e não são responsáveis pelo tratamento nem operadores desses dados.",
+              )
+            : t(
+                "quem instalou e opera este sistema. Os autores do software não têm acesso a este servidor nem aos dados guardados nele, e não são controladores nem operadores desses dados.",
+              )}
         </p>
       </section>
 
@@ -94,7 +111,12 @@ export default async function PrivacyPage() {
           </li>
           <li>
             {t(
-              "quando o operador liga o Jev (desligado por padrão), a TypeSafe AI, nos Estados Unidos, que recebe cada mensagem do cliente, sozinha e já sem CPF, telefone e e-mail, para avaliar se ele está irritado, se a mensagem tenta manipular o atendimento automático e a qual área da empresa ela se destina;",
+              "quando o operador liga o Jev (desligado por padrão), a TypeSafe AI, nos Estados Unidos, que recebe cada mensagem do cliente, sozinha e já sem CPF, telefone e e-mail, para avaliar se ele está irritado, se a mensagem tenta manipular o atendimento automático, a qual área da empresa ela se destina, se ela pede para falar com uma pessoa ou para parar de receber mensagens e, quando ela responde a um follow-up, em qual das saídas do fluxo ela se encaixa;",
+            )}
+          </li>
+          <li>
+            {t(
+              "quando o operador cadastra uma chave de Mapas (desligado por padrão), o Google, que recebe as coordenadas da localização que o cliente compartilhou, para devolver a rua e a cidade aproximadas;",
             )}
           </li>
           <li>{t("o provedor de infraestrutura onde o servidor está hospedado.")}</li>
@@ -114,9 +136,13 @@ export default async function PrivacyPage() {
       <section className="space-y-2">
         <h2 className="text-base font-semibold">{t("6. Seus direitos")}</h2>
         <p>
-          {t(
-            "A LGPD garante a você confirmar se há tratamento, acessar seus dados, corrigir dados incompletos ou desatualizados, pedir anonimização ou eliminação, saber com quem foram compartilhados e revogar consentimento.",
-          )}
+          {ePortugal
+            ? t(
+                "O RGPD garante-lhe confirmar se há tratamento, aceder aos seus dados, corrigir dados incompletos ou desatualizados, pedir anonimização ou eliminação, saber com quem foram partilhados e retirar o consentimento.",
+              )
+            : t(
+                "A LGPD garante a você confirmar se há tratamento, acessar seus dados, corrigir dados incompletos ou desatualizados, pedir anonimização ou eliminação, saber com quem foram compartilhados e revogar consentimento.",
+              )}
         </p>
         <p>
           {t(
@@ -136,11 +162,17 @@ export default async function PrivacyPage() {
       </section>
 
       <section className="space-y-2">
-        <h2 className="text-base font-semibold">{t("8. Encarregado e contato")}</h2>
+        <h2 className="text-base font-semibold">
+          {ePortugal ? t("8. Encarregado da proteção de dados e contato") : t("8. Encarregado e contato")}
+        </h2>
         <p>
           {op.dpoEmail ? (
             <>
-              {t("Para exercer seus direitos ou tirar dúvidas sobre privacidade, fale com o encarregado de dados:")}{" "}
+              {ePortugal
+                ? t(
+                    "Para exercer seus direitos ou tirar dúvidas sobre privacidade, fale com o encarregado da proteção de dados:",
+                  )
+                : t("Para exercer seus direitos ou tirar dúvidas sobre privacidade, fale com o encarregado de dados:")}{" "}
               <a className="underline underline-offset-2" href={`mailto:${op.dpoEmail}`}>
                 {op.dpoEmail}
               </a>
@@ -148,11 +180,70 @@ export default async function PrivacyPage() {
             </>
           ) : (
             <>
-              {t(
-                "O operador ainda não publicou um endereço de contato do encarregado de dados nesta instalação. Os pedidos devem ser feitos pelos canais de atendimento da própria organização.",
-              )}
+              {ePortugal
+                ? t(
+                    "O operador ainda não publicou um endereço de contato do encarregado da proteção de dados nesta instalação. Os pedidos devem ser feitos pelos canais de atendimento da própria organização.",
+                  )
+                : t(
+                    "O operador ainda não publicou um endereço de contato do encarregado de dados nesta instalação. Os pedidos devem ser feitos pelos canais de atendimento da própria organização.",
+                  )}
             </>
           )}
+        </p>
+      </section>
+
+      {/* A seção que o Google exige de todo app que pede acesso a dados de conta
+          Google: o que é lido, para quê, que não se vende nem treina modelo, o
+          selo de Uso Limitado e como desfazer. Cada frase aqui descreve o que o
+          código faz (escopos em `lib/agenda/google/oauth.ts` e
+          `lib/plataformas-de-anuncio/google/oauth.ts`) — acrescentar acesso novo
+          ao Google sem acrescentar a frase correspondente é descumprir a política
+          de dados de usuário do Google. */}
+      <section className="space-y-2" id="dados-do-google">
+        <h2 className="text-base font-semibold">{t("9. Dados do Google (Agenda, Meet e Google Ads)")}</h2>
+        <p>
+          {t(
+            "Quando uma pessoa autorizada da organização conecta uma conta Google a este sistema, os dados recebidos do Google são usados somente para a função que ela pediu:",
+          )}
+        </p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li>
+            <strong>{t("Google Agenda:")}</strong>{" "}
+            {t(
+              "mostrar a ocupação da agenda, criar, alterar e cancelar os agendamentos feitos pelo próprio usuário e evitar choque de horários. O sistema guarda no servidor do operador o título e o horário dos eventos para calcular a ocupação, e o cálculo de horários livres usa apenas o início, o fim e a situação deles. O sistema não lê e-mails.",
+            )}
+          </li>
+          <li>
+            <strong>{t("Google Meet:")}</strong>{" "}
+            {t(
+              "criar espaços de reunião do Google Meet quando a organização liga o Meet com acesso aberto; só o link gerado é devolvido pelo Google e guardado no servidor do operador para o convite.",
+            )}
+          </li>
+          <li>
+            <strong>{t("Google Ads:")}</strong>{" "}
+            {t(
+              "enviar ao Google Ads as vendas que um anúncio trouxe, para que ele aprenda com elas, criar e listar ações de conversão e ler as métricas das campanhas da própria conta de anúncios.",
+            )}
+          </li>
+        </ul>
+        <p>
+          {t(
+            "Os dados do Google ficam no servidor do operador, não são vendidos, não são usados para publicidade e não são usados para treinar modelos de inteligência artificial. O uso e a transferência das informações recebidas das APIs do Google seguem a Política de Dados de Usuário dos Serviços de API do Google, incluindo os requisitos de Uso Limitado.",
+          )}
+        </p>
+        <p>
+          {t(
+            "A conexão com a Agenda pode ser desfeita a qualquer momento em Agenda → Desconectar, e a do Google Ads é retirada pelo operador, a pedido. Em qualquer caso, a pessoa também pode revogar o acesso diretamente em",
+          )}{" "}
+          <a
+            className="underline underline-offset-2"
+            href="https://myaccount.google.com/permissions"
+            target="_blank"
+            rel="noreferrer"
+          >
+            myaccount.google.com/permissions
+          </a>
+          .
         </p>
       </section>
     </>

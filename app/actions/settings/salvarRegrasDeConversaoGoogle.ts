@@ -11,6 +11,7 @@
  * O `event_name` de uma etapa nasce uma vez (`Etapa:<uuid>`) e não muda; a
  * qualificação migrada da 0402 mantém `QualifiedLead`.
  */
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 import { supportWriteError } from "@/lib/impersonate/support";
 import { headers } from "next/headers";
 import { revalidatePath } from "next/cache";
@@ -18,7 +19,7 @@ import { z } from "zod";
 
 import { audit } from "@/lib/audit";
 import { loadAuthUser, mfaEmDivida, resolveActiveOrg } from "@/lib/auth/server";
-import { ROLE_RANK } from "@/lib/auth/types";
+import { podeAdministrarEmpresa } from "@/lib/auth/pode-administrar-empresa";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { eventoDaEtapa, VALORES_DE_CATEGORIA } from "@/lib/conversoes/regras-google";
 
@@ -73,10 +74,7 @@ export async function salvarRegrasDeConversaoGoogle(
   if (supportWriteError(authUser.support)) return { ok: false, error: "forbidden_role" };
   const activeOrg = await resolveActiveOrg(authUser);
   if (!activeOrg) return { ok: false, error: "forbidden_tenant" };
-  if (
-    !(authUser.is_platform_admin && !authUser.support) &&
-    ROLE_RANK[activeOrg.role] < ROLE_RANK.admin
-  ) {
+  if (!podeAdministrarEmpresa(authUser, activeOrg)) {
     return { ok: false, error: "forbidden_role" };
   }
   if (await mfaEmDivida()) return { ok: false, error: "mfa_required" };
@@ -164,7 +162,7 @@ export async function salvarRegrasDeConversaoGoogle(
     resourceType: "google_ads_conversion_rules",
     resourceId: null,
     requestId: hdrs.get("x-request-id") ?? undefined,
-    ip: hdrs.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined,
+    ip: ipDoCliente(hdrs) ?? undefined,
     userAgent: hdrs.get("user-agent") ?? undefined,
     metadata: {
       ligadas: ligadas.length,

@@ -12,12 +12,22 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
  * que vale agora, o que ela vira ao ligar o Jev (`ao_ligar`), se ela é nova —
  * começou sozinha e ninguém escolheu ainda — e a concordância dela com a IA de
  * sempre (`observacao`): a do clima, das notas em `messages.metadata`; a das
- * outras, de `jev_observacoes`. E o que a impede de rodar: `sem_camada`, a
- * tarefa acompanha uma camada de segurança que a organização desligou;
- * `sem_roteador`, a do roteador numa empresa sem roteador de intenção ativo.
+ * outras, de `jev_observacoes` — e, nas tarefas em cascata, que só são
+ * perguntadas onde a regra de hoje disse não, em quantas mensagens o Jev
+ * percebeu o pedido que ela não reconheceu (`percebidos`, uma linha de
+ * `jev_observacoes` por mensagem), com as conversas mais recentes. E o que a
+ * impede de rodar: `sem_camada`, a tarefa acompanha uma camada de segurança que
+ * a organização desligou; `sem_roteador`, a do roteador numa empresa sem
+ * roteador de intenção ativo; `sem_atendente`, as de pedido numa empresa em que
+ * o atendimento automático não roda em número nenhum (ninguém no ar sem pausa,
+ * ou o atendimento com um sistema de fora) — o worker só as pergunta onde ele
+ * roda; `sem_fluxo`, a do follow-up numa empresa sem follow-up publicado com o
+ * passo "Classificar (IA)" e sem inscrição andando numa versão que o tenha.
  *
  * PATCH liga, desliga, troca o modo do clima (`modo`, o nome da onda 1) e o
- * estado de uma tarefa (`tarefa` + `estado`). Ligar manda cada mensagem que o cliente
+ * estado de uma tarefa (`tarefa` + `estado` — na em cascata, `decidindo` é o
+ * "Avisar a equipe" da tela; na que só observa, `decidindo` é recusado com
+ * `jev_tarefa_so_observa`). Ligar manda cada mensagem que o cliente
  * escreve, uma de cada vez e sem o resto da conversa, a um fornecedor nos EUA, então exige chave validada e, na primeira
  * vez, o aceite explícito do administrador (LGPD, D6), que fica gravado com
  * quem e quando. O interruptor mora em `organizations.settings.jev`
@@ -28,7 +38,10 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { z } from "zod";
 
+import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
+import { llmEdgeConfigFromEnv, temIaDeSempre } from "@/lib/agent-engine/edge/llm/credentials";
 import { camadasEfetivas } from "@/lib/agent-engine/guardrails/camadas-da-org";
+import { haQuemAtendaAOrganizacao } from "@/lib/ai/agents/quem-atende-a-sessao";
 import { credencialEmUsoPeloJev, PROVEDOR_DO_JEV } from "@/lib/ai/decisao/credencial";
 import {
   ESTADO_DO_MODO,
@@ -41,29 +54,45 @@ import {
 } from "@/lib/ai/decisao/config";
 import { CHAVES_DO_CLIMA, type MotorDoClima } from "@/lib/ai/decisao/metadados-do-clima";
 import {
+  ORIGENS_DO_JEV,
+  provedorDaCredencial,
+  type OrigemDoJev,
+} from "@/lib/ai/decisao/origem";
+import {
   estadoAoLigar,
   estadoEfetivoDaTarefa,
   estadoGravadoDaTarefa,
+  rotuloDaChamadaDoJev,
   TAREFA_DO_CLIMA,
   TAREFAS_DO_JEV,
   tarefaEhNova,
+  algumFluxoQueClassifica,
   algumRoteadorQuePergunta,
+  INSCRICAO_ENCERRADA,
+  ROTEADOR_SOB_DEMANDA_SEM_IA,
   TAREFA_DA_MANIPULACAO,
+  tarefaSemAtendente,
   tarefaSemCamada,
+  tarefaSemFluxo,
   tarefaSemRoteador,
+  type SemAtendente,
 } from "@/lib/ai/decisao/tarefas";
 import { CODIGOS_SEM_REDE } from "@/lib/ai/decisao/textos";
 import { DEFAULT_CLASSIFIER_MODEL } from "@/lib/ai/gateway";
 import { resolverModeloDoPonto } from "@/lib/ai/gateway-binding";
-import { PROVEDORES_DE_DECISAO } from "@/lib/ai/pontos/provedores";
+import { REFERENCIAS_DE_AVISO } from "@/lib/ai/inbox-destino";
+import { PROVEDOR_POR_ID, PROVEDORES_DE_DECISAO } from "@/lib/ai/pontos/provedores";
 import { DEFAULT_SENTIMENT_THRESHOLD } from "@/lib/ai/prompts/sentiment";
 import { fail, ok } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { roleAtLeast } from "@/lib/auth/types";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { logger } from "@/lib/logger";
+import { aiDispatchModeSchema } from "@/lib/schemas/settings";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
+import { env } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -72,6 +101,8 @@ const [JEV] = PROVEDORES_DE_DECISAO;
 const DIAS_DOS_NUMEROS = 7;
 const DIAS_DA_CONCORDANCIA = 30;
 const MENSAGENS_COMPARADAS_MAX = 500;
+/** Quantas conversas o cartão oferece por tarefa em cascata — as mais recentes. */
+const CONVERSAS_PERCEBIDAS_MAX = 5;
 /** O teto de linhas por resposta do PostgREST (`max_rows` em `supabase/config.toml`). */
 const PAGINA = 1000;
 // ponytail: 50 páginas = 50 mil execuções do Jev numa semana; acima disso os
@@ -107,11 +138,27 @@ type Concordancia = {
   so_o_jev_alto?: number;
 };
 
+/**
+ * O que o cartão mostra de uma tarefa em cascata: em quantas MENSAGENS o Jev
+ * percebeu o pedido que a regra de hoje não reconheceu (a resposta dele passou
+ * do corte), e as conversas mais recentes delas. A unidade é a mensagem — uma
+ * linha de `jev_observacoes` por mensagem —, e não o pedido: o worker pergunta
+ * no `message.received`, antes da janela do turno, então duas frases naturais
+ * na mesma rajada contam duas, e a frase natural que chega antes de um pedido
+ * que a regra pega na mensagem seguinte conta uma. Por mensagem, as duas são
+ * verdade. O link sai pronto daqui: o navegador nunca monta endereço a partir
+ * de uma referência solta.
+ */
+type Percebidos = { dias: number; mensagens: number; conversas: Array<{ href: string; em: string }> };
+
 function porTarefa(
   c: ConfigDoJev,
   observacao: Readonly<Record<string, Concordancia>>,
+  percebidos: Readonly<Record<string, Percebidos>>,
   camadas: ReturnType<typeof camadasEfetivas>,
   temRoteadorQuePergunta: boolean,
+  semAtendente: SemAtendente | null,
+  temFluxoQueClassifica: boolean,
 ) {
   return TAREFAS_DO_JEV.map((t) => ({
     id: t.id,
@@ -122,12 +169,19 @@ function porTarefa(
     ao_ligar: estadoAoLigar(c, t),
     novo: tarefaEhNova(c, t),
     observacao: observacao[t.id] ?? null,
+    percebidos: percebidos[t.id] ?? null,
     // A camada de segurança que ela acompanha está desligada: o turno não
     // pergunta, e "observando" sem mais nada prometeria uma comparação que nunca vem.
     sem_camada: tarefaSemCamada(t, camadas),
     // Sem roteador ativo que o Jev possa perguntar (nenhum, ou sem intenções, ou
     // com mais do que cabe), "observando" prometeria uma comparação que nunca vem.
     sem_roteador: tarefaSemRoteador(t, temRoteadorQuePergunta),
+    // As de pedido, onde o atendimento automático não roda em número nenhum: o
+    // worker nunca as pergunta, e "Só observa" com "percebeu 0" mentiria.
+    sem_atendente: tarefaSemAtendente(t, semAtendente),
+    // A do follow-up sem follow-up publicado com o passo "Classificar (IA)":
+    // ninguém lê a resposta, e "observando" esperaria uma comparação que não vem.
+    sem_fluxo: tarefaSemFluxo(t, temFluxoQueClassifica),
   }));
 }
 
@@ -200,55 +254,86 @@ function numerosDaSemana(linhas: readonly LinhaDaSemana[]) {
       ? {
           motivo: falha.error_code,
           em: falha.created_at,
-          tarefa: TAREFAS_DO_JEV.find((t) => t.ponto === falha.purpose)?.rotulo ?? null,
+          tarefa: rotuloDaChamadaDoJev(falha.purpose),
         }
       : null,
   };
 }
 
 /**
- * A nota chamaria uma pessoa? O corte é `DEFAULT_SENTIMENT_THRESHOLD`
- * (`lib/ai/prompts/sentiment.ts:34`), o mesmo que `workers/ai-sentiment-worker.ts`
- * compara (`score < threshold`) para emitir `ai.sentiment_alert`.
- * ponytail: o limiar por agente (`config.sentiment_threshold`) não entra — não
- * tem tela que o grave hoje. Se ganhar, o worker passa a gravar o limiar usado
- * em `messages.metadata` e a conta lê de lá.
+ * O limiar COM O QUAL a nota foi cortada — lido da própria mensagem
+ * (`messages.metadata.sentiment_threshold`, que o worker passou a gravar na
+ * #2219), e não do fixo. É o `config.sentiment_threshold` do agente da
+ * conversa (tela desde o #2216): um agente em 0,1 tem a concordância dele
+ * medida contra 0,1. Mensagem antiga, gravada antes do #2219, não tem a chave:
+ * aí vale `DEFAULT_SENTIMENT_THRESHOLD`, o mesmo default do worker — e um valor
+ * fora da faixa 0–1 nunca corta no escuro.
  */
-const abaixo = (n: number) => n < DEFAULT_SENTIMENT_THRESHOLD;
+const limiarDa = (linha: { limiar?: unknown }): number =>
+  typeof linha.limiar === "number" && Number.isFinite(linha.limiar) && linha.limiar >= 0 && linha.limiar <= 1
+    ? linha.limiar
+    : DEFAULT_SENTIMENT_THRESHOLD;
+
+/** A nota chamaria uma pessoa? O worker decide por `score < limiar`. */
+const abaixo = (n: number, limiar: number) => n < limiar;
 
 /**
  * Concordância em observação: as duas notas caíram do MESMO LADO do corte que
  * decide a passagem para humano? É a pergunta que importa antes de deixar o Jev
- * decidir — "chamou uma pessoa quando a IA de sempre chamaria".
+ * decidir — "chamou uma pessoa quando a IA de sempre chamaria". O corte é o de
+ * CADA mensagem (o limiar por agente gravado na decisão), com o padrão como
+ * fallback para as antigas (issue #2219).
  */
-function concordancia(linhas: ReadonlyArray<{ nota: unknown; nota_do_jev: unknown }>): Concordancia {
+function concordancia(
+  linhas: ReadonlyArray<{ nota: unknown; nota_do_jev: unknown; limiar?: unknown }>,
+): Concordancia {
   const pares = linhas.flatMap((l) =>
     typeof l.nota === "number" && typeof l.nota_do_jev === "number"
-      ? [[l.nota, l.nota_do_jev] as const]
+      ? [[l.nota, l.nota_do_jev, limiarDa(l)] as const]
       : [],
   );
   return {
     dias: DIAS_DA_CONCORDANCIA,
     comparadas: pares.length,
-    concordaram: pares.filter(([ia, jev]) => abaixo(ia) === abaixo(jev)).length,
+    concordaram: pares.filter(([ia, jev, limiar]) => abaixo(ia, limiar) === abaixo(jev, limiar)).length,
   };
 }
 
 /**
- * "Clientes irritados percebidos": conversas em que a nota DO JEV ficou abaixo
+ * "Clientes irritados percebidos": conversas em que a nota DO Jev ficou abaixo
  * do corte da passagem para humano. A nota dele, e não a que decidiu: em
  * observação quem decide é a IA de sempre, e o número do cartão ficaria em zero
  * enquanto o Jev percebe a irritação do mesmo jeito. Conversa, e não mensagem:
  * o cliente irritado que manda três mensagens é um cliente.
  */
-function irritadosPercebidos(linhas: ReadonlyArray<{ conversa: unknown; nota_do_jev: unknown }>): number {
+function irritadosPercebidos(
+  linhas: ReadonlyArray<{ conversa: unknown; nota_do_jev: unknown; limiar?: unknown }>,
+): number {
   return new Set(
-    linhas.flatMap((l) => (typeof l.nota_do_jev === "number" && abaixo(l.nota_do_jev) ? [l.conversa] : [])),
+    linhas.flatMap((l) =>
+      typeof l.nota_do_jev === "number" && abaixo(l.nota_do_jev, limiarDa(l)) ? [l.conversa] : [],
+    ),
   ).size;
 }
 
 function configPublica(c: ConfigDoJev) {
-  return { ligado: c.ligado, modo: c.modo, aceite: c.aceite };
+  return { ligado: c.ligado, modo: c.modo, modo_roteador: c.modo_roteador, aceite: c.aceite };
+}
+
+/**
+ * O bloco do PROVEDOR que o cartão mostra. Na origem OpenRouter ele troca pelo
+ * cadastro da OpenRouter — rótulo, link e prefixo da chave (`PROVEDOR_POR_ID`) —
+ * porque a chave que o Jev reaproveita é a DE LÁ: mandar o link da TypeSafe a
+ * quem escolheu OpenRouter pediria a chave errada, que o caminho recusaria.
+ */
+function provedorPublico(origem: OrigemDoJev) {
+  const p = origem === "openrouter" ? (PROVEDOR_POR_ID.get("openrouter") ?? JEV) : JEV;
+  return {
+    rotulo: p.rotulo,
+    quandoUsar: p.quandoUsar,
+    ondePegarAChave: p.ondePegarAChave,
+    prefixoDaChave: p.prefixoDaChave,
+  };
 }
 
 function diasAtras(dias: number): string {
@@ -300,7 +385,9 @@ export async function GET(): Promise<Response> {
         .eq("tarefa", tarefa)
         .gte("created_at", desde);
     const porTarefa: Record<string, Concordancia> = {};
-    for (const t of TAREFAS_DO_JEV.filter((x) => x.id !== TAREFA_DO_CLIMA.id)) {
+    // As em cascata não têm concordância: por construção, a regra de hoje disse
+    // não em toda mensagem em que o Jev foi perguntado (`lerPercebidos`).
+    for (const t of TAREFAS_DO_JEV.filter((x) => x.id !== TAREFA_DO_CLIMA.id && x.familia !== "cascata")) {
       const daManipulacao = t.id === TAREFA_DA_MANIPULACAO.id;
       const [comparadas, concordaram, soDoJev] = await Promise.all([
         contar(t.id).not("concordou", "is", null),
@@ -320,13 +407,71 @@ export async function GET(): Promise<Response> {
     return { porTarefa, erro: null };
   };
 
-  const [orgRes, credsRes, semana, comparadasRes, iaDeSempre, percebidasRes, observacoes, camadasRes, roteadoresRes] = await Promise.all([
+  /**
+   * As tarefas em cascata: as mensagens em que o Jev percebeu o pedido (passou
+   * do corte) nos últimos 30 dias, contadas no banco, e as conversas das mais
+   * recentes. ponytail: as conversas saem das 50 linhas mais recentes; com mais
+   * de 50 mensagens seguidas da mesma conversa, as outras só aparecem depois.
+   */
+  const lerPercebidos = async (): Promise<{ porTarefa: Record<string, Percebidos>; erro: string | null }> => {
+    const desde = diasAtras(DIAS_DA_CONCORDANCIA);
+    const doJev = (tarefa: string) =>
+      db
+        .from("jev_observacoes")
+        .select("conversation_id, created_at", { count: "exact" })
+        .eq("organization_id", org.orgId)
+        .eq("tarefa", tarefa)
+        .eq("rotulo_jev", "sim")
+        .gte("created_at", desde)
+        .order("created_at", { ascending: false })
+        .limit(50);
+    const porTarefa: Record<string, Percebidos> = {};
+    for (const t of TAREFAS_DO_JEV.filter((x) => x.familia === "cascata")) {
+      const { data, count, error } = await doJev(t.id);
+      if (error) return { porTarefa, erro: error.message };
+      const conversas: Percebidos["conversas"] = [];
+      const vistas = new Set<string>();
+      for (const linha of data ?? []) {
+        if (linha.conversation_id === null || vistas.has(linha.conversation_id)) continue;
+        vistas.add(linha.conversation_id);
+        conversas.push({ href: REFERENCIAS_DE_AVISO.conversation.href(linha.conversation_id), em: linha.created_at });
+        if (conversas.length === CONVERSAS_PERCEBIDAS_MAX) break;
+      }
+      porTarefa[t.id] = { dias: DIAS_DA_CONCORDANCIA, mensagens: count ?? 0, conversas };
+    }
+    return { porTarefa, erro: null };
+  };
+
+  /**
+   * Há quem atenda, sem pausa, em algum número da organização? — o portão que
+   * o worker pergunta antes dos pedidos, sem fixar o número. `null` quando não
+   * deu para saber (sem `SUPABASE_DB_URL`, o banco fora): aí o cartão não
+   * afirma "Não roda" — dizer que algo está parado sem ter lido mandaria a
+   * pessoa consertar o que está funcionando.
+   */
+  const lerQuemAtende = async (): Promise<boolean | null> => {
+    try {
+      return await haQuemAtendaAOrganizacao(getRequestPool(), org.orgId);
+    } catch (erro) {
+      logger.warn("[ai/jev] não deu para saber se há quem atenda na organização", {
+        organization_id: org.orgId,
+        erro: erro instanceof Error ? erro.name : typeof erro,
+      });
+      return null;
+    }
+  };
+
+  const [orgRes, credsRes, semana, comparadasRes, iaDeSempre, percebidasRes, observacoes, percebidos, camadasRes, roteadoresRes, haQuemAtenda, fluxosRes, versoesEmCursoRes, roteadorTemIaDeSempre] = await Promise.all([
     db.from("organizations").select("settings").eq("id", org.orgId).maybeSingle(),
     db
       .from("ai_provider_credentials")
       .select("id, label, provider, is_active, validated_at, validation_error, created_at")
       .eq("organization_id", org.orgId)
-      .eq("provider", PROVEDOR_DO_JEV)
+      // Sem filtro por provedor DE PROPÓSITO: a origem escolhida decide qual
+      // provedor conta como "a chave do Jev", e o cartão também oferece
+      // reaproveitar a credencial OpenRouter da empresa — as duas se leem aqui,
+      // e a separação por provedor é feita em memória (evita uma segunda ida ao
+      // banco só para saber se a OpenRouter já tem chave).
       .eq("is_active", true),
     lerSemana(),
     // ponytail: `messages` não tem índice por (organização, data) — o plano lê
@@ -334,7 +479,12 @@ export async function GET(): Promise<Response> {
     // `metadata ? 'sentiment_jev_score'` (migration) quando pesar.
     db
       .from("messages")
-      .select(`nota:metadata->${CHAVES_DO_CLIMA.nota}, nota_do_jev:metadata->${CHAVES_DO_CLIMA.notaDoJev}`)
+      // `limiar` é o corte que valeu NAQUELA mensagem (o do agente da
+      // conversa, #2216): a concordância corta por ele, com o padrão como
+      // fallback para as mensagens anteriores ao #2219.
+      .select(
+        `nota:metadata->${CHAVES_DO_CLIMA.nota}, nota_do_jev:metadata->${CHAVES_DO_CLIMA.notaDoJev}, limiar:metadata->${CHAVES_DO_CLIMA.limiar}`,
+      )
       .eq("organization_id", org.orgId)
       .gte("created_at", diasAtras(DIAS_DA_CONCORDANCIA))
       .eq(`metadata->>${CHAVES_DO_CLIMA.motor}`, "llm" satisfies MotorDoClima)
@@ -350,13 +500,16 @@ export async function GET(): Promise<Response> {
     // disso a conta sai das mais recentes. O agregado em SQL é o passo seguinte.
     db
       .from("messages")
-      .select(`conversa:conversation_id, nota_do_jev:metadata->${CHAVES_DO_CLIMA.notaDoJev}`)
+      .select(
+        `conversa:conversation_id, nota_do_jev:metadata->${CHAVES_DO_CLIMA.notaDoJev}, limiar:metadata->${CHAVES_DO_CLIMA.limiar}`,
+      )
       .eq("organization_id", org.orgId)
       .gte("created_at", diasAtras(DIAS_DOS_NUMEROS))
       .not(`metadata->${CHAVES_DO_CLIMA.notaDoJev}`, "is", null)
       .order("created_at", { ascending: false })
       .limit(PAGINA),
     lerObservacoes(),
+    lerPercebidos(),
     db.from("org_guardrail_layers").select("layer, enabled").eq("organization_id", org.orgId),
     // Com a contagem das intenções: o roteador ativo sem nenhuma (o estado logo
     // depois de criar um) ou com mais do que cabe nunca é perguntado ao Jev.
@@ -365,6 +518,30 @@ export async function GET(): Promise<Response> {
       .select("id, intencoes:ai_router_members(count)")
       .eq("organization_id", org.orgId)
       .eq("is_active", true),
+    lerQuemAtende(),
+    // Os follow-ups publicados, com o grafo da versão ativa: é nele que se vê o
+    // passo "Classificar (IA)" (`algumFluxoQueClassifica`).
+    db
+      .from("followup_flow_pointers")
+      .select("versao:followup_flow_versions!followup_flow_pointers_active_version_id_fkey(graph)")
+      .eq("organization_id", org.orgId)
+      .eq("status", "active"),
+    // E as versões em que alguma inscrição ainda anda: o motor as leva ao passo
+    // mesmo com o follow-up desativado ou republicado sem ele — e cada resposta
+    // vai ao Jev. Sem elas, o cartão diria "Não roda" com dados saindo.
+    // ponytail: o `!inner` procura a inscrição viva por versão, sem índice em
+    // `version_id`; se pesar, um índice parcial nos status vivos.
+    db
+      .from("followup_flow_versions")
+      .select("graph, inscricoes:followup_enrollments!inner(id)")
+      .eq("organization_id", org.orgId)
+      .not("inscricoes.status", "in", INSCRICAO_ENCERRADA)
+      .limit(1, { referencedTable: "inscricoes" }),
+    // A IA de sempre do ROTEADOR é a pergunta do turno (`temIaDeSempre`), não a
+    // do clima: o cartão só oferece o Jev roteando sozinho onde ele teria a
+    // reserva (decisão B, doc 89). Nunca rejeita: na dúvida (até o pool que não
+    // abre, como em `lerQuemAtende`), diz que não tem — e o turno diz o mesmo.
+    (async () => temIaDeSempre(getRequestPool(), llmEdgeConfigFromEnv(env), org.orgId))().catch(() => false),
   ]);
 
   const erro =
@@ -374,21 +551,41 @@ export async function GET(): Promise<Response> {
     comparadasRes.error?.message ??
     percebidasRes.error?.message ??
     observacoes.erro ??
+    percebidos.erro ??
     camadasRes.error?.message ??
-    roteadoresRes.error?.message;
+    roteadoresRes.error?.message ??
+    fluxosRes.error?.message ??
+    versoesEmCursoRes.error?.message;
   if (erro) return fail("query_failed", erro, 500, { requestId });
 
+  const config = lerConfigDoJev(orgRes.data?.settings);
+  const { numeros, ultima_falha } = numerosDaSemana(semana.linhas);
+  // A ORIGEM é a primeira coisa que se resolve: ela escolhe qual credencial é
+  // "a chave do Jev" e qual bloco de provedor o cartão mostra.
+  const origem = config.origem;
   const credenciais = credsRes.data ?? [];
-  const emUso = credencialEmUsoPeloJev(credenciais);
+  const doProvedorDaOrigem = credenciais.filter((c) => c.provider === provedorDaCredencial(origem));
+  const emUso = credencialEmUsoPeloJev(doProvedorDaOrigem, origem);
   // Sem nenhuma validada, o cartão mostra a mais recente — é ela que tem o
   // motivo da recusa para explicar.
   const mostrada =
     emUso ??
-    [...credenciais].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0] ??
+    [...doProvedorDaOrigem].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0] ??
     null;
-
-  const { numeros, ultima_falha } = numerosDaSemana(semana.linhas);
-  const config = lerConfigDoJev(orgRes.data?.settings);
+  // A credencial OpenRouter da empresa, se houver uma validada: é o que o cartão
+  // oferece REAPROVEITAR em vez de exigir uma chave TypeSafe separada (issue
+  // #2947). Vale mesmo com a origem de hoje sendo a TypeSafe — é justamente o
+  // convite para trocar sem cadastrar nada.
+  const credencialOpenRouter = credencialEmUsoPeloJev(
+    credenciais.filter((c) => c.provider === provedorDaCredencial("openrouter")),
+    "openrouter",
+  );
+  // O dreno descarta o turno do modo externo antes de tudo (spec 14), e o
+  // worker não pergunta os pedidos ali — o mesmo `aiDispatchModeSchema`.
+  const externo =
+    aiDispatchModeSchema.parse((orgRes.data?.settings as { ai_dispatch_mode?: unknown } | null | undefined)?.ai_dispatch_mode) ===
+    "external";
+  const semAtendente: SemAtendente | null = externo ? "externo" : haQuemAtenda === false ? "ninguem_no_ar" : null;
   const linhasDoClima = comparadasRes.data ?? [];
   const doClima: Concordancia = {
     ...concordancia(linhasDoClima),
@@ -397,11 +594,18 @@ export async function GET(): Promise<Response> {
 
   return ok(
     {
-      provedor: {
-        rotulo: JEV.rotulo,
-        quandoUsar: JEV.quandoUsar,
-        ondePegarAChave: JEV.ondePegarAChave,
-        prefixoDaChave: JEV.prefixoDaChave,
+      provedor: provedorPublico(origem),
+      /**
+       * DE ONDE O JEV RESPONDE HOJE (`./origem`) e o que a empresa já tem para
+       * reaproveitar. `origem` é o valor gravado; `openrouter` diz se a
+       * credencial OpenRouter da empresa está validada — o cartão oferece
+       * trocar a origem sem cadastrar chave nova quando ela existe, e manda
+       * cadastrar quando não (issue #2947).
+       */
+      origem,
+      openrouter: {
+        disponivel: credencialOpenRouter !== null,
+        rotulo: credencialOpenRouter?.label ?? null,
       },
       chave: {
         existe: mostrada !== null,
@@ -415,10 +619,17 @@ export async function GET(): Promise<Response> {
       por_tarefa: porTarefa(
         config,
         { ...observacoes.porTarefa, [TAREFA_DO_CLIMA.id]: doClima },
+        percebidos.porTarefa,
         camadasEfetivas(camadasRes.data ?? []),
         algumRoteadorQuePergunta(roteadoresRes.data ?? []),
+        semAtendente,
+        algumFluxoQueClassifica([
+          ...(fluxosRes.data ?? []),
+          ...(versoesEmCursoRes.data ?? []).map((versao) => ({ versao })),
+        ]),
       ),
       tem_ia_de_sempre: iaDeSempre !== null,
+      roteador_tem_ia_de_sempre: roteadorTemIaDeSempre,
       numeros: {
         ...numeros,
         irritados: irritadosPercebidos(percebidasRes.data ?? []),
@@ -438,7 +649,15 @@ const corpoDoPatch = z
     ligado: z.boolean().optional(),
     /** O estado do clima, no nome da onda 1 — a imagem anterior também o entende. */
     modo: z.enum(["observacao", "decide"]).optional(),
-    /** A caixa marcada na tela. Só pesa ao ligar pela primeira vez. */
+    modo_roteador: z.enum(["comparacao", "sob_demanda"]).optional(),
+    /**
+     * DE ONDE O JEV RESPONDE (`./origem`): `typesafe` (o caminho de sempre) ou
+     * `openrouter` (a mesma chave da conversa). Trocar de origem troca a
+     * CREDENCIAL e o nome do modelo — o PATCH só aceita a troca com a
+     * credencial da origem nova já validada.
+     */
+    origem: z.enum(ORIGENS_DO_JEV).optional(),
+    /** A caixa marcada na tela. Pesa ao ligar pela primeira vez e ao trocar a origem para a OpenRouter. */
     aceite_lgpd: z.literal(true).optional(),
     tarefa: idDaTarefaSchema.optional(),
     estado: z.enum(ESTADOS_DA_TAREFA).optional(),
@@ -450,9 +669,17 @@ const corpoDoPatch = z
   .refine((c) => c.modo === undefined || c.tarefa === undefined, {
     message: "informe `modo` ou `tarefa`, não os dois",
   })
-  .refine((c) => c.ligado !== undefined || c.modo !== undefined || c.tarefa !== undefined, {
-    message: "informe `ligado`, `modo` ou `tarefa`",
-  });
+  .refine(
+    (c) =>
+      c.ligado !== undefined ||
+      c.modo !== undefined ||
+      c.modo_roteador !== undefined ||
+      c.origem !== undefined ||
+      c.tarefa !== undefined,
+    {
+      message: "informe `ligado`, `modo`, `modo_roteador`, `origem` ou `tarefa`",
+    },
+  );
 
 export async function PATCH(req: NextRequest): Promise<Response> {
   const supportDenied = await requireSupportWrite();
@@ -483,6 +710,62 @@ export async function PATCH(req: NextRequest): Promise<Response> {
   const atual = lerConfigDoJev(orgAtual?.settings);
 
   const mudanca: MudancaDaConfig = {};
+  if (corpo.origem !== undefined && corpo.origem !== atual.origem) {
+    // Trocar a origem troca a CREDENCIAL: a TypeSafe direto usa a chave do Jev;
+    // via OpenRouter, a credencial OpenRouter que a empresa já tem. Sem uma
+    // validada para a origem escolhida, o Jev pararia de responder — e a tela
+    // ficaria "ligada" sem chave. A troca é recusada com o caminho do conserto
+    // (o mesmo portão de `ligado: true`), em vez de gravar um estado que não
+    // funciona. Trocar para a origem que JÁ vale não é mutação (cai no
+    // `Object.keys(mudanca).length === 0` abaixo).
+    const { data: creds, error: credsErr } = await admin
+      .from("ai_provider_credentials")
+      .select("provider, is_active, validated_at, created_at")
+      .eq("organization_id", org.orgId)
+      .eq("provider", provedorDaCredencial(corpo.origem))
+      .eq("is_active", true);
+    if (credsErr) return fail("query_failed", credsErr.message, 500, { requestId });
+    if (credencialEmUsoPeloJev(creds ?? [], corpo.origem) === null) {
+      return fail(
+        "jev_exige_chave_validada",
+        corpo.origem === "openrouter"
+          ? t(
+              "Para o Jev responder pela OpenRouter, a chave da OpenRouter precisa estar cadastrada e conferida em Credenciais. É a mesma chave que a sua IA de conversa usa.",
+            )
+          : t("Para o Jev responder pela TypeSafe, cole a chave dele em Credenciais e espere o teste da chave passar."),
+        422,
+        { requestId },
+      );
+    }
+    // LGPD: o aceite gravado foi dado a um texto que nomeava só a TypeSafe AI.
+    // Pela OpenRouter a mensagem passa por mais um operador nos EUA, então a
+    // troca pede o aceite de novo — mesmo com o Jev desligado, porque religar
+    // não pergunta (D6). Sem aceite gravado, quem pergunta é o `ligado: true`.
+    if (corpo.origem === "openrouter" && atual.aceite !== null) {
+      if (corpo.aceite_lgpd !== true) {
+        return fail(
+          "jev_exige_aceite",
+          t(
+            "Pela OpenRouter, cada mensagem dos clientes vai, uma de cada vez e sem o resto da conversa, para a TypeSafe AI, pela OpenRouter, nos Estados Unidos. Para trocar, confirme que você está de acordo.",
+          ),
+          422,
+          { requestId },
+        );
+      }
+      mudanca.aceite = { ...atual.aceite, em: new Date().toISOString(), por: user.id };
+    }
+    mudanca.origem = corpo.origem;
+  }
+  if (corpo.modo_roteador !== undefined && corpo.modo_roteador !== atual.modo_roteador) {
+    // Decisão B (doc 89): sem a IA de sempre, o Jev não roteia sozinho. O turno
+    // confere de novo a cada mensagem; aqui a recusa é para a tela não gravar um
+    // modo que não valeria.
+    if (corpo.modo_roteador === "sob_demanda" &&
+      !(await temIaDeSempre(getRequestPool(), llmEdgeConfigFromEnv(env), org.orgId))) {
+      return fail("jev_sem_ia_de_sempre", t(ROTEADOR_SOB_DEMANDA_SEM_IA), 422, { requestId });
+    }
+    mudanca.modo_roteador = corpo.modo_roteador;
+  }
   // `modo` é o clima com o nome antigo: os dois pedidos chegam ao mesmo lugar.
   const pedido =
     corpo.tarefa !== undefined && corpo.estado !== undefined
@@ -490,6 +773,12 @@ export async function PATCH(req: NextRequest): Promise<Response> {
       : corpo.modo !== undefined
         ? { tarefa: TAREFA_DO_CLIMA.id, estado: ESTADO_DO_MODO[corpo.modo] }
         : null;
+  // A tarefa que só observa não tem o que decidir: aceitar o pedido gravaria um
+  // estado que o worker não obedece e que o cartão mostraria como "Só observa".
+  const soObserva = pedido ? TAREFAS_DO_JEV.find((x) => x.id === pedido.tarefa)?.soObserva : undefined;
+  if (pedido?.estado === "decidindo" && soObserva !== undefined) {
+    return fail("jev_tarefa_so_observa", t(soObserva), 422, { requestId });
+  }
   const estadoAnterior = pedido ? estadoGravadoDaTarefa(atual, pedido.tarefa) : undefined;
   if (pedido && pedido.estado !== estadoAnterior) mudanca.tarefas = { [pedido.tarefa]: pedido.estado };
   if (corpo.ligado === false && atual.ligado) mudanca.ligado = false;
@@ -498,10 +787,12 @@ export async function PATCH(req: NextRequest): Promise<Response> {
       .from("ai_provider_credentials")
       .select("provider, is_active, validated_at, created_at")
       .eq("organization_id", org.orgId)
-      .eq("provider", PROVEDOR_DO_JEV)
+      // A credencial da ORIGEM escolhida: TypeSafe direto, ou a OpenRouter que a
+      // empresa já tem (issue #2947).
+      .eq("provider", provedorDaCredencial(atual.origem))
       .eq("is_active", true);
     if (credsErr) return fail("query_failed", credsErr.message, 500, { requestId });
-    if (credencialEmUsoPeloJev(creds ?? []) === null) {
+    if (credencialEmUsoPeloJev(creds ?? [], atual.origem) === null) {
       return fail(
         "jev_exige_chave_validada",
         t("Para ligar o Jev, cole a chave dele em Credenciais e espere o teste da chave passar."),
@@ -548,7 +839,11 @@ export async function PATCH(req: NextRequest): Promise<Response> {
           ? "ai.jev.desligado"
           : corpo.modo !== undefined
             ? "ai.jev.modo_alterado"
-            : "ai.jev.tarefa_alterada",
+            : mudanca.modo_roteador !== undefined
+              ? "ai.jev.modo_roteador_alterado"
+              : mudanca.origem !== undefined
+                ? "ai.jev.origem_alterada"
+                : "ai.jev.tarefa_alterada",
     organizationId: org.orgId,
     actorUserId: user.id,
     resourceType: "organization",
@@ -556,6 +851,14 @@ export async function PATCH(req: NextRequest): Promise<Response> {
     requestId,
     metadata: {
       modo: gravado.config.modo,
+      ...(mudanca.origem !== undefined ? {
+        origem: mudanca.origem,
+        origem_anterior: atual.origem,
+      } : {}),
+      ...(mudanca.modo_roteador !== undefined ? {
+        modo_roteador: mudanca.modo_roteador,
+        modo_roteador_anterior: atual.modo_roteador,
+      } : {}),
       ...(gravado.config.modo !== atual.modo ? { modo_anterior: atual.modo } : {}),
       ...(mudanca.tarefas !== undefined && pedido
         ? { tarefa: pedido.tarefa, estado: pedido.estado, estado_anterior: estadoAnterior ?? null }

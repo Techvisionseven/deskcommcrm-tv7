@@ -6,7 +6,8 @@ import { type NextRequest } from "next/server";
 
 import { ApiError } from "@/lib/api/types";
 import { fail, ok } from "@/lib/api/wrappers";
-import { loadAuthUser, resolveActiveOrg } from "@/lib/auth/server";
+import { loadAuthUser } from "@/lib/auth/server";
+import { orgAtivaDaApi } from "@/lib/auth/require-role";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { listConversationsQuerySchema } from "@/lib/schemas";
 import { createClient } from "@/lib/supabase/server";
@@ -30,7 +31,9 @@ export async function GET(req: NextRequest): Promise<Response> {
 
   const authUser = await loadAuthUser();
   const t = (texto: string) => traduzir(texto, authUser?.idioma ?? "pt-BR");
-  const activeOrg = authUser ? await resolveActiveOrg(authUser) : null;
+  const ativa = await orgAtivaDaApi(authUser, requestId);
+  if (!ativa.ok) return ativa.response;
+  const activeOrg = ativa.org;
   if (!activeOrg) {
     return fail("no_active_org", t("No active organization."), 403, { requestId });
   }
@@ -54,10 +57,26 @@ export async function GET(req: NextRequest): Promise<Response> {
     // meio: `InboxFilters` mostra o select "Filtrar por tag" sempre que a org tem
     // vocabulário, o browser manda `?tag=vip`, e a lista voltava inteira, sem erro.
     // Achado por @jmpo, no cabeçalho do teste que ele escreveu no PR #199.
-    tag: url.searchParams.get("tag") ?? undefined,
+    //
+    // ⚠️ `getAll`, e não `get` (#1274): o filtro passou a aceitar VÁRIAS
+    // etiquetas, e a repetição na URL (`?tag=vip&tag=orçamento`) só existe para o
+    // `getAll`. Um `get` aqui leria só a PRIMEIRA e a tela mostraria uma escolha
+    // que a lista ignora — que é a MESMA classe de rotura silenciosa que a linha
+    // de cima documenta, e por isso a cerca `rota-le-todo-filtro-do-schema` cobre
+    // este filtro com a mesma regra.
+    tag: url.searchParams.getAll("tag"),
+    modo: url.searchParams.get("modo") ?? undefined,
     unread: url.searchParams.get("unread") ?? undefined,
     channel_session_id: url.searchParams.get("channel_session_id") ?? undefined,
+    // A aba "Grupos" (Task 10) — mesma rotura que `tag`/`comando` já tiveram
+    // aqui: schema aceita, hook serializa, handler filtra, e esta linha é o
+    // único lugar que pode esquecer sem erro nenhum. `rota-le-todo-filtro-do-schema`
+    // cobra a chave.
+    is_group: url.searchParams.get("is_group") ?? undefined,
     search: url.searchParams.get("search") ?? undefined,
+    // A cerca `rota-le-todo-filtro-do-schema` cobra a chave: schema aceita,
+    // rota lê, handler filtra. Esquecer aqui é invisível para todo gate de tipo.
+    contact_id: url.searchParams.get("contact_id") ?? undefined,
     cursor: url.searchParams.get("cursor") ?? undefined,
     limit: url.searchParams.get("limit") ?? undefined,
   });

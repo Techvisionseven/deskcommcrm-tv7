@@ -24,7 +24,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { TOOL_CATALOG } from "@/lib/mcp/tools/catalogo";
+import { TOOL_CATALOG, deModuloDesligado } from "@/lib/mcp/tools/catalogo";
 import { IDS_DO_HARNESS } from "@/lib/mcp/tools/ferramentas-do-harness";
 import {
   TETO_TOOLS_POR_AGENTE,
@@ -64,7 +64,12 @@ function toolsDoSeedDaSpec(): string[] {
  * já têm dono: entrada × handler em `catalogo-servido.test.ts`, e a lista de
  * harness em `capacidade-do-harness-nao-e-oferecida.test.ts`.
  */
-const CATALOGO_DA_TELA = TOOL_CATALOG.map((entrada) => ({
+const CATALOGO_DA_TELA = TOOL_CATALOG.filter(
+  // A spec roda numa instalação nova, sem módulo opcional instalado: a rota
+  // tira do catálogo servido o que é de módulo desligado (`deModuloDesligado`),
+  // e as capacidades de honorários (#1578) não entram na conta da tela.
+  (entrada) => !deModuloDesligado(entrada.name, []),
+).map((entrada) => ({
   ...entrada,
   marcavel: !IDS_DO_HARNESS.has(entrada.name),
 }));

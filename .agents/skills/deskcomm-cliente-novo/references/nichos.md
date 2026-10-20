@@ -172,6 +172,114 @@ grátis a partir de X. **Teste**: "tem o {produto} no tamanho M?", "quanto fica 
 
 ---
 
+## Escritório de advocacia
+
+**Funil "Consultas"**: Novo contato → Já respondi → Entendendo o caso → Consulta agendada →
+Consulta realizada → Contrato assinado (ganhou) → Não avançou (perdeu). **Vocabulário**:
+cliente = *cliente*, negócio = *caso*, ganhou = *contrato assinado*, perdeu = *não avançou*.
+
+**Prompt (preencha):**
+
+```markdown
+# Quem você é
+Você atende quem procura {escritório}, especializado em {área(s) do direito}. Seu nome é
+{nome}. Fale com clareza e sem juridiquês; quem escreve muitas vezes está preocupado ou
+inseguro sobre uma situação pessoal.
+
+# O que você faz primeiro
+Antes de oferecer qualquer coisa, entenda, uma pergunta por vez:
+- Qual é a situação, em poucas palavras?
+- Quando aconteceu (ou quando terminou, se for vínculo empregatício)?
+- Já existe processo aberto sobre isso, ou é a primeira vez que procura orientação?
+- Tem documentos à mão que ajudem a entender o caso?
+
+# Como você decide o próximo passo
+- Situação identificada e dentro da área que {escritório} atende: ofereça horário de consulta
+  inicial e confirme nome completo e telefone.
+- Prazo apertado, situação em andamento (risco, urgência) ou pedido explícito de urgência:
+  ofereça o horário mais próximo disponível E chame uma pessoa da equipe agora — isso não
+  espera a data marcada.
+- Fora da área de atuação do escritório: diga com educação que não atuam nisso e, se souber,
+  oriente o tipo de profissional que ajudaria.
+
+# Situações
+- "Quanto eu tenho direito a receber?" / "vou ganhar a causa?": não estime valor nem chance —
+  isso é análise de caso; diga que o advogado avalia na consulta.
+- "Vou pensar": pergunte o que falta para decidir e ofereça registrar o horário sem compromisso.
+- Pergunta sobre prazo (prescrição, recurso): não afirme prazo específico — diga que quanto
+  antes melhor e ofereça o horário mais próximo.
+
+# Limites
+Você não dá parecer jurídico, não estima indenização ou valor de causa, não promete resultado
+de processo. Chama uma pessoa da equipe quando: urgência de prazo, situação de risco, ou
+pedido explícito de falar com um advogado.
+
+# Estilo
+Mensagens curtas, uma pergunta por vez, sem termos jurídicos sem explicação. Emoji: não.
+```
+
+**Atenção — três coisas que este nicho quebra se você copiar de outro sem ajustar:**
+
+1. **O gate jurídico fixo (G4) NÃO vale para o agente publicado — não planeje em cima dele.** Existe
+   um regex de termos jurídicos (`G4_LEGAL_REGEX` em `lib/ai/handoff/regex.ts`, aplicado por
+   `checkG4Legal`) que passa a conversa para humano antes de qualquer LLM, mas quem o chama é só o
+   worker **legado** (`workers/ai-response-worker.ts`). Esse worker só alcança o G4 quando a
+   organização não tem nenhum agente publicado, e nessa situação a IA já não responde
+   (`elegivelParaWorkerLegado()` em `lib/ai/agents/no-ar.ts` devolve `false` desde a v1.17.0). O
+   agente que você monta com esta skill é publicado e roda no agent-engine, que não chama o G4. Para
+   um escritório de advocacia, onde "advogado", "processo" e "justiça" são o vocabulário normal do
+   cliente, o que passa a conversa para humano no agente publicado é:
+   - **pedido explícito de pessoa** (`detectHumanHandoffRequest` em
+     `lib/agent-engine/agent/human-handoff.ts`): regex conservador e sempre ligado. Casa "falar com
+     um atendente/humano/pessoa/responsável"; **não** casa "falar com o advogado";
+   - **palavras de passagem do agente** (`handoff_keywords`, tela do agente › "Passar para uma
+     pessoa"; padrão "falar com humano", "atendente", "pessoa real"): comparação por trecho de
+     texto. Não acrescente "advogado" ou "processo" aqui neste nicho, senão quase toda conversa passa;
+   - **a ferramenta `request_human_handoff`**, que o próprio modelo aciona. A descrição dela
+     (`AGENT_TOOL_DEFS` em `lib/agent-engine/agent/inbound-turn.ts`) cita "questão
+     jurídica/financeira sensível", então o modelo pode passar a conversa por assunto jurídico. O
+     lugar de corrigir isso é o prompt: diga que, neste escritório, assunto jurídico é o atendimento
+     normal, e quando chamar a equipe (o exemplo acima faz isso). Desligar o interruptor "Deixar o
+     agente chamar uma pessoa…" desliga TODAS as passagens pedidas pelo modelo, não só as jurídicas.
+   Não existe hoje chave para desligar a passagem "por assunto jurídico" no agente publicado. Se o
+   escritório pedir isso, é questão de produto (issue), não algo para contornar com SQL.
+2. **"Agendar com o advogado responsável pela área" não é o agente escolhendo um nome** —
+   `crm_list_team_members` deliberadamente não devolve nome/e-mail ao modelo. O roteamento certo é
+   por **tipo de atendimento** (Agenda › Tipos de atendimento), um por área, cada um com
+   `default_owner_user_id` = o advogado daquela área; o agente lê `crm_list_event_types` e casa a
+   área diagnosticada com o tipo certo.
+3. **Sigilo profissional entre áreas não é resolvido pelo produto hoje.** `user_pipeline_access`
+   (permissão por pipeline) não está no MVP — qualquer `agent`/`manager` com acesso ao funil
+   "Consultas" enxerga os casos de todas as áreas, não só a sua. Avise o escritório disso antes de
+   publicar; não é algo para contornar com RLS/SQL fora de migration.
+
+**Campos do funil** (`Configurações › Funis` → campos personalizados, não pede migration):
+`area_direito` (select, com as áreas que o escritório atende), `urgencia` (select: Alta/Média/
+Baixa), `numero_processo` (text, se já houver processo aberto). `type: date` (ex. um prazo
+processual) pode virar alerta automático pelo gatilho de campo de data do funil já existente.
+
+**Agentes e roteador**: um agente resolve a maioria dos escritórios (uma área de atuação). Com
+mais de uma área (ex. trabalhista e cível), use o **Roteador de Intenção** — cada área um agente,
+prompt e tipo de atendimento padrão próprios; senão o mesmo agente tenta cobrir áreas que
+não conhece direito. **Follow-ups**: silêncio 24 h em "Entendendo o caso"; no-show de consulta
+agendada. **FAQ para pedir**: áreas que atendem de fato; se cobram pela consulta inicial e
+quanto; documentos que a pessoa deve levar; como funciona o processo, em linhas gerais; forma de
+cobrança (fixo x êxito), se aplicável. **Memória**: áreas que NÃO atendem; horário de
+atendimento; "sigilo profissional: nunca peça documento sensível por aqui, isso é na consulta".
+**Promessas**: valor da consulta inicial, se houver — nunca estimativa de indenização/êxito.
+**Capacidades**: vender (agenda, conhecimento, notas, funil) **+ a capacidade crítica "casos"
+ligada e explicada ao escritório** — é o que torna "urgência alta" acionável de verdade (abre
+fila humana), não um rótulo solto no lead. **Teste**: "fui demitido sem justa causa semana
+passada", "quanto eu tenho direito a receber?", "sofri um acidente e estou afastado do
+trabalho", "quero falar direto com o advogado", pergunta fora da área que o escritório atende.
+
+*Nuance fora da doutrina do CRM, mas que vale avisar quem monta o prompt:* a OAB restringe
+captação de clientela e proíbe prometer resultado em publicidade (Provimento 205/2021 e Código
+de Ética) — o escopo do prompt acima já evita isso, mas o advogado responsável deve revisar o
+texto final antes de publicar; o CRM não valida conteúdo jurídico.
+
+---
+
 ## Outro tipo de negócio (genérico)
 
 **Funil "Clientes"**: Novo contato → Já respondi → Entendendo a necessidade → Proposta enviada →

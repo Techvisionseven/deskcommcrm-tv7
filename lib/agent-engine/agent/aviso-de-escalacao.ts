@@ -50,7 +50,7 @@ import type {
 } from '@/lib/escalacao/passagem';
 
 import type { ChannelAdapter } from '../channel-adapter';
-import { runBeforeSend } from '../guardrails/before-send';
+import { runBeforeSend, type TipoDeEnvio } from '../guardrails/before-send';
 import type { LgpdInput } from '../guardrails/lgpd/legal-basis';
 import type { Logger } from '../obs/logger';
 
@@ -105,6 +105,20 @@ export interface AvisoDeEscalacaoOpts {
   agentId?: string | null;
   disclosureMode?: 'inject' | 'veto';
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * O TIPO do envio que este aviso É (#2112, coluna `before_send_traces.tipo_envio`).
+   *
+   * `resposta` (DEFAULT) = o aviso responde a quem escreveu e pediu pessoa, que é
+   * o caso do turno de inbound/case — a janela que vale é a de `resposta_*` (0495).
+   * `disparo` = a escalação nasceu DENTRO de um follow-up: ali ninguém escreveu
+   * nada agora, é retomada, e a janela que vale é a de `window_*`. Com a janela de
+   * resposta mais estreita que a de disparo, o `resposta: true` fixo vetava pelo
+   * lado errado e o trace registrava um veto que a janela de disparo não daria.
+   *
+   * Default `resposta` de propósito: todo chamador que hoje não declara origem é o
+   * caminho de resposta (#1984), e omitir o campo não pode abrir o disparo.
+   */
+  origem?: TipoDeEnvio;
 }
 
 /**
@@ -152,6 +166,14 @@ export async function avisarLeadDaEscalacao(
       channelSessionId: ids.channelSessionId,
       body,
       optedOutThisTurn: opts.optedOutThisTurn,
+      // O TIPO do envio decide qual janela o gate avalia (#2112): `resposta_*`
+      // (0495) quando o aviso responde a quem escreveu e pediu pessoa, e
+      // `window_*` quando ele nasce dentro de um follow-up (`origem: 'disparo'`)
+      // — retomada, não resposta. O `true` fixo de #1984 estava certo para o
+      // turno de inbound e ERRADO para o follow-up: com a janela de resposta mais
+      // estreita que a de disparo, o aviso de quem pediu pessoa dentro de um
+      // disparo era vetado pela janela de quem não escreveu nada.
+      resposta: opts.origem !== 'disparo',
       // Ver `GateContext.spinningEnforced`: com o gate armado, a terceira pessoa
       // a ser escalada na mesma janela do número receberia silêncio — pelo
       // guardrail. Este é o ÚNICO chamador que o desarma.
@@ -277,4 +299,71 @@ export async function avisarLeadLendoOContato(
     optedOutThisTurn,
     ...(lgpd !== undefined ? { lgpd } : {}),
   });
+}
+
+/**
+ * ═══ O LEAD É AVISADO UMA VEZ — nem zero, nem duas ═══
+ *
+ * A tool `request_human_handoff` (`inbound-turn.ts`) só manda o aviso de código
+ * quando o modelo não disse nada ao lead no turno: é o PISO que garante que
+ * ninguém fica falando com o vazio. "Disse" é lido no contador `seq` do turno,
+ * que só anda no envio FÍSICO — no fim da cadeia `before_send`, depois do
+ * classificador semântico, do lock do número e do throttle.
+ *
+ * O buraco é o paralelismo. O AI SDK executa as ferramentas de UM passo ao
+ * mesmo tempo (`Promise.all` em `executeTools`), e o modelo costuma dizer "vou
+ * passar para uma pessoa da equipe" e chamar a passagem NO MESMO PASSO. A
+ * passagem lia `seq === 0` enquanto a fala dele ainda estava na cadeia, e o
+ * cliente recebia as duas. Medido em produção em 2026-10-16: a fala do agente
+ * saiu às 18:13:28 (`seq` 1) e o aviso fixo dois segundos depois (`seq` 0), no
+ * MESMO job — repetindo o que o agente acabara de dizer, trocando "a senhora"
+ * por "você" e anunciando a uma cliente de vendas que ninguém estava disponível.
+ *
+ * O conserto não troca a régua (`seq`); muda QUANDO ela é lida. `acompanhar`
+ * envolve as ferramentas que falam com o lead e registra cada tentativa
+ * enquanto ela corre; `assentar` deixa as irmãs do mesmo passo começarem (uma
+ * volta do laço de eventos basta: dentro do SDK, até a `execute` delas é só
+ * microtarefa) e espera todas terminarem. Só então `seq` responde a pergunta
+ * certa: o modelo falou — ou tentou e foi vetado, e aí o piso fala por ele.
+ *
+ * Esperar a irmã é também a única ordem que funciona: a passagem grava
+ * `force_human`, que arma o `stopGate`, e passar na frente da fala do agente a
+ * vetaria no meio da cadeia.
+ */
+export interface FalaDoTurno {
+  /** Envolve a `execute` de uma ferramenta que fala com o lead. */
+  acompanhar<A extends unknown[], R>(
+    execute: (...args: A) => R,
+  ): (...args: A) => Promise<Awaited<R>>;
+  /** Espera as falas em curso no passo — inclusive as que mal começaram. */
+  assentar(): Promise<void>;
+}
+
+/** Uma por TURNO, como o `seq` que ela protege. */
+export function criarFalaDoTurno(): FalaDoTurno {
+  const emCurso = new Set<Promise<unknown>>();
+
+  function acompanhar<A extends unknown[], R>(
+    execute: (...args: A) => R,
+  ): (...args: A) => Promise<Awaited<R>> {
+    return (...args: A) => {
+      // Registrada ANTES do primeiro `await` da ferramenta: quem assentar
+      // depois desta linha já a enxerga.
+      const tentativa = (async (): Promise<Awaited<R>> => await execute(...args))();
+      emCurso.add(tentativa);
+      const sair = (): void => {
+        emCurso.delete(tentativa);
+      };
+      // A rejeição é de quem chamou a ferramenta (o SDK); aqui só se limpa.
+      tentativa.then(sair, sair);
+      return tentativa;
+    };
+  }
+
+  async function assentar(): Promise<void> {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    while (emCurso.size > 0) await Promise.allSettled([...emCurso]);
+  }
+
+  return { acompanhar, assentar };
 }

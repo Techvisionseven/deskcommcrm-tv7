@@ -58,6 +58,7 @@ import {
   type waitConfigSchema,
 } from "./graph-schema";
 import type { EnrollmentOutcome, EnrollmentStatus } from "./node-handlers";
+import type { BaseDaPausa } from "./pausa-de-reentrada";
 
 type ConditionConfig = z.infer<typeof conditionConfigSchema>;
 type Check = ConditionConfig["checks"][number];
@@ -87,7 +88,7 @@ export function opcoes<K extends string>(mapa: Record<K, string>): ReadonlyArray
  * `stage_id` (um UUID, veja `engine.ts` → `loadLeadFacts`), então um campo de
  * texto livre pede ao dono da clínica que digite um identificador interno.
  */
-export type TipoDeValor = "etapa" | "etiqueta" | "numero" | "texto";
+export type TipoDeValor = "etapa" | "etiqueta" | "numero" | "texto" | "dias";
 
 export interface CampoDeCondicao {
   rotulo: string;
@@ -99,6 +100,10 @@ export const CAMPOS_DA_CONDICAO: Record<CampoDaCondicao, CampoDeCondicao> = {
   tag: { rotulo: "Etiqueta do contato", tipoDeValor: "etiqueta" },
   steps_taken: { rotulo: "Passos já dados no fluxo", tipoDeValor: "numero" },
   last_outcome: { rotulo: "Desfecho do passo anterior", tipoDeValor: "texto" },
+  // O VALOR desta regra é um PRAZO EM DIAS, não uma data: a data mora no campo
+  // do negócio (`key`), e o que a tela pede é "quantos dias". Ver
+  // `condicao-por-data.ts`.
+  lead_date: { rotulo: "Data de um campo do negócio", tipoDeValor: "dias" },
 };
 
 // ─── condição: o par (campo, operador) ───────────────────────────────────
@@ -159,6 +164,18 @@ function passos(valor: string | number): string {
  * A frase de cada par. Ordem das chaves = ordem no seletor (o mais usado
  * primeiro), então mexer na ordem aqui mexe na tela.
  */
+const AVISO_DATA_PEDE_PRAZO =
+  "A regra de data compara um PRAZO EM DIAS, não um valor: use «já passou há» ou «falta».";
+
+/** "1 dia" / "3 dias" — a frase da regra de data é lida por quem monta o fluxo. */
+function diasEmPalavras(valor: string | number): string {
+  const n = Number(valor);
+  return Number.isFinite(n) && Math.abs(n) === 1 ? `${valor} dia` : `${valor} dias`;
+}
+
+const AVISO_SO_DATA =
+  "«já passou há» e «falta» existem só para a regra de data de um campo do negócio.";
+
 const COMPARADORES: Record<CampoDaCondicao, Record<OperadorDaCondicao, Comparador>> = {
   lead_stage: {
     eq: {
@@ -189,6 +206,18 @@ const COMPARADORES: Record<CampoDaCondicao, Record<OperadorDaCondicao, Comparado
       frase: (v) => `A etapa do lead é no máximo ${aspas(v)}`,
       oferecido: false,
       aviso: AVISO_SO_NUMERO,
+    },
+    passou_ha: {
+      rotulo: "já passou há",
+      frase: () => "A etapa do lead — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
+    },
+    falta_para: {
+      rotulo: "falta",
+      frase: () => "A etapa do lead — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
     },
   },
   tag: {
@@ -222,6 +251,18 @@ const COMPARADORES: Record<CampoDaCondicao, Record<OperadorDaCondicao, Comparado
       oferecido: false,
       aviso: AVISO_SO_NUMERO,
     },
+    passou_ha: {
+      rotulo: "já passou há",
+      frase: () => "A etiqueta do contato — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
+    },
+    falta_para: {
+      rotulo: "falta",
+      frase: () => "A etiqueta do contato — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
+    },
   },
   steps_taken: {
     gte: {
@@ -249,6 +290,18 @@ const COMPARADORES: Record<CampoDaCondicao, Record<OperadorDaCondicao, Comparado
       frase: (v) => `O número de passos contém ${aspas(v)}`,
       oferecido: false,
       aviso: AVISO_SO_TEXTO,
+    },
+    passou_ha: {
+      rotulo: "já passou há",
+      frase: () => "Os passos dados — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
+    },
+    falta_para: {
+      rotulo: "falta",
+      frase: () => "Os passos dados — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
     },
   },
   last_outcome: {
@@ -278,6 +331,66 @@ const COMPARADORES: Record<CampoDaCondicao, Record<OperadorDaCondicao, Comparado
       frase: (v) => `O desfecho do passo anterior é no máximo ${aspas(v)}`,
       oferecido: false,
       aviso: AVISO_SO_NUMERO,
+    },
+    passou_ha: {
+      rotulo: "já passou há",
+      frase: () => "O desfecho do passo anterior — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
+    },
+    falta_para: {
+      rotulo: "falta",
+      frase: () => "O desfecho do passo anterior — regra de data aplicada a campo que não é data",
+      oferecido: false,
+      aviso: AVISO_SO_DATA,
+    },
+  },
+  lead_date: {
+    passou_ha: {
+      rotulo: "já passou há",
+      frase: (v) =>
+        Number(v) === 0
+          ? "A data do campo é hoje ou já passou"
+          : `A data do campo já passou há ${diasEmPalavras(v)} ou mais`,
+      oferecido: true,
+    },
+    falta_para: {
+      rotulo: "falta",
+      frase: (v) =>
+        Number(v) === 0
+          ? "A data do campo é hoje ou ainda está por vir"
+          : `Falta ${diasEmPalavras(v)} ou mais para a data do campo`,
+      oferecido: true,
+    },
+    eq: {
+      rotulo: "é igual a",
+      frase: (v) => `A data do campo é igual a ${aspas(v)}`,
+      oferecido: false,
+      aviso: AVISO_DATA_PEDE_PRAZO,
+    },
+    neq: {
+      rotulo: "é diferente de",
+      frase: (v) => `A data do campo é diferente de ${aspas(v)}`,
+      oferecido: false,
+      aviso: AVISO_DATA_PEDE_PRAZO,
+    },
+    contains: {
+      rotulo: "contém",
+      frase: (v) => `A data do campo contém ${aspas(v)}`,
+      oferecido: false,
+      aviso: AVISO_DATA_PEDE_PRAZO,
+    },
+    gte: {
+      rotulo: "é pelo menos",
+      frase: (v) => `A data do campo é pelo menos ${aspas(v)}`,
+      oferecido: false,
+      aviso: AVISO_DATA_PEDE_PRAZO,
+    },
+    lte: {
+      rotulo: "é no máximo",
+      frase: (v) => `A data do campo é no máximo ${aspas(v)}`,
+      oferecido: false,
+      aviso: AVISO_DATA_PEDE_PRAZO,
     },
   },
 };
@@ -564,17 +677,35 @@ export const SITUACOES_DO_ACOMPANHAMENTO: Record<EnrollmentStatus, string> = {
   // precisa saber que este acompanhamento está vivo e só não fala agora.
   dormente: "Aguardando a data do retorno",
   paused_handoff: "Pausado — um humano assumiu",
+  // O mesmo rótulo da linha do tempo (`eventos-legiveis.ts`): os dois pararam o
+  // envio, mas por razões diferentes, e a diferença é o que quem lê precisa ver.
+  paused_manual: "Pausado por uma pessoa",
   coletando: "Coletando respostas do roteiro",
   completed: "Concluído",
   cancelled: "Cancelado",
   dead: "Parou por falha",
 };
 
-/** Como o acompanhamento terminou. Sem tradução em lugar nenhum do produto até aqui. */
+/**
+ * Como o acompanhamento terminou — na voz de quem opera o dossiê (#2014).
+ *
+ * Antes este mapa existia só para o teste. O desfecho agora sai por aqui na
+ * tela do dossiê, e o rótulo de `exhausted` diverge de `RESULTADOS_DO_FIM` de
+ * propósito: lá é a opção do nó final no construtor, sob contrato do e2e
+ * ("Esgotado"); aqui é como o operador lê o fim do acompanhamento.
+ *
+ * De onde `exhausted` vem, para o rótulo não afirmar mais do que o dado sabe:
+ * do nó Fim (que NASCE com `exhausted` — nodeVisuals.ts) ou de uma pergunta de
+ * coleta esgotada (atendimento.ts), sempre como a alternativa a `converted`.
+ * NÃO vem de esgotar as novas tentativas do motor: isso leva o enrollment a
+ * `status='dead'` (`markDead`, engine.ts) sem tocar em `outcome`. E não prova
+ * que o contato ficou calado — um fluxo pode chegar ao nó Fim padrão depois de
+ * uma resposta. Por isso "sem conversão", e não "sem resposta".
+ */
 export const DESFECHOS: Record<EnrollmentOutcome, string> = {
   converted: "Convertido",
   replied: "O contato respondeu",
-  exhausted: "Esgotado",
+  exhausted: "Encerrado sem conversão",
   opted_out: "Pediu para parar",
   handoff: "Passou para um humano",
 };
@@ -598,4 +729,14 @@ export const GATILHOS: Record<TipoDeGatilho, string> = {
   case_opened: "Quando o agente pede ajuda de um humano",
   inbound_after_silence: "Cliente voltou",
   conversation_end: "Fim da conversa",
+};
+
+/**
+ * De onde conta a pausa antes de o gatilho de silêncio recomeçar
+ * (`params.reentry_pause_basis`). A tela a oferece como um interruptor, mas o
+ * valor não pode chegar cru a quem lê o gatilho em outro lugar.
+ */
+export const BASES_DA_PAUSA_DE_REENTRADA: Record<BaseDaPausa, string> = {
+  ultima_mensagem: "Da última mensagem do cliente",
+  ultimo_envio: "Do último envio deste fluxo",
 };

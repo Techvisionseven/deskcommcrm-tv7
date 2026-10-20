@@ -13,10 +13,26 @@ import { autoriaDaMudanca } from "@/lib/operacao/autoria";
 import { updateWebhookSourceSchema } from "@/lib/schemas";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { opcaoSemAssinatura } from "@/lib/webhooks/assinatura-autorizacao";
 import { encryptWebhookSecret } from "@/lib/webhooks/secrets";
 import { traduzir } from "@/lib/i18n/dicionario";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * A frase de cada opção que exige assinatura (#2316).
+ *
+ * Literal e no arquivo, e não montada com `opcao`: a chave do dicionário de i18n
+ * é o TEXTO em português. Uma frase interpolada existiria só neste ponto do
+ * código e a varredura de tradução não a veria — a tela em espanhol mostraria
+ * português, e `i18n-espanhol-cobre-a-tela` só acusaria se alguém compusesse a
+ * string em JSX.
+ */
+const FRASE_DA_OPCAO_SEM_ASSINATURA = {
+  ai: "Configure a assinatura da fonte antes de autorizar IA. Para remover a assinatura, desligue primeiro a autorização de IA.",
+  update_lead:
+    "Configure a assinatura da fonte antes de deixar a integração atualizar o card. Para remover a assinatura, desligue primeiro a atualização pelo external_id.",
+} as const;
 
 interface RouteCtx {
   params: Promise<{ id: string }>;
@@ -50,12 +66,26 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
   const supabase = await createClient();
   const { data: existing, error: fetchErr } = await supabase
     .from("webhook_sources")
-    .select("id")
+    .select("id, authorize_ai_on_capture, update_existing_lead_on_capture, secret_encrypted")
     .eq("id", id)
     .eq("organization_id", activeOrg.orgId)
     .maybeSingle();
   if (fetchErr) return fail("internal_error", fetchErr.message, 500, { requestId });
   if (!existing) return fail("not_found", t("Fonte não encontrada."), 404, { requestId });
+
+  // As duas opções que dependem de prova de origem (#2316) recusam pelo mesmo
+  // lugar — e cada uma com a própria frase: uma mensagem só para as duas faria
+  // quem ligou a atualização de card ler "autorizar IA" e procurar o problema
+  // na tela errada.
+  const opcaoQuePedeAssinatura = opcaoSemAssinatura(existing, parsed.data);
+  if (opcaoQuePedeAssinatura) {
+    return fail(
+      "signature_required",
+      t(FRASE_DA_OPCAO_SEM_ASSINATURA[opcaoQuePedeAssinatura]),
+      422,
+      { requestId },
+    );
+  }
 
   // secret plaintext do input vira secret_encrypted (migration 0041); a coluna
   // em claro não existe mais. `secret: null` remove o segredo da fonte.
@@ -89,6 +119,7 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
     .from("webhook_sources")
     .update(patch)
     .eq("id", id)
+    .eq("organization_id", activeOrg.orgId)
     .select("*")
     .single();
   if (updErr) return fail("internal_error", updErr.message, 500, { requestId });

@@ -94,13 +94,56 @@ instrua_e_saia() {
   printf '\n' >&2
   c_ylw "⚠ $1"
   printf '\n' >&2
-  c_dim "  Para fazer à mão, no painel do Supabase:"
-  c_dim "    1. Authentication → URL Configuration"
-  c_dim "         Site URL:      ${APP_URL:-https://SEU_DOMINIO}"
-  c_dim "         Redirect URLs: ${APP_URL:-https://SEU_DOMINIO}/auth/confirm"
-  c_dim "    2. Authentication → Email Templates → Confirm signup / Reset password"
-  c_dim "         <a href=\"{{ .RedirectTo }}&token_hash={{ .TokenHash }}\">Confirmar</a>"
-  c_dim "         ⚠ o separador é & — um ? aqui quebra o link (vira ?type=x?token_hash=y)"
+  # O passo manual DEPENDE DA TOPOLOGIA — "no painel do Supabase" só existe na
+  # nuvem. A régua é a MESMA de `aviso_do_site_url` (_common.sh:585): o
+  # `SINGLE_SERVER=1` é o Supabase do próprio kit, `NEXT_PUBLIC_SUPABASE_URL` em
+  # `*.supabase.co` (ou vazia, topologia desconhecida) é a nuvem, e outra URL é
+  # um Supabase próprio. Sem este corte, quem tem o Supabase na VPS era mandado
+  # a um painel da nuvem onde o projeto dele não existe — e o caminho que vale
+  # ali (o `.env` do Supabase, ou o `update.sh` do kit) nunca aparecia.
+  local topologia
+  if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+    topologia="kit"
+  else
+    case "${NEXT_PUBLIC_SUPABASE_URL:-}" in
+      https://*.supabase.co*|"") topologia="nuvem";;
+      *) topologia="proprio";;
+    esac
+  fi
+  case "$topologia" in
+  kit)
+    # O Supabase é o do kit: os moldes moram no GoTrue desta VPS (gravados por
+    # `gravar_modelos_do_gotrue`, _common.sh — #2109) e o Site URL sai do `.env`
+    # do Supabase. Não há painel da nuvem a abrir.
+    local dir_sb
+    dir_sb="$(PROJECT_DIR="$PROJ_DIR" dir_do_supabase)"
+    c_dim "  Este Supabase é o do kit (na VPS) — o caminho é o do kit, não um painel:"
+    c_dim "    bash hostgator-setup-kit/update.sh   # grava os moldes no GoTrue e reinicia o auth"
+    c_dim "    Site URL / Redirect URLs, no .env do Supabase desta VPS (${dir_sb}/.env):"
+    c_dim "         SITE_URL:                 ${APP_URL:-https://SEU_DOMINIO}"
+    c_dim "         ADDITIONAL_REDIRECT_URLS: ${APP_URL:-https://SEU_DOMINIO}/auth/confirm"
+    c_dim "    (ao mudar o .env, recrie o auth; um restart não relê o .env: cd ${dir_sb} && docker compose up -d --no-deps auth)"
+    ;;
+  proprio)
+    # Supabase próprio FORA do kit: também não há painel da nuvem — a
+    # conferência é no `.env` DELE (mesmo texto de aviso_do_site_url).
+    c_dim "  Seu Supabase é próprio (não é da nuvem) — o caminho é o .env DELE:"
+    c_dim "    Site URL / Redirect URLs:"
+    c_dim "         SITE_URL:                 ${APP_URL:-https://SEU_DOMINIO}"
+    c_dim "         ADDITIONAL_REDIRECT_URLS: ${APP_URL:-https://SEU_DOMINIO}/auth/confirm"
+    c_dim "    ao mudar, recrie o auth dele: docker compose up -d auth (na pasta do Supabase)"
+    c_dim "    Modelos: aponte GOTRUE_MAILER_TEMPLATES_* para a rota do app, que resolve a marca pelo banco."
+    ;;
+  *)
+    c_dim "  Para fazer à mão, no painel do Supabase:"
+    c_dim "    1. Authentication → URL Configuration"
+    c_dim "         Site URL:      ${APP_URL:-https://SEU_DOMINIO}"
+    c_dim "         Redirect URLs: ${APP_URL:-https://SEU_DOMINIO}/auth/confirm"
+    c_dim "    2. Authentication → Email Templates → Confirm signup / Reset password"
+    c_dim "         <a href=\"{{ .RedirectTo }}&token_hash={{ .TokenHash }}\">Confirmar</a>"
+    c_dim "         ⚠ o separador é & — um ? aqui quebra o link (vira ?type=x?token_hash=y)"
+    ;;
+  esac
   printf '\n' >&2
   exit 0
 }
@@ -252,16 +295,50 @@ if [ -n "$RENDER_EM" ]; then
   c_grn "✓ modelos renderizados em $RENDER_EM (marca: $APP_NOME, accent: $ACCENT)"
   c_dim "  Isto e so o HTML renderizado -- NAO aponte GOTRUE_MAILER_TEMPLATES_* para estes arquivos."
   c_dim "  Num Supabase proprio, aponte para a rota do app, que resolve a marca pelo BANCO:"
-  c_dim "    GOTRUE_MAILER_TEMPLATES_CONFIRMATION=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/confirmation"
-  c_dim "    GOTRUE_MAILER_TEMPLATES_RECOVERY=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/recovery"
+  # No single-server o auth alcanca o app pela rede privada, nao pelo dominio
+  # publico (#2587) -- e quem grava e o update.sh.
+  if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+    c_dim "    GOTRUE_MAILER_TEMPLATES_CONFIRMATION=${BASE_INTERNA_DO_APP:-http://app:3000}/email-templates/confirmation"
+    c_dim "    GOTRUE_MAILER_TEMPLATES_RECOVERY=${BASE_INTERNA_DO_APP:-http://app:3000}/email-templates/recovery"
+  else
+    c_dim "    GOTRUE_MAILER_TEMPLATES_CONFIRMATION=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/confirmation"
+    c_dim "    GOTRUE_MAILER_TEMPLATES_RECOVERY=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/recovery"
+  fi
   exit 0
 fi
 
 # ── 3. Dá para subir? ──────────────────────────────────────────────────────
-[ -n "${SUPABASE_ACCESS_TOKEN:-}" ] || instrua_e_saia \
-  "sem SUPABASE_ACCESS_TOKEN — não dá para configurar os e-mails de acesso sozinho.
+# A TOPOLOGIA vem antes do token. O token (`sbp_...`) é da Management API da
+# NUVEM; perguntar por ele primeiro mandava quem tem o Supabase na própria VPS
+# buscar uma chave de outra conta, para um passo que ali não existe (medido
+# numa instalação single-server em 2026-10-07).
+#
+# Single-server: o Supabase é do kit, e o install-single-server.sh / update.sh
+# gravam os moldes direto no GoTrue (gravar_modelos_do_gotrue, _common.sh —
+# #2109). Aqui só conferimos que estão lá.
+if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+  env_sb="$(PROJECT_DIR="$PROJ_DIR" dir_do_supabase)/.env"
+  if [ -n "$(valor_do_env "$env_sb" GOTRUE_MAILER_TEMPLATES_CONFIRMATION)" ] \
+     && [ -n "$(valor_do_env "$env_sb" GOTRUE_MAILER_TEMPLATES_RECOVERY)" ]; then
+    c_grn "✓ Supabase desta VPS: os e-mails de acesso já usam os moldes do app (gravados no GoTrue)."
+  else
+    anota_pendencia "o GoTrue do Supabase desta VPS ainda não aponta para os moldes do app — rode: bash hostgator-setup-kit/update.sh"
+    c_ylw "⚠ o GoTrue do Supabase desta VPS ainda não aponta para os moldes do app."
+    c_dim "  Rode: bash hostgator-setup-kit/update.sh  (ele grava os moldes e reinicia o auth)"
+  fi
+  exit 0
+fi
+# Supabase próprio fora do kit: sem URL da nuvem, o token não serve para nada —
+# o passo abaixo (REF vazio) ensina a env do GoTrue. URL vazia segue pedindo o
+# token: ali não dá para saber a topologia.
+case "${NEXT_PUBLIC_SUPABASE_URL:-}" in
+  https://*.supabase.co*|"")
+    [ -n "${SUPABASE_ACCESS_TOKEN:-}" ] || instrua_e_saia \
+      "sem SUPABASE_ACCESS_TOKEN — não dá para configurar os e-mails de acesso sozinho.
     Pegue um token em https://supabase.com/dashboard/account/tokens, rode
     \`export SUPABASE_ACCESS_TOKEN=sbp_...\` e chame este script de novo."
+    ;;
+esac
 
 # O ref do projeto sai da URL: https://<ref>.supabase.co. Supabase PRÓPRIO
 # (self-hosted) não tem Management API nenhuma — e nesse caso o passo é por env

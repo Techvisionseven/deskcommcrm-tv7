@@ -34,6 +34,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { encryptWebhookSecret } from "@/lib/webhooks/secrets";
 import { basePublicaDaInstalacao } from "@/lib/webhooks/url-publica";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { traduzirLimiteDoPlano } from "@/lib/cobranca/limites";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -133,6 +134,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   // Reconectar por cima de um canal excluído RESSUSCITA a linha, e o token de
   // webhook é preservado para não invalidar o que já está colado do outro lado.
   const token = existente?.webhookPathToken ?? randomBytes(16).toString("hex");
+  // O nome do provedor só batiza a conexão; depois dela o nome é do operador
+  // (Renomear), e salvar a credencial de novo não o apaga.
+  const displayName = existente?.displayName || (v.displayName ?? PARTNER_CHANNEL_LABEL);
 
   const { error } = await savePartnerSession(admin, {
     organizationId: orgId,
@@ -142,15 +146,20 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     webhookPathToken: token,
     webhookSecretEncrypted: segredoCifrado,
     phoneNumber: v.phoneNumber ? `+${v.phoneNumber.replace(/\D/g, "")}` : null,
-    displayName: v.displayName ?? PARTNER_CHANNEL_LABEL,
+    displayName,
   });
-  if (error) return fail("internal_error", error, 500, { requestId });
+  if (error) {
+    // `savePartnerSession` devolve só a mensagem: é ela que carrega o limite do plano.
+    const limite = traduzirLimiteDoPlano(error, authz.user.idioma);
+    if (limite) return fail(limite.code, limite.message, 409, { requestId, details: limite.details });
+    return fail("internal_error", error, 500, { requestId });
+  }
 
   return ok(
     {
       connected: true,
       phone_number: v.phoneNumber ? `+${v.phoneNumber.replace(/\D/g, "")}` : null,
-      display_name: v.displayName ?? PARTNER_CHANNEL_LABEL,
+      display_name: displayName,
       quality_rating: v.qualityRating,
       webhook_url: urlDoWebhook(req, token),
       // Volta UMA vez, porque o operador precisa colá-lo no provedor.

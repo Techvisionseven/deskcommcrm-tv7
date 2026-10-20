@@ -17,7 +17,17 @@ interface ChannelKnobsRow {
   jitter_max_ms: number | null;
   window_start_hour: number | null;
   window_end_hour: number | null;
+  /** Janela da RESPOSTA do agente (0495). NULL = usa `window_*` (comportamento anterior). */
+  resposta_start_hour: number | null;
+  resposta_end_hour: number | null;
+  /** Números do atraso humano antes da 1ª bolha (0499). NULL = default (defaults.ts). */
+  atraso_notar_ms: number | null;
+  ms_por_caractere: number | null;
+  atraso_minimo_ms: number | null;
+  atraso_maximo_ms: number | null;
   allow_sunday: boolean | null;
+  /** Dias da prospecção (0642, `smallint[]`, 0=dom … 6=sáb). Coluna NOT NULL. */
+  prospeccao_dias: number[] | null;
   timezone: string | null;
   warmup_daily_caps: unknown; // jsonb — shape validado em parseWarmupCaps (nunca confiado)
   /** Nulo quando o número não tem linha em channel_knobs (o `left join` da leitura). */
@@ -71,6 +81,24 @@ export function parseWarmupCaps(value: unknown): WarmupStep[] | null {
   return steps.length > 0 ? steps : null;
 }
 
+/**
+ * Dias da prospecção vindos do banco (0642, `smallint[]`, 0=dom … 6=sáb).
+ * Fora do 0..6, duplicado ou vazio → null: o load cai na regra antiga
+ * (`allowSunday`), com warn — a mesma falha fechada do warm-up (nunca exceção
+ * no caminho de envio, nunca fila parada em silêncio por dado corrupto).
+ */
+export function parseDiasDaProspeccao(value: unknown): number[] | null {
+  if (!Array.isArray(value)) return null;
+  const dias = [
+    ...new Set(
+      value.filter(
+        (d): d is number => typeof d === "number" && Number.isInteger(d) && d >= 0 && d <= 6,
+      ),
+    ),
+  ].sort((a, b) => a - b);
+  return dias.length > 0 ? dias : null;
+}
+
 export interface ChannelPacingConfig {
   knobs: PacingKnobs;
   /** null = sem linha em channel_knobs → o engine trata como idade 0 (conservador). */
@@ -92,7 +120,9 @@ export async function loadChannelKnobs(
   // ainda precisa do fuso da empresa (`fusoDaJanela`). Uma ida ao banco só.
   const { rows } = await db.query<ChannelKnobsRow>(
     `select k.throttle_ms, k.jitter_max_ms, k.window_start_hour, k.window_end_hour,
-            k.allow_sunday, k.timezone, k.warmup_daily_caps, k.number_activated_at,
+            k.resposta_start_hour, k.resposta_end_hour,
+            k.atraso_notar_ms, k.ms_por_caractere, k.atraso_minimo_ms, k.atraso_maximo_ms,
+            k.allow_sunday, k.prospeccao_dias, k.timezone, k.warmup_daily_caps, k.number_activated_at,
             o.timezone as org_timezone
      from organizations o
      left join channel_knobs k
@@ -122,9 +152,34 @@ export async function loadChannelKnobs(
     knobs: {
       throttleMs: row.throttle_ms ?? PACING_DEFAULTS.throttleMs,
       jitterMaxMs: row.jitter_max_ms ?? PACING_DEFAULTS.jitterMaxMs,
+      atrasoNotarMs: row.atraso_notar_ms ?? PACING_DEFAULTS.atrasoNotarMs,
+      msPorCaractere: row.ms_por_caractere ?? PACING_DEFAULTS.msPorCaractere,
+      atrasoMinimoMs: row.atraso_minimo_ms ?? PACING_DEFAULTS.atrasoMinimoMs,
+      atrasoMaximoMs: row.atraso_maximo_ms ?? PACING_DEFAULTS.atrasoMaximoMs,
       windowStartHour: row.window_start_hour ?? PACING_DEFAULTS.windowStartHour,
       windowEndHour: row.window_end_hour ?? PACING_DEFAULTS.windowEndHour,
+      // `null` nestas duas = o número nunca foi configurado com janela de
+      // resposta própria, e aí vale a janela de DISPARO. Sem esse `??`, um clone
+      // que rodou a 0495 porém nunca gravou as colunas teria resposta bloqueada
+      // fora de 7h-22h (o default do arquivo), que é justamente o que ele já
+      // fazia — mas por outro caminho, e ninguém saberia dizer qual.
+      respostaStartHour: row.resposta_start_hour ?? row.window_start_hour ?? PACING_DEFAULTS.respostaStartHour,
+      respostaEndHour: row.resposta_end_hour ?? row.window_end_hour ?? PACING_DEFAULTS.respostaEndHour,
       allowSunday: row.allow_sunday ?? PACING_DEFAULTS.allowSunday,
+      // Dias próprios da prospecção (0642). Inválido/vazio cai na regra antiga
+      // (`allowSunday`), com warn — nunca fila parada em silêncio.
+      prospeccaoDias: (() => {
+        const dias = parseDiasDaProspeccao(row.prospeccao_dias);
+        if (dias) return dias;
+        if (row.prospeccao_dias !== null && row.prospeccao_dias !== undefined) {
+          logger?.warn('prospeccao_dias inválido em channel_knobs — usando a regra antiga', {
+            tenantId,
+            channelSessionId,
+          });
+        }
+        const domingo = row.allow_sunday ?? PACING_DEFAULTS.allowSunday;
+        return domingo ? [...PACING_DEFAULTS.prospeccaoDias] : [1, 2, 3, 4, 5, 6];
+      })(),
       timezone: fusoDaJanela(row.timezone, row.org_timezone),
       warmupDailyCaps,
     },
@@ -140,11 +195,17 @@ export async function loadPacingState(
   input: { now: Date; timezone: string; numberActivatedAt: Date | null },
 ): Promise<PacingState> {
   const dayStart = dayStartInTz(input.now, input.timezone);
+  // Dois subselects e não `max` + `count(*) filter`: com o filtro de data fora do
+  // WHERE, a agregação lia o histórico inteiro do número a cada envio, sob o lock.
+  // Assim os dois descem por `idx_pacing_ledger_session (org, sessão, sent_at desc)`:
+  // a última linha e só as linhas do dia. Mesmo molde de `ledger-supabase.ts`.
   const { rows } = await db.query<{ last_sent_at: Date | null; sent_today: string }>(
-    `select max(sent_at) as last_sent_at,
-            count(*) filter (where sent_at >= $3) as sent_today
-     from pacing_ledger
-     where organization_id = $1 and channel_session_id = $2`,
+    `select (select sent_at from pacing_ledger
+              where organization_id = $1 and channel_session_id = $2
+              order by sent_at desc limit 1) as last_sent_at,
+            (select count(*) from pacing_ledger
+              where organization_id = $1 and channel_session_id = $2
+                and sent_at >= $3) as sent_today`,
     [tenantId, channelSessionId, dayStart],
   );
   const row = rows[0];

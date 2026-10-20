@@ -6,6 +6,10 @@ const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   audit: vi.fn(),
   platform: vi.fn(),
+  catalogoDaConta: vi.fn(async (): Promise<Array<Record<string, unknown>>> => []),
+}));
+vi.mock("@/lib/ai/catalogo/modelos-da-assinatura", () => ({
+  listarModelosDaAssinaturaOuVazio: mocks.catalogoDaConta,
 }));
 vi.mock("@/lib/ai/agents/publish", () => ({ publishAgentVersion: mocks.publish }));
 vi.mock("@/lib/ai/agents/create-draft", () => ({ createMcpAgentDraft: mocks.create }));
@@ -114,6 +118,8 @@ function database() {
               model: "model-tools",
               credential_id: null,
               display_name: "Modelo configurado",
+              // A consulta agora traz a capacidade e o filtro é no código (#2931).
+              supports_tools: true,
             },
           ],
         };
@@ -333,7 +339,79 @@ describe("model and router prerequisites", () => {
   it("fails closed when there is no usable credential or platform key", async () => {
     mocks.platform.mockReturnValue(null);
     const db = { query: vi.fn().mockResolvedValue({ rows: [] }) } as unknown as pg.PoolClient;
-    await expect(resolveSetupModel(db, org)).rejects.toThrow("Configure uma chave");
+    await expect(resolveSetupModel(db, org, null, () => true)).rejects.toThrow("Configure uma chave");
+  });
+  // #2458: o modelo escolhido aqui é GRAVADO na versão. Um agente publicado com a
+  // assinatura do ChatGPT, com o módulo desligado, é pulado — e a escolha segue
+  // para a próxima credencial utilizável, em vez de recriar a assinatura.
+  it("skips a provider the installation does not offer and keeps choosing", async () => {
+    mocks.platform.mockReturnValue(null);
+    const db = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes("from ai_agents a"))
+          return {
+            rows: [
+              { provider: "openai-assinatura", model: "gpt-5.5", credential_id: "cred-assinatura", display_name: "GPT" },
+            ],
+          };
+        if (sql.includes("from organizations")) return { rows: [{ settings: {} }] };
+        if (sql.includes("from ai_provider_credentials"))
+          return { rows: [{ id: "cred-assinatura", provider: "openai-assinatura" }, { id: "cred-claude", provider: "anthropic" }] };
+        // Modelo para QUALQUER provedor: quem pula a assinatura é `oferece`, não o catálogo.
+        if (sql.includes("from ai_models"))
+          return {
+            rows: [
+              { model_id: `modelo-${String(params?.[0])}`, display_name: "M", is_default_for_provider: true, supports_tools: true },
+            ],
+          };
+        return { rows: [] };
+      }),
+    } as unknown as pg.PoolClient;
+    const semAssinatura = (id: string) => id !== "openai-assinatura";
+    expect(await resolveSetupModel(db, org, null, semAssinatura)).toMatchObject({
+      provider: "anthropic",
+      credential_id: "cred-claude",
+    });
+  });
+  // #2931: os modelos da assinatura não estão em `ai_models`; a capacidade vem
+  // da lista DA CONTA. Sem isto, a Prospecção nunca escolhia a assinatura.
+  it("reuses a published subscription agent when its model is in the account list", async () => {
+    mocks.platform.mockReturnValue(null);
+    mocks.catalogoDaConta.mockResolvedValueOnce([{ model_id: "gpt-da-conta", supports_tools: true }]);
+    const db = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("from ai_agents a"))
+          return {
+            rows: [
+              { provider: "openai-assinatura", model: "gpt-da-conta", credential_id: "cred-assinatura", display_name: null, supports_tools: null },
+            ],
+          };
+        return { rows: [] };
+      }),
+    } as unknown as pg.PoolClient;
+    expect(await resolveSetupModel(db, org, null, () => true)).toMatchObject({
+      provider: "openai-assinatura",
+      model: "gpt-da-conta",
+      credential_id: "cred-assinatura",
+    });
+  });
+  it("picks a subscription model from the account list, never from ai_models", async () => {
+    mocks.platform.mockReturnValue(null);
+    mocks.catalogoDaConta.mockResolvedValueOnce([{ model_id: "gpt-da-conta", supports_tools: true }]);
+    const db = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("from organizations")) return { rows: [{ settings: {} }] };
+        if (sql.includes("from ai_provider_credentials"))
+          return { rows: [{ id: "cred-assinatura", provider: "openai-assinatura" }] };
+        if (sql.includes("from ai_models")) throw new Error("a assinatura não consulta ai_models");
+        return { rows: [] };
+      }),
+    } as unknown as pg.PoolClient;
+    expect(await resolveSetupModel(db, org, null, () => true)).toMatchObject({
+      provider: "openai-assinatura",
+      model: "gpt-da-conta",
+      credential_id: "cred-assinatura",
+    });
   });
   it("validates all replacement agents before deleting existing router members", async () => {
     const db = {

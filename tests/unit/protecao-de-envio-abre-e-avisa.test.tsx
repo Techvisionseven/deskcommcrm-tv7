@@ -84,9 +84,16 @@ function canal(over: Partial<ChannelSession> = {}): ChannelSession {
 const KNOBS: PacingKnobs = {
   throttleMs: 1_200,
   jitterMaxMs: 800,
+  atrasoNotarMs: 900,
+  msPorCaractere: 22,
+  atrasoMinimoMs: 1_200,
+  atrasoMaximoMs: 7_500,
   windowStartHour: 7,
   windowEndHour: 22,
+  respostaStartHour: 7,
+  respostaEndHour: 22,
   allowSunday: true,
+  prospeccaoDias: [0, 1, 2, 3, 4, 5, 6],
   timezone: "America/Sao_Paulo",
   warmupDailyCaps: [
     { minAgeDays: 0, cap: 20 },
@@ -111,6 +118,8 @@ function itemDePacing(over: Partial<PacingKnobsItem> = {}): PacingKnobsItem {
     defaults: KNOBS,
     bounds: {
       intervalMaxMs: 600_000,
+      msPorCaractereMax: 200,
+      atrasoMaximoMsMax: 60_000,
       hourLastStart: 23,
       hourEnd: 24,
       daily_limit: { min: 1, max: 2_000 },

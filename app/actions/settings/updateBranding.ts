@@ -3,9 +3,10 @@
 import { headers } from "next/headers";
 
 import { audit } from "@/lib/audit";
-import { requirePlatformAdmin } from "@/lib/auth/requirePlatformAdmin";
+import { escritaDeAdminOuRecusa } from "@/lib/auth/escritaDeAdminOuRecusa";
 import { invalidarMarcaDaInstalacao } from "@/lib/branding/instalacao";
 import { normalizarHex } from "@/lib/branding/rampa";
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 import { platformBrandingSchema, type PlatformBrandingInput } from "@/lib/schemas/settings";
 import { createAdminClient } from "@/lib/supabase/admin";
 
@@ -42,7 +43,7 @@ export type UpdateBrandingResult =
  * tabela não é tenant-aware — o filtro equivalente é `id = 1`, que a constraint
  * `platform_branding_singleton` torna o único valor possível.
  *
- * ── Por que `requirePlatformAdmin()` e não `loadAuthUser()` + a flag ─────────
+ * ── Por que `requirePlatformAdminEscrita()` e não `loadAuthUser()` + a flag ─────────
  *
  * Server Action NÃO é rota: não passa por `requireRole` (cujo `mfaEmDivida` tem
  * um call site só, `lib/auth/require-role.ts`, que serve apenas `/api/v1`) e não
@@ -53,13 +54,15 @@ export type UpdateBrandingResult =
  * por organização, aqui o banco NÃO tem como fechar o buraco — a escrita vai
  * pelo `service_role`, e o Postgres não enxerga o AAL de uma sessão do GoTrue.
  *
- * `requirePlatformAdmin()` já checa as três coisas (JWT, linha ativa em
+ * `requirePlatformAdminEscrita()` já checa as três coisas (JWT, linha ativa em
  * `platform_admins`, e `aal2` quando `mfa_required`) e é o MESMO gate do layout
  * de `/admin` — então, para quem chega pela tela, nada muda: essa pessoa já
  * passou por ele para ver o formulário. O que muda é o caminho que não passa
- * pela tela. Ele redireciona em vez de devolver `{ ok: false }`, e o formulário
- * não embrulha a chamada em `try/catch`, então o `NEXT_REDIRECT` sobe para o
- * runtime como deve.
+ * pela tela. Quem não é platform admin é redirecionado, e o formulário não
+ * embrulha a chamada em `try/catch`, então o `NEXT_REDIRECT` sobe para o runtime
+ * como deve. Só-leitura e MFA pendente voltam como `{ ok: false, error }` pelo
+ * `escritaDeAdminOuRecusa()`, para a tela dizer o motivo em vez de cair no
+ * error boundary.
  *
  * ── Por que NÃO emite `event_log` ───────────────────────────────────────────
  *
@@ -77,11 +80,13 @@ export async function updateBranding(
     return { ok: false, error: "validation_failed", details: parsed.error.flatten() };
   }
 
-  const { user: authUser } = await requirePlatformAdmin();
+  const escrita = await escritaDeAdminOuRecusa();
+  if (!escrita.ok) return escrita;
+  const { user: authUser } = escrita.ctx;
 
   const hdrs = await headers();
   const requestId = hdrs.get("x-request-id");
-  const ip = hdrs.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
+  const ip = ipDoCliente(hdrs);
   const userAgent = hdrs.get("user-agent") ?? null;
 
   const valores = {
@@ -92,6 +97,11 @@ export async function updateBranding(
     // dois passa pelo banco. Normalizar aqui é o que faz "mudou?" ser uma
     // pergunta com resposta — duas grafias da mesma cor mentiriam.
     accent_hex: parsed.data.accent_hex === null ? null : normalizarHex(parsed.data.accent_hex),
+    // Mesma normalização e MESMO CHECK da irmã (#2482): `#FFF` passa pelo
+    // domínio e não passa pelo banco, e normalizar aqui é o que faz "mudou?"
+    // ser uma pergunta com resposta.
+    accent_dark_hex:
+      parsed.data.accent_dark_hex === null ? null : normalizarHex(parsed.data.accent_dark_hex),
     show_powered_by: parsed.data.show_powered_by,
     // A linha passa a ser HUMANA. É o que impede a semeadura do `.env` de
     // reescrever a escolha no render seguinte — inclusive quando a escolha foi

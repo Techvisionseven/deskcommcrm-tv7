@@ -147,6 +147,15 @@ export interface SendInBubblesOpts<T extends BubbleOutcome = BubbleOutcome> {
    */
   antesDaPrimeira?: (primeiraBolha: string) => Promise<void>;
   /**
+   * A pausa antes de cada bolha SEGUINTE, dado o jitter anti-ban que ela já
+   * pagaria — o gancho da digitação da bolha (`criarPausaEntreBolhas`, em
+   * `atraso-humano.ts`). O laço dorme o MAIOR dos dois, nunca a soma: o
+   * anti-ban é piso aqui dentro, qualquer que seja o gancho.
+   *
+   * OPCIONAL — sem ele a pausa entre bolhas é só o jitter, como antes.
+   */
+  entreBolhas?: (proximaBolha: string, antiBanMs: number) => number;
+  /**
    * Quantas bolhas ainda cabem no teto de mensagens do turno (MAX_SENDS_PER_TURN).
    * Um parágrafo = uma bolha, então sem isto um único send_message de 7 parágrafos
    * sairia em 7 mensagens físicas, passando do teto que existe para barrar isso.
@@ -234,9 +243,15 @@ export async function sendInBubbles<T extends BubbleOutcome>(
   let last: T | undefined;
   for (let i = 0; i < bubbles.length; i++) {
     // Antes da 1ª: o atraso humano do turno. Entre as demais: o jitter anti-ban
-    // que já existia. Nunca os dois na mesma pausa.
+    // que já existia, esticado até a digitação da bolha quando há gancho.
+    // Nunca duas esperas somadas na mesma pausa.
     if (i === 0) await opts.antesDaPrimeira?.(bubbles[0]!);
-    else await opts.sleep(opts.jitter());
+    else {
+      const antiBan = opts.jitter();
+      await opts.sleep(
+        opts.entreBolhas ? Math.max(antiBan, opts.entreBolhas(bubbles[i]!, antiBan)) : antiBan,
+      );
+    }
     last = await opts.send(bubbles[i]!);
     if (!OK_KINDS.has(last.kind)) return last; // veto/bloqueio/falha: para aqui
   }

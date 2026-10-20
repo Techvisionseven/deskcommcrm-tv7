@@ -46,10 +46,34 @@
  * continua sendo o jitter anti-ban (1.2s + ≤800ms) que já existia — são coisas
  * diferentes com donos diferentes, e somá-las numa só apagaria o throttle que
  * protege o número de banimento.
+ *
+ * ─── E entre as bolhas, a digitação da SEGUINTE ─────────────────────────────
+ *
+ * Só o jitter entre bolhas era rápido demais: medido em produção (2026-10-16),
+ * uma resposta em três bolhas de 189, 187 e 84 caracteres chegou em 4,8s —
+ * 18:09:59, 18:10:01, 18:10:04. Ninguém digita 187 caracteres em 1,9s.
+ *
+ * `criarPausaEntreBolhas` dá a cada bolha seguinte o tempo de DIGITÁ-LA, na
+ * mesma taxa da 1ª e sem o `NOTAR`: quem escreve em bolhas não relê a conversa
+ * entre uma e outra. "A mesma taxa" é a EFETIVA da conexão — os knobs de
+ * `channel_knobs` (0499), com o default deste módulo onde não há valor —, e o
+ * mesmo vale para o piso e para o teto: uma conexão que configurou outro ritmo
+ * o recebe em toda bolha, não só na 1ª. A pausa é o MAIOR dos dois — anti-ban
+ * ou digitação —, nunca a soma: o anti-ban vira piso, intacto, e o cliente não
+ * espera duas vezes na mesma pausa.
+ *
+ * Esta pausa dorme onde o jitter já dormia: dentro do `send` da cadeia, com o
+ * lock do NÚMERO na mão (ver `runBeforeSend`, issue #654). Por isso ela tem
+ * dois tetos — por bolha e, somado, por turno —, e o que ela acrescenta ao
+ * jitter nunca passa de `ATRASO_EXTRA_ENTRE_BOLHAS_POR_TURNO_MS`. O resto da
+ * resposta segue no ritmo do anti-ban, que é o de antes.
  */
 import type { Logger } from '../obs/logger';
 
-/** Ver o cabeçalho: a parcela que não depende do tamanho do texto. */
+/**
+ * Ver o cabeçalho: a parcela que não depende do tamanho do texto.
+ * É o DEFAULT — quem configura por conexão (channel_knobs 0499) recebe outro.
+ */
 export const ATRASO_NOTAR_MS = 900;
 
 /** ≈45 caracteres/s — rápido de propósito; ver o cabeçalho. */
@@ -61,14 +85,89 @@ export const ATRASO_MINIMO_MS = 1200;
 /** Acima disto o silêncio lê como queda, não como digitação. */
 export const ATRASO_MAXIMO_MS = 7500;
 
+/** Os quatro números do atraso humano — o default é o do código de antes. */
+export interface AtrasoHumanoKnobs {
+  atrasoNotarMs?: number;
+  msPorCaractere?: number;
+  atrasoMinimoMs?: number;
+  atrasoMaximoMs?: number;
+}
+
+/** Os quatro números com o default do módulo preenchido (NULL/ausente = valor de antes). */
+export function atrasoHumanoEfetivo(knobs: AtrasoHumanoKnobs | undefined): Required<AtrasoHumanoKnobs> {
+  return {
+    atrasoNotarMs: knobs?.atrasoNotarMs ?? ATRASO_NOTAR_MS,
+    msPorCaractere: knobs?.msPorCaractere ?? MS_POR_CARACTERE,
+    atrasoMinimoMs: knobs?.atrasoMinimoMs ?? ATRASO_MINIMO_MS,
+    atrasoMaximoMs: knobs?.atrasoMaximoMs ?? ATRASO_MAXIMO_MS,
+  };
+}
+
 /**
  * Quanto esperar antes de mandar `texto`, em ms. Pura — é o que a torna
- * testável sem relógio e sem canal.
+ * testável sem relógio e sem canal. `knobs` opcional: sem eles vale
+ * EXATAMENTE o comportamento histórico (regressão zero).
  */
-export function calcularAtrasoHumano(texto: string): number {
+export function calcularAtrasoHumano(texto: string, knobs?: AtrasoHumanoKnobs): number {
+  const ef = atrasoHumanoEfetivo(knobs);
   const comprimento = (texto ?? '').trim().length;
-  const bruto = ATRASO_NOTAR_MS + MS_POR_CARACTERE * comprimento;
-  return Math.min(ATRASO_MAXIMO_MS, Math.max(ATRASO_MINIMO_MS, bruto));
+  const bruto = ef.atrasoNotarMs + ef.msPorCaractere * comprimento;
+  return Math.min(ef.atrasoMaximoMs, Math.max(ef.atrasoMinimoMs, bruto));
+}
+
+/**
+ * Teto da digitação de UMA bolha seguinte (≈227 caracteres na taxa default).
+ * Abaixo do teto da 1ª: entre bolhas o cliente acabou de receber uma, e um
+ * silêncio longo depois dela lê como "parou no meio". Conexão com teto
+ * configurado MENOR que este (`atraso_maximo_ms`) usa o dela.
+ */
+export const ATRASO_ENTRE_BOLHAS_MAXIMO_MS = 5000;
+
+/**
+ * Quanto as bolhas seguintes de um turno podem esperar, SOMADAS, além do
+ * jitter anti-ban. É o teto do que esta pausa acrescenta à posse do lock do
+ * número (ver o cabeçalho) — por isso NÃO é knob da conexão: um ritmo lento
+ * configurado não pode virar lock do número segurado por mais tempo.
+ */
+export const ATRASO_EXTRA_ENTRE_BOLHAS_POR_TURNO_MS = 4000;
+
+/**
+ * O tempo de digitar uma bolha seguinte, em ms. Pura. Sem o `NOTAR` (ver o
+ * cabeçalho), na taxa e com o piso EFETIVOS da conexão — os mesmos da 1ª —, e
+ * com o teto de bolha (o menor entre `ATRASO_ENTRE_BOLHAS_MAXIMO_MS` e o teto
+ * da conexão). `knobs` omitido = os defaults do módulo.
+ */
+export function calcularDigitacaoDaBolha(texto: string, knobs?: AtrasoHumanoKnobs): number {
+  const ef = atrasoHumanoEfetivo(knobs);
+  const comprimento = (texto ?? '').trim().length;
+  return Math.min(
+    Math.min(ATRASO_ENTRE_BOLHAS_MAXIMO_MS, ef.atrasoMaximoMs),
+    Math.max(ef.atrasoMinimoMs, ef.msPorCaractere * comprimento),
+  );
+}
+
+/**
+ * A pausa antes de cada bolha SEGUINTE, com o saldo do turno — uma por TURNO,
+ * como `jaEsperouComoHumano`: um turno pode chamar `send_message` mais de uma
+ * vez, e o teto vale para a soma.
+ *
+ * `knobs` são os do atraso humano da CONEXÃO (os mesmos que `esperarComoHumano`
+ * recebe para a 1ª bolha); omitidos, valem os defaults.
+ *
+ * Recebe a bolha que vai sair e o jitter anti-ban sorteado para aquela pausa;
+ * devolve quanto esperar: o anti-ban, esticado até a digitação da bolha
+ * enquanto houver saldo. Nunca menos que o anti-ban.
+ */
+export function criarPausaEntreBolhas(
+  knobs?: AtrasoHumanoKnobs,
+  tetoExtraMs: number = ATRASO_EXTRA_ENTRE_BOLHAS_POR_TURNO_MS,
+): (bolha: string, antiBanMs: number) => number {
+  let saldo = Math.max(0, tetoExtraMs);
+  return (bolha, antiBanMs) => {
+    const extra = Math.min(saldo, Math.max(0, calcularDigitacaoDaBolha(bolha, knobs) - antiBanMs));
+    saldo -= extra;
+    return antiBanMs + extra;
+  };
 }
 
 export interface EsperaHumanaArgs {
@@ -78,6 +177,11 @@ export interface EsperaHumanaArgs {
   processamentoMs?: number;
   sleep: (ms: number) => Promise<void>;
   log: Logger;
+  /**
+   * Os quatro números do atraso por conexão (channel_knobs 0499). Omitir =
+   * comportamento histórico (defaults de atraso-humano.ts).
+   */
+  knobs?: AtrasoHumanoKnobs;
   /**
    * Acende o "digitando…" no aparelho do cliente. OPCIONAL: canal que não sabe
    * sinalizar presença simplesmente espera, e o ganho principal (não responder
@@ -101,7 +205,7 @@ export async function esperarComoHumano(args: EsperaHumanaArgs): Promise<number>
   const gasto = args.processamentoMs ?? 0;
   const ms = Math.max(
     0,
-    calcularAtrasoHumano(args.texto) - (Number.isFinite(gasto) ? Math.max(0, gasto) : 0),
+    calcularAtrasoHumano(args.texto, args.knobs) - (Number.isFinite(gasto) ? Math.max(0, gasto) : 0),
   );
 
   // O cliente já esperou o alvo: não acrescentar presença decorativa nem sleep.
@@ -143,4 +247,89 @@ export function acenderDigitando(sinalizarDigitando: () => Promise<void>, log: L
       error: err instanceof Error ? err.name : 'unknown',
     });
   });
+}
+
+/**
+ * De quanto em quanto tempo o "digitando…" é renovado enquanto o turno trabalha.
+ *
+ * O WhatsApp apaga o indicador sozinho depois de uns 25 segundos sem novo sinal.
+ * Medido numa VPS real: o turno levou 67s entre a mensagem do lead e a resposta
+ * (classificadores auxiliares + modelo + conferência de promessa), e o único
+ * sinal saía no meio dele — o cliente via o "digitando…" sumir e ficava olhando
+ * uma conversa parada, que é exatamente o "ninguém respondeu" que ele existe para
+ * evitar. 10s fica com folga dentro dos ~25s, e custa uma chamada leve ao canal.
+ */
+export const DIGITANDO_RENOVAR_MS = 10_000;
+
+/**
+ * Teto da renovação. Um turno que passou disto travou em algum lugar; manter o
+ * "digitando…" aceso para sempre mentiria ao cliente que alguém está escrevendo.
+ * Depois do teto o indicador apaga sozinho, como fazia antes desta renovação.
+ */
+export const DIGITANDO_TETO_MS = 120_000;
+
+export interface ManterDigitandoOpts {
+  renovarMs?: number;
+  tetoMs?: number;
+  /** Relógio e timers injetáveis — o que torna a função testável sem esperar de verdade. */
+  agora?: () => number;
+  setInterval?: (fn: () => void, ms: number) => unknown;
+  clearInterval?: (handle: unknown) => void;
+}
+
+/**
+ * Acende o "digitando…" AGORA e o renova até alguém chamar o `parar` devolvido
+ * (ou até o teto). É o `acenderDigitando` para o turno inteiro, e não só para o
+ * instante em que o modelo começa.
+ *
+ * Mesma disciplina de falha de `acenderDigitando`: nunca espera o canal, nunca
+ * rejeita. Só a PRIMEIRA recusa vira warn — o canal fora do ar recusaria a cada
+ * renovação, e uma linha a cada 10s sobre o mesmo enfeite seria ruído.
+ *
+ * O `parar` é idempotente: quem envia a 1ª bolha para a renovação (depois da
+ * mensagem, um "digitando…" novo leria como uma segunda resposta a caminho), e o
+ * `finally` do turno para de novo para cobrir o turno que termina sem enviar.
+ */
+export function manterDigitando(
+  sinalizarDigitando: () => Promise<void>,
+  log: Logger,
+  opts: ManterDigitandoOpts = {},
+): () => void {
+  const renovarMs = opts.renovarMs ?? DIGITANDO_RENOVAR_MS;
+  const tetoMs = opts.tetoMs ?? DIGITANDO_TETO_MS;
+  const agora = opts.agora ?? ((): number => Date.now());
+  const agendar = opts.setInterval ?? ((fn: () => void, ms: number): unknown => setInterval(fn, ms));
+  const cancelar = opts.clearInterval ?? ((h: unknown): void => clearInterval(h as NodeJS.Timeout));
+
+  let avisou = false;
+  const sinalizar = (): void => {
+    void sinalizarDigitando().catch((err: unknown) => {
+      if (avisou) return;
+      avisou = true;
+      log.warn('não consegui sinalizar "digitando" (segue o turno)', {
+        error: err instanceof Error ? err.name : 'unknown',
+      });
+    });
+  };
+
+  const inicio = agora();
+  let parado = false;
+  sinalizar();
+  const handle = agendar(() => {
+    if (parado) return;
+    if (agora() - inicio >= tetoMs) {
+      parar();
+      return;
+    }
+    sinalizar();
+  }, renovarMs);
+  // O timer não segura o processo do worker vivo num desligamento.
+  (handle as { unref?: () => void } | null)?.unref?.();
+
+  function parar(): void {
+    if (parado) return;
+    parado = true;
+    cancelar(handle);
+  }
+  return parar;
 }

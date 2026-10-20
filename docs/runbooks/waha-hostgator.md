@@ -41,7 +41,7 @@ owner: Rafael Melgaço
 ### 3.1 Acessar e endurecer SSH
 
 ```bash
-ssh root@<IP_DO_VPS>
+ssh -p 22022 root@<IP_DO_VPS>
 
 # usuário não-root
 adduser deskcomm
@@ -57,7 +57,7 @@ sed -i 's/#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 systemctl reload sshd
 ```
 
-A partir daqui: `ssh deskcomm@<IP>` + `sudo` para tudo.
+A partir daqui: `ssh -p 22022 deskcomm@<IP>` + `sudo` para tudo.
 
 ### 3.2 Instalar dependências
 
@@ -77,7 +77,7 @@ sudo usermod -aG docker deskcomm
 ```bash
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-sudo ufw allow 22/tcp
+sudo ufw allow 22022/tcp  # SSH da HostGator escuta na 22022
 sudo ufw allow 80/tcp     # certbot challenge
 sudo ufw allow 443/tcp
 sudo ufw enable
@@ -138,8 +138,8 @@ services:
       - "127.0.0.1:3000:3000"                             # bind localhost; Nginx termina TLS
     environment:
       WAHA_API_KEY: ${WAHA_API_KEY}                       # plaintext rotacionado
-      WHATSAPP_HOOK_URL: ${WAHA_WEBHOOK_BASE_URL}/api/v1/webhooks/waha
-      WHATSAPP_HOOK_HMAC: ${WAHA_HMAC_SECRET}
+      WHATSAPP_HOOK_URL: ${WAHA_WEBHOOK_URL}              # rota COM token — ver 5.2
+      WHATSAPP_HOOK_HMAC_KEY: ${WAHA_HMAC_SECRET}   # nome EXATO da doc do WAHA; sem o _KEY ele nunca assina
       WAHA_DEFAULT_ENGINE: NOWEB
       WAHA_DASHBOARD_ENABLED: "false"                     # sem dashboard em prod
 ```
@@ -152,9 +152,15 @@ services:
 
 ```bash
 WAHA_API_KEY=<plaintext gerado novo, 64 chars hex>
-WAHA_WEBHOOK_BASE_URL=https://<dominio-da-sua-instalacao-do-crm>
+WAHA_WEBHOOK_URL=https://<dominio-da-sua-instalacao-do-crm>/api/v1/webhooks/waha/<token-do-canal>
 WAHA_HMAC_SECRET=<32 bytes random distinto da api key>
 ```
+
+> **Rota com token, não a global.** A rota global (`/api/v1/webhooks/waha`, sem token)
+> só atende a rede interna da stack do CRM e responde 404 a quem chega pelo domínio.
+> WAHA em outro servidor entrega pela rota do canal: o `<token-do-canal>` é a coluna
+> `webhook_path_token` da linha do canal em `channel_sessions`. É uma URL por canal —
+> com mais de um número no mesmo WAHA, cada sessão precisa do seu webhook.
 
 ```bash
 chmod 600 /opt/deskcomm-waha/.env
@@ -314,14 +320,14 @@ As variáveis do CRM vivem no `.env` da instalação dele — não num painel. E
 ```
 WAHA_API_BASE_URL=https://waha.deskcomm.com.br
 WAHA_API_KEY=<mesmo plaintext do .env do VPS>
-WAHA_WEBHOOK_BASE_URL=https://<dominio-da-sua-instalacao-do-crm>
+WAHA_WEBHOOK_BASE_URL=http://app:3000
 WAHA_HMAC_SECRET=<mesmo do VPS>
 ```
 
 Env var é lida no boot: editar o `.env` não muda nada até os contêineres serem recriados.
 
 Não tente descobrir quais são eles com um `grep env_file`: esse grep não enxerga o
-serviço `waha` do compose, que recebe `WAHA_WEBHOOK_BASE_URL` e `WAHA_HMAC_SECRET` por
+serviço `waha` do compose, que recebe `WAHA_HMAC_SECRET` por
 interpolação (`${...}` dentro do bloco `environment:`), sem `env_file` nenhum — a
 resposta sai incompleta com cara de completa.
 

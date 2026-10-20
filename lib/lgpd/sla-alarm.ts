@@ -8,6 +8,19 @@
  *  - Sentry payload: zero PII — only ids, counts, thresholds.
  *  - DPO email: recipient address from DB column or env, never logged in plaintext.
  *  - request_payload.last_alarm_at updated as fire-once-per-24h dedup guard.
+ *
+ * ─── Língua do destinatário, e não país (issue #2347, itens 1 e 2) ──────────
+ *
+ * O e-mail fala com QUEM RECEBE. O `lang` do HTML e as frases saem da LÍNGUA do
+ * país (`PerfilDoPais.idioma`), não do código do país: Portugal falava português
+ * e mandava `lang="pt-BR"`, e o "Acesse:" — que só existe em português — sairia
+ * igual num país que não fale português. A LEI continua vindo do país
+ * (`noBrasil`): as duas coisas são ortogonais.
+ *
+ * O rodapé de fora do Brasil tem duas figuras. Antes de vencer o mês do
+ * art. 12.º, n.º 3, ele diz que o prazo interno é mais curto que o legal; depois
+ * de vencido, dizer isso faria o encarregado achar que ainda há folga, e ele
+ * passa a afirmar o vencimento.
  */
 
 import * as Sentry from "@sentry/nextjs";
@@ -18,6 +31,10 @@ import { sendEmail } from "@/lib/email/roteador";
 import { audit } from "@/lib/audit";
 import { env } from "@/lib/env";
 import { valorDaInstalacao } from "@/lib/instalacao/config";
+import { citacaoDaLei, PAIS_PADRAO, perfilDoPais, type PerfilDoPais } from "@/lib/legal/perfil-do-pais";
+import { traduzir } from "@/lib/i18n/dicionario";
+import { idiomaDoTexto } from "@/lib/i18n/idiomas";
+import { diasAtePrazo, diasDeAtraso, prazoEmBr } from "./sla";
 import type { LgpdRequest } from "./types";
 
 export type AlarmThreshold = "data_request_d5" | "redact_d10";
@@ -40,6 +57,14 @@ export interface TriggerSlaAlarmArgs {
    * pinta o botão — sem ela o alarme sairia com a cor de outro produto.
    */
   marca: MarcaDeSaida;
+  /**
+   * `organizations.country`, lido na MESMA consulta do watcher que já traz o
+   * encarregado — nenhuma leitura a mais por pedido. `null`/ausente = Brasil,
+   * com o texto de sempre. Fora do Brasil o alarme não afirma a LGPD (doc 88).
+   * Obrigatória de propósito: quem esquecer de passá-la recebe erro de tipo, e
+   * não o alarme brasileiro calado numa organização de Portugal.
+   */
+  country: string | null;
 }
 
 export interface TriggerSlaAlarmResult {
@@ -55,6 +80,8 @@ export async function triggerSlaAlarm(
   args: TriggerSlaAlarmArgs,
 ): Promise<TriggerSlaAlarmResult> {
   const { request, threshold, organizationDpoEmail, organizationName, marca } = args;
+  const perfil = perfilDoPais(args.country);
+  const noBrasil = perfil.codigo === PAIS_PADRAO;
 
   // ──────────────────────────────────────────────────────────────────────────
   // 1. 24-hour dedup guard
@@ -68,13 +95,26 @@ export async function triggerSlaAlarm(
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // 2. Compute days overdue (best-effort; MVP uses calendar days as approx)
+  // 2. Dias de atraso — contados em DIAS CIVIS, no eixo em que o prazo foi
+  //    contado. Ver `lib/lgpd/sla.ts`: `due_at` é a meia-noite UTC de um dia
+  //    útil, e o prazo vai até o FIM desse dia.
+  //
+  //    A versão anterior (`Math.round((now - due_at) / 86_400_000)`) errava por
+  //    dois motivos somados: media milissegundos — que a oeste de UTC já são o
+  //    dia seguinte — e arredondava meio dia para cima. Efeito medido em São
+  //    Paulo, prazo no dia 05/10: às 09h de 05/10 (12h UTC) o e-mail dizia
+  //    "1 dia(s) em atraso" ao lado de "o prazo vence em 04/10, 21:00" — dois
+  //    números que não podem estar certos ao mesmo tempo, e o primeiro é o que
+  //    o DPO lê.
   // ──────────────────────────────────────────────────────────────────────────
-  const dueAtMs = new Date(request.due_at).getTime();
-  const nowMs = Date.now();
-  const daysOverdue = Math.round((nowMs - dueAtMs) / 86_400_000);
+  // Um `Date` só para a passada inteira: `diasDeAtraso`, `diasAtePrazo` e a
+  // checagem do mês legal do RGPD (item 1 da #2347) leem o MESMO agora — duas
+  // leituras de relógio na virada do dia civil dariam números que não podem
+  // estar certos ao mesmo tempo.
+  const agora = new Date();
+  const daysOverdue = diasDeAtraso(request.due_at, agora);
 
-  const daysToDue = -daysOverdue; // negative = overdue
+  const daysToDue = diasAtePrazo(request.due_at, agora); // negativo = atrasado
 
   // ──────────────────────────────────────────────────────────────────────────
   // 3. Sentry warning — zero PII in payload
@@ -116,56 +156,129 @@ export async function triggerSlaAlarm(
       const shortId = request.id.slice(0, 8);
       const orgName = escapeHtml(organizationName || marca.nome);
       const appUrl = env.NEXT_PUBLIC_APP_URL;
-      const requestUrl = `${appUrl}/app/lgpd/requests/${request.id}`;
+      // Porta neutra, não `/app` nem o hub: a empresa pode ser suspensa ou
+      // reativada entre o envio e o clique, e quem decide é o clique
+      // (`app/lgpd/pedido/[id]/route.ts`).
+      const requestUrl = `${appUrl}/lgpd/pedido/${request.id}`;
 
-      const subject = `[LGPD] Solicitação ${shortId} próxima do vencimento`;
+      // O IDIOMA do DESTINATÁRIO, não o país (issue #2347, item 2): o `lang` do
+      // HTML e as frases do alarme saem da LÍNGUA que o país fala. Hoje o
+      // seletor só oferece Brasil e Portugal e os dois falam português — o que
+      // muda de imediato é o `lang` de Portugal, que era um `pt-BR` de mentira,
+      // e o "Acesse:", que só existe em português. O país continua decidindo a
+      // LEI (`noBrasil`): língua e lei são coisas ortogonais, e um país pode
+      // falar português sem ser o Brasil.
+      const idioma = perfil.idioma;
+      const t = (texto: string) => traduzir(texto, idiomaDoTexto(idioma));
+
+      // O Brasil fica byte a byte igual; fora dele, o rótulo não nomeia lei.
+      // `store_redact` é a Nuvemshop avisando que o lojista desinstalou o app
+      // (`webhooks/nuvemshop/store-redact`): não é pedido de titular, e o prazo
+      // do art. 12.º, n.º 3 do RGPD não o rege.
+      const daLoja = !noBrasil && request.request_type === "store_redact";
+      // `[LGPD]` fica em duro porque só sai no BRASIL, que é sempre `pt-BR` (a
+      // coluna vazia vale Brasil). Os rótulos de fora do Brasil saem pelo
+      // idioma: são texto ao destinatário, não citação de lei.
+      const etiqueta = noBrasil
+        ? "[LGPD]"
+        : daLoja
+          ? t("[Apagamento da loja]")
+          : t("[Pedido de titular]");
+      // Item 1 da #2347: passado o mês do art. 12.º, n.º 3, o rodapé não pode
+      // mais dizer que o prazo interno é "mais curto que o legal" — nesse ponto
+      // o prazo legal TAMBÉM venceu e a frase fazia parecer que havia folga.
+      const mesLegalVencido = mesLegalDoPedidoVencido(request.received_at, agora);
+      const rodapeForaDoBrasil = daLoja
+        ? t("Prazo interno do sistema.")
+        : prazoInternoForaDoBrasil(perfil, mesLegalVencido, t);
+      // O rótulo vem do PERFIL do país (issue #2344): o art. 18 da LGPD é um
+      // DIREITO do titular, não uma base legal. O Brasil declara "Direito
+      // exercido"; o `??` cobre só perfil construído à mão em teste.
+      const rotulo = perfil.lei?.rotuloNoDocumento ?? "Base legal";
+      const rodapeHtml = noBrasil
+        ? `${rotulo}: LGPD Lei nº 13.709/2018, Art. 18. SLA obrigatório conforme regulamentação vigente.`
+        : rodapeForaDoBrasil;
+      const rodapeTexto = noBrasil
+        ? `${rotulo}: LGPD Lei nº 13.709/2018, Art. 18.`
+        : rodapeForaDoBrasil;
+
+      const subject = `${etiqueta} ${t("Solicitação {id} próxima do vencimento").replace("{id}", shortId)}`;
 
       const thresholdLabel =
         threshold === "data_request_d5"
-          ? "D+5 (acesso a dados)"
-          : "D+10 (anonimização/exclusão)";
+          ? t("D+5 (acesso a dados)")
+          : t("D+10 (anonimização/exclusão)");
 
-      const dueFmt = new Date(request.due_at).toLocaleString("pt-BR", {
-        timeZone: "America/Sao_Paulo",
-        day: "2-digit",
-        month: "2-digit",
-        year: "numeric",
-      });
+      // A DATA vem do dia civil que a coluna guarda, não do instante com fuso:
+      // `toLocaleString` com `timeZone: America/Sao_Paulo` devolvia o dia
+      // ANTERIOR (a meia-noite UTC do dia 05 é 21:00 do dia 04 em São Paulo).
+      // Ver `prazoEmBr` — e, junto, `diaDoPrazo`.
+      const dueFmt = prazoEmBr(request.due_at) ?? new Date(request.due_at).toISOString().slice(0, 10);
+
+      // A frase do limiar: no Brasil ela nomeia a lei ("A solicitação LGPD") e
+      // fica em duro, byte a byte como sempre foi; fora do Brasil sai pelo
+      // idioma. Os `{id}`/`{org}`/`{limiar}` são substituídos DEPOIS, para o
+      // HTML manter o `<strong>` que o texto puro não tem — é por isso uma frase
+      // só com marcadores, e não a prosa remontada em pedaços traduzidos, que o
+      // idioma desmontaria ("de" e "atingiu o limiar" soltos não são frase).
+      const origemBruta = organizationName || marca.nome;
+      const modeloDaFrase = noBrasil
+        ? "A solicitação LGPD {id} de {org} atingiu o limiar {limiar}."
+        : t("A solicitação {id} de {org} atingiu o limiar {limiar}.");
+      // O nome da organização entra por ÚLTIMO e por FUNÇÃO: é texto de quem
+      // cadastrou, e como string de substituição um `$$`/`$&`/`$'` no nome
+      // seria lido como padrão do `replace` — o Brasil deixaria de sair byte a
+      // byte igual para "Ca$$h Store".
+      const fraseHtml = modeloDaFrase
+        .replace("{id}", `<strong>#${shortId}</strong>`)
+        .replace("{limiar}", `<strong>${thresholdLabel}</strong>`)
+        .replace("{org}", () => `<strong>${orgName}</strong>`);
+      const fraseTexto = modeloDaFrase
+        .replace("{id}", `#${shortId}`)
+        .replace("{limiar}", thresholdLabel)
+        .replace("{org}", () => origemBruta);
 
       // `#dc2626` FICA, e não vira o accent: é semântica de ALERTA, não marca.
       // Um atraso que aparece em verde-sálvia porque o revendedor escolheu
       // verde deixa de comunicar urgência — a cor aqui é a informação.
+      const notaDeAtraso = t("Esta solicitação está {n} dia(s) em atraso.").replace(
+        "{n}",
+        String(daysOverdue),
+      );
       const overdueNote =
         daysOverdue > 0
-          ? `<p style="color:#dc2626;font-weight:600;">⚠ Esta solicitação está ${daysOverdue} dia(s) em atraso.</p>`
-          : `<p>O prazo vence em <strong>${dueFmt}</strong>.</p>`;
+          ? `<p style="color:#dc2626;font-weight:600;">⚠ ${notaDeAtraso}</p>`
+          : `<p>${t("O prazo vence em {data}.").replace("{data}", `<strong>${dueFmt}</strong>`)}</p>`;
+      // O texto puro diz o prazo curto ("Prazo: 20/10/2026."), e não "O prazo
+      // vence em" — duas frases que sempre foram diferentes.
+      const notaDePrazoTexto = daysOverdue > 0 ? notaDeAtraso : t("Prazo: {data}.").replace("{data}", dueFmt);
 
       const html = `<!doctype html>
-<html lang="pt-BR">
+<html lang="${idioma}">
 <body style="font-family:-apple-system,Helvetica,Arial,sans-serif;color:${NEUTROS_DE_SAIDA.texto};line-height:1.5;max-width:560px;margin:0 auto;padding:24px;">
-  <h2 style="margin:0 0 12px;font-size:18px;">[LGPD] Alerta de SLA — Solicitação #${shortId}</h2>
-  <p>Olá,</p>
-  <p>A solicitação LGPD <strong>#${shortId}</strong> de <strong>${orgName}</strong> atingiu o limiar <strong>${thresholdLabel}</strong>.</p>
+  <h2 style="margin:0 0 12px;font-size:18px;">${etiqueta} ${t("Alerta de SLA — Solicitação {id}").replace("{id}", `#${shortId}`)}</h2>
+  <p>${t("Olá,")}</p>
+  <p>${fraseHtml}</p>
   ${overdueNote}
-  <p>Status atual: <code>${request.request_type}</code> / <code>${request.status}</code></p>
+  <p>${t("Status atual:")} <code>${request.request_type}</code> / <code>${request.status}</code></p>
   <p style="margin:24px 0;">
-    <a href="${requestUrl}" style="background:${marca.accent};color:${marca.accentFg};padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;">Ver solicitação no painel</a>
+    <a href="${requestUrl}" style="background:${marca.accent};color:${marca.accentFg};padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;">${t("Ver solicitação no painel")}</a>
   </p>
-  <p style="font-size:12px;color:${NEUTROS_DE_SAIDA.suave};">Base legal: LGPD Lei nº 13.709/2018, Art. 18. SLA obrigatório conforme regulamentação vigente.</p>
+  <p style="font-size:12px;color:${NEUTROS_DE_SAIDA.suave};">${rodapeHtml}</p>
 </body>
 </html>`;
 
       // Texto puro não escapa: `&amp;` no corpo de um alarme é ruído.
-      const text = `[LGPD] Alerta de SLA — Solicitação #${shortId}
+      const text = `${etiqueta} ${t("Alerta de SLA — Solicitação {id}").replace("{id}", `#${shortId}`)}
 
-A solicitação LGPD #${shortId} de ${organizationName || marca.nome} atingiu o limiar ${thresholdLabel}.
-${daysOverdue > 0 ? `Esta solicitação está ${daysOverdue} dia(s) em atraso.` : `Prazo: ${dueFmt}.`}
+${fraseTexto}
+${notaDePrazoTexto}
 
-Status: ${request.request_type} / ${request.status}
+${t("Status:")} ${request.request_type} / ${request.status}
 
-Acesse: ${requestUrl}
+${t("Acesse:")} ${requestUrl}
 
-Base legal: LGPD Lei nº 13.709/2018, Art. 18.`;
+${rodapeTexto}`;
 
       const result = await sendEmail({
         to: recipientEmail,
@@ -239,6 +352,58 @@ Base legal: LGPD Lei nº 13.709/2018, Art. 18.`;
   }
 
   return { alarmed, sentry: sentryOk, email: emailOk };
+}
+
+/**
+ * O rodapé do alarme fora do Brasil, JÁ no idioma do destinatário.
+ *
+ * Três figuras, e a ordem importa:
+ *  - país sem citação de lei revisada não afirma lei nenhuma;
+ *  - com o mês do art. 12.º, n.º 3 VENCIDO (issue #2347, item 1) não há mais
+ *    prazo legal adiante, e "mais curto que o prazo legal" faria o encarregado
+ *    concluir que ainda há folga — a frase passa a afirmar o vencimento;
+ *  - antes disso, a frase de sempre: o prazo interno é mais curto que o legal.
+ *
+ * Recebe `t` porque a escolha da figura é do país/do relógio e a LÍNGUA é do
+ * destinatário: cada frase sai de uma chamada `t()` com literal, para o guarda
+ * de i18n cobrar o espanhol de todas elas.
+ */
+function prazoInternoForaDoBrasil(
+  perfil: PerfilDoPais,
+  mesLegalVencido: boolean,
+  t: (texto: string) => string,
+): string {
+  const rgpd = perfil.lei?.nome === "RGPD" && citacaoDaLei(perfil) !== null;
+  if (!rgpd) return t("Prazo interno do sistema, mais curto que o prazo legal.");
+  if (mesLegalVencido) return t("O prazo do art. 12.º, n.º 3 do RGPD (um mês) venceu.");
+  return t("Prazo interno do sistema, mais curto que o prazo legal (RGPD: um mês, art. 12.º, n.º 3).");
+}
+
+/**
+ * O mês legal do art. 12.º, n.º 3 do RGPD — um mês desde o recebimento do
+ * pedido — já passou? (issue #2347, item 1.)
+ *
+ * O watcher reenvia o alarme todo dia enquanto o pedido não fecha, e num pedido
+ * de 40 dias o rodapé continuava prometendo um prazo legal à frente.
+ *
+ * "Um mês" é um MÊS DE CALENDÁRIO, não 30 dias: 31/01 + um mês acaba em 28/02,
+ * e não em 03/03 como o estouro de `Date` faria. O instante do dia é o do
+ * recebimento — o prazo corre da hora do pedido. `received_at` ausente ou
+ * inválido devolve `false`: sem data não se afirma vencimento legal.
+ */
+function mesLegalDoPedidoVencido(receivedAt: string | null | undefined, agora: Date): boolean {
+  if (!receivedAt) return false;
+  const recebidoMs = Date.parse(receivedAt);
+  if (!Number.isFinite(recebidoMs)) return false;
+  const recebido = new Date(recebidoMs);
+  const vencimento = new Date(recebidoMs);
+  vencimento.setUTCMonth(vencimento.getUTCMonth() + 1);
+  if (vencimento.getUTCDate() !== recebido.getUTCDate()) {
+    // O dia não existe no mês seguinte (31/01 → 03/03): o mês legal acaba no
+    // ÚLTIMO dia do mês seguinte.
+    vencimento.setUTCDate(0);
+  }
+  return agora.getTime() > vencimento.getTime();
 }
 
 /**

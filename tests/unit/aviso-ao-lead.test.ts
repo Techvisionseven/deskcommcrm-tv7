@@ -83,10 +83,31 @@ describe("o texto respeita o estado REAL da equipe", () => {
     expect(semLeitura).toBe(semEquipe);
   });
 
-  it("equipe existe mas ninguém livre: não convida a aguardar", () => {
+  it("equipe existe mas ninguém livre: registra, não convida a aguardar", () => {
     const t = textoDoAviso("pediu_humano", { disponiveis: 0, total: 3 }, LEAD);
-    expect(t).toMatch(/ninguém|não há atendente/i);
+    expect(t).toMatch(/anotad|registr|resumo/i);
     expect(t).not.toMatch(/aguarde só um momento|é só aguardar/i);
+  });
+
+  /**
+   * Produção, 2026-10-16: a cliente perguntou "Vai me transferir para um
+   * atendente?" e leu "No momento ninguém está disponível". É verdade sobre a
+   * escala do time e o recado errado para quem está decidindo uma compra. A
+   * conta é sobre TODAS as variantes (o sorteio é por lead, então qualquer uma
+   * chega a alguém), em todo motivo e nos dois idiomas.
+   */
+  it("nenhuma variante, em nenhum idioma, anuncia que falta gente", () => {
+    const AUSENCIA_PT = /ninguém|não há|não tem|disponível|livre|fila/i;
+    const AUSENCIA_ES = /nadie|no hay|disponible|libre|cola/i;
+    for (const motivo of MOTIVOS) {
+      for (let i = 0; i < 60; i++) {
+        const lead = randomUUID();
+        const pt = textoDoAviso(motivo, { disponiveis: 0, total: 3 }, lead);
+        const es = textoDoAviso(motivo, { disponiveis: 0, total: 3 }, lead, "es");
+        expect(pt, `${motivo}: ${pt}`).not.toMatch(AUSENCIA_PT);
+        expect(es, `${motivo}: ${es}`).not.toMatch(AUSENCIA_ES);
+      }
+    }
   });
 
   it("com gente livre: convida a aguardar na conversa", () => {
@@ -221,7 +242,7 @@ describe("o aviso sai no idioma da organização", () => {
 
   it("o estado da equipe muda o fecho em espanhol como muda em português", () => {
     expect(textoDoAviso("outro", { disponiveis: 0, total: 0 }, LEAD, "es")).toMatch(/registrad|anotado|primera oportunidad/i);
-    expect(textoDoAviso("outro", { disponiveis: 0, total: 3 }, LEAD, "es")).toMatch(/no hay/i);
+    expect(textoDoAviso("outro", { disponiveis: 0, total: 3 }, LEAD, "es")).toMatch(/anotado|registrad|resumen/i);
     expect(textoDoAviso("outro", { disponiveis: 2, total: 3 }, LEAD, "es")).toMatch(/espera|quédate/i);
   });
 
@@ -258,5 +279,26 @@ describe("o aviso sai no idioma da organização", () => {
     expect(textoDoAviso("pediu_humano", null, LEAD, null)).toBe(pt);
     expect(textoDoAviso("pediu_humano", null, LEAD, "pt-BR")).toBe(pt);
     expect(pt).not.toBe(es);
+  });
+});
+
+describe("o aviso não usa travessão (#1881)", () => {
+  /**
+   * Há marca cuja regra de estilo proíbe travessão em texto ao cliente, e esta
+   * frase é fixa: a organização não tem como editá-la. Percorre todo motivo,
+   * todo estado e os dois idiomas, com leads bastantes para sortear todas as
+   * variantes.
+   */
+  it("nenhuma redação, em português ou espanhol, leva —", () => {
+    for (const idioma of ["pt-BR", "es"]) {
+      for (const motivo of MOTIVOS) {
+        for (const estado of ESTADOS) {
+          for (let i = 0; i < 200; i++) {
+            const t = textoDoAviso(motivo, estado.quem, `lead-${i}`, idioma);
+            expect(t, `${idioma} / ${motivo} / ${estado.rotulo}`).not.toContain("—");
+          }
+        }
+      }
+    }
   });
 });

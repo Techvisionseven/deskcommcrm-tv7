@@ -40,8 +40,10 @@ import { useT } from "@/hooks/i18n/useT";
 import { descreverErroDeValidacao } from "@/lib/ai/credenciais/erro-de-validacao";
 import type { EstadoDaTarefa } from "@/lib/ai/decisao/config";
 import { PROVEDOR_DO_JEV } from "@/lib/ai/decisao/credencial";
-import { TAREFA_DO_CLIMA, TAREFAS_DO_JEV } from "@/lib/ai/decisao/tarefas";
+import type { OrigemDoJev } from "@/lib/ai/decisao/origem";
+import { ROTEADOR_SOB_DEMANDA, ROTEADOR_SOB_DEMANDA_SEM_IA, TAREFA_DO_CLIMA, TAREFAS_DO_JEV, tarefaPodeDecidir } from "@/lib/ai/decisao/tarefas";
 import { O_QUE_FAZER_DO_JEV } from "@/lib/ai/decisao/textos";
+import type { ProvedorComChave } from "@/lib/ai/pontos/provedores";
 
 /** O corpo de `GET /api/v1/ai/jev` (`app/api/v1/ai/jev/route.ts`). */
 export interface DadosDoJev {
@@ -56,6 +58,7 @@ export interface DadosDoJev {
   config: {
     ligado: boolean;
     modo: "observacao" | "decide";
+    modo_roteador?: "comparacao" | "sob_demanda";
     aceite: { em: string; por: string } | null;
   };
   tarefas: Array<{ id: string; rotulo: string; oQueOJevFaz: string }>;
@@ -66,6 +69,12 @@ export interface DadosDoJev {
    */
   por_tarefa?: TarefaNoCartao[];
   tem_ia_de_sempre: boolean;
+  /**
+   * A IA de sempre do ROTEADOR, a mesma pergunta que o turno faz antes de deixar
+   * o Jev rotear sozinho (`temIaDeSempre`). Ausente (imagem anterior) vale `false`:
+   * sem saber, o cartão não oferece o modo que dispensaria a reserva.
+   */
+  roteador_tem_ia_de_sempre?: boolean;
   numeros: {
     dias: number;
     decisoes: number;
@@ -89,6 +98,20 @@ export interface DadosDoJev {
   };
   /** `tarefa`: o rótulo da tarefa que falhou. Ausente na imagem anterior. */
   ultima_falha: { motivo: string | null; em: string; tarefa?: string | null } | null;
+  /**
+   * DE ONDE O JEV RESPONDE hoje (`@/lib/ai/decisao/origem`): a TypeSafe direto,
+   * ou via OpenRouter. Ausente na resposta da imagem anterior (a página aberta
+   * durante um rollback) e vale o caminho de sempre — TypeSafe direto, que é o
+   * único que aquela imagem conhece.
+   */
+  origem?: OrigemDoJev;
+  /**
+   * O que a empresa já tem na OpenRouter, para o cartão oferecer REAPROVEITAR
+   * em vez de exigir uma chave TypeSafe separada. `disponivel` é a credencial
+   * OpenRouter validada da empresa; `rotulo` é o nome que ela deu à credencial.
+   * Ausente na imagem anterior: sem ele, não se oferece nada.
+   */
+  openrouter?: { disponivel: boolean; rotulo: string | null };
   pode_editar: boolean;
 }
 
@@ -108,6 +131,13 @@ export interface TarefaNoCartao {
    */
   observacao?: Concordancia | null;
   /**
+   * Só as tarefas em cascata, que o Jev responde onde a regra de hoje disse não:
+   * em quantas MENSAGENS ele percebeu o pedido que ela não reconheceu, e as
+   * conversas das mais recentes (o endereço já vem pronto da rota). Ausente na
+   * imagem anterior.
+   */
+  percebidos?: { dias: number; mensagens: number; conversas: Array<{ href: string; em: string }> } | null;
+  /**
    * A camada de segurança que ela acompanha está desligada para a empresa: o
    * turno não pergunta, e ela não roda em estado nenhum. Ausente na imagem anterior.
    */
@@ -117,10 +147,26 @@ export interface TarefaNoCartao {
    * escolhe agente, e ela não tem o que comparar. Ausente na imagem anterior.
    */
   sem_roteador?: boolean;
+  /**
+   * As de pedido numa empresa em que o atendimento automático não roda em
+   * número nenhum: ninguém no ar sem pausa, ou o atendimento com um sistema de
+   * fora. O worker só as pergunta onde ele roda. Ausente na imagem anterior.
+   */
+  sem_atendente?: "externo" | "ninguem_no_ar" | null;
+  /**
+   * A do follow-up numa empresa sem follow-up publicado com o passo
+   * "Classificar (IA)": ninguém lê a resposta do cliente, e ela não tem o que
+   * comparar. Ausente na imagem anterior.
+   */
+  sem_fluxo?: boolean;
 }
 
-/** Algo fora do Jev a impede de rodar em qualquer estado — a camada, ou o roteador. */
-const parada = (t: TarefaNoCartao) => t.sem_camada === true || t.sem_roteador === true;
+/** Algo fora do Jev a impede de rodar em qualquer estado — a camada, o roteador, quem atende ou o fluxo. */
+const parada = (t: TarefaNoCartao) =>
+  t.sem_camada === true ||
+  t.sem_roteador === true ||
+  t.sem_fluxo === true ||
+  (t.sem_atendente !== undefined && t.sem_atendente !== null);
 
 /** A tarefa pode rodar agora — não está desligada nem parada. */
 const roda = (t: TarefaNoCartao) => t.estado !== "desligada" && !parada(t);
@@ -194,8 +240,8 @@ function estadoDoJev(d: DadosDoJev): Estado {
     if (!d.tem_ia_de_sempre && clima && clima.estado !== "desligada") return "sozinho";
     // A tarefa parada pela camada não mede nada: não faz o cartão observar nem decidir.
     const rodando = tarefas.filter(roda);
-    if (rodando.some((t) => t.estado === "decidindo")) return "decidindo";
-    if (rodando.some((t) => t.estado === "observando")) return "observando";
+    if (rodando.some(decide)) return "decidindo";
+    if (rodando.length > 0) return "observando";
     return "em_pausa";
   }
   if (!d.chave.existe) return "sem_chave";
@@ -209,7 +255,7 @@ function estadoDoJev(d: DadosDoJev): Estado {
  * decidindo é o caminho natural depois do selo "Novo" e de um clique.
  */
 function decideEmParte(d: DadosDoJev): boolean {
-  return tarefasDoCartao(d).some((t) => roda(t) && t.estado === "observando");
+  return tarefasDoCartao(d).some((t) => roda(t) && !decide(t));
 }
 
 /**
@@ -219,10 +265,104 @@ function decideEmParte(d: DadosDoJev): boolean {
 const doRegistro = (tarefaId: string) => TAREFAS_DO_JEV.find((x) => x.id === tarefaId);
 
 /**
+ * A tarefa em cascata não decide nada no lugar da regra de hoje: o estado
+ * `decidindo` dela abre um aviso na Central, e a tela o chama "Avisar a
+ * equipe" — nunca "Deixar o Jev decidir", que prometeria passar a conversa ou
+ * bloquear o contato.
+ */
+const avisaAEquipe = (tarefaId: string) => doRegistro(tarefaId)?.familia === "cascata";
+
+/**
+ * A tarefa oferece "Deixar o Jev decidir" (ou "Avisar a equipe")? A que só
+ * observa nesta versão, não — e a rota recusaria o pedido. Uma tarefa que esta
+ * página não conhece (de uma versão mais nova) segue com o botão, como antes.
+ */
+const podeDecidir = (tarefaId: string) => {
+  const registro = doRegistro(tarefaId);
+  return registro === undefined || tarefaPodeDecidir(registro);
+};
+
+/**
+ * A tarefa DECIDE algo no lugar do mecanismo de hoje. A em cascata, avisando a
+ * equipe, não: o cliente não sente nada, e o estado do cartão inteiro (selo,
+ * frase, texto de antes de ligar) a conta como quem não decide. Só a linha
+ * dela diz "Avisa a equipe".
+ */
+const decide = (t: TarefaNoCartao) => t.estado === "decidindo" && !avisaAEquipe(t.id);
+
+/**
+ * As tarefas que rodam, pela família: as que o Jev compara com a IA de sempre,
+ * e as em cascata, que só contam as mensagens com um pedido que a regra de hoje
+ * não reconheceu (e, em "Avisar a equipe", abrem aviso). A frase do cartão não
+ * pode falar de comparar nem da "sua IA de sempre" quando só estas rodam.
+ */
+function oQueRoda(d: DadosDoJev): { comparam: number; daParaDeixarDecidir: boolean; cascata: number; avisando: boolean } {
+  const rodando = tarefasDoCartao(d).filter(roda);
+  const cascata = rodando.filter((t) => avisaAEquipe(t.id));
+  const comparam = rodando.filter((t) => !avisaAEquipe(t.id));
+  return {
+    comparam: comparam.length,
+    // Com todas as que comparam só observando sem como decidir (a do
+    // follow-up), "antes de deixar o Jev decidir" prometeria um botão que não há.
+    daParaDeixarDecidir: comparam.some((t) => podeDecidir(t.id)),
+    cascata: cascata.length,
+    avisando: cascata.some((t) => t.estado === "decidindo"),
+  };
+}
+
+/** A frase do cartão observando — verdadeira para o que de fato roda. */
+function fraseObservando(d: DadosDoJev, t: (texto: string) => string): string {
+  const r = oQueRoda(d);
+  if (r.comparam === 0) {
+    return r.avisando
+      ? t("Observando — o Jev conta as mensagens em que o cliente faz um pedido que a regra de hoje não reconheceu, e avisa a equipe na Central. Ele não decide nada no atendimento.")
+      : t("Observando — o Jev só conta as mensagens em que o cliente faz um pedido que a regra de hoje não reconheceu. Nada muda no atendimento.");
+  }
+  if (!r.daParaDeixarDecidir) {
+    if (r.cascata === 0) return t("Observando — a sua IA de sempre decide, e o Jev só é comparado com ela.");
+    return r.avisando
+      ? t("Observando — onde o Jev compara, a sua IA de sempre decide, e ele só é comparado com ela. Nos pedidos do cliente, ele conta as mensagens em que a regra de hoje não reconheceu o pedido, e avisa a equipe.")
+      : t("Observando — onde o Jev compara, a sua IA de sempre decide, e ele só é comparado com ela. Nos pedidos do cliente, ele só conta as mensagens em que a regra de hoje não reconheceu o pedido.");
+  }
+  if (r.cascata === 0) return t("Observando — a sua IA de sempre ainda decide. Compare os dois antes de deixar o Jev decidir.");
+  return r.avisando
+    ? t("Observando — onde o Jev compara, a sua IA de sempre ainda decide: compare os dois antes de deixar o Jev decidir. Nos pedidos do cliente, ele conta as mensagens em que a regra de hoje não reconheceu o pedido, e avisa a equipe.")
+    : t("Observando — onde o Jev compara, a sua IA de sempre ainda decide: compare os dois antes de deixar o Jev decidir. Nos pedidos do cliente, ele só conta as mensagens em que a regra de hoje não reconheceu o pedido.");
+}
+
+/** A frase do cartão decidindo: "em parte" nomeia também quem só avisa a equipe. */
+function fraseDecidindo(d: DadosDoJev, t: (texto: string) => string): string {
+  if (!decideEmParte(d)) return t("Decidindo — cada tarefa abaixo diz o que o Jev decide nela.");
+  return oQueRoda(d).avisando
+    ? t("Decidindo em parte — cada tarefa abaixo diz se o Jev decide, só observa ou avisa a equipe nela.")
+    : t("Decidindo em parte — cada tarefa abaixo diz se o Jev decide ou só observa nela.");
+}
+
+/**
  * Como o Jev está no ponto `pontoId`, para a linha do cartão do ponto — pelo
  * estado da tarefa dele. Decidindo, a linha é a da tarefa (`aoDecidirNoPonto`):
  * "o modelo abaixo é a reserva" só é verdade no clima.
  */
+/**
+ * O modo do roteador que VALE: sob demanda só onde a empresa tem a IA de sempre
+ * (decisão B do doc 89). Sem ela o turno compara, e o cartão diz o mesmo.
+ */
+function roteadorSobDemanda(d: DadosDoJev): boolean {
+  return d.config.modo_roteador === "sob_demanda" && d.roteador_tem_ia_de_sempre === true;
+}
+
+/** A origem que a resposta diz — ausente (imagem anterior) é o caminho de sempre. */
+const origemDoCartao = (d: DadosDoJev): OrigemDoJev => d.origem ?? "typesafe";
+
+/**
+ * O provedor da credencial que ESTA origem consome (`lib/ai/decisao/origem`): a
+ * chave do Jev na TypeSafe, ou a credencial OpenRouter da empresa. É o que a
+ * frase de recusa e o diálogo de colar a chave precisam saber para apontar a
+ * conta certa — via OpenRouter, "cadastre na TypeSafe" pediria a coisa errada.
+ */
+const provedorDaCredencialDoCartao = (d: DadosDoJev): ProvedorComChave =>
+  origemDoCartao(d) === "openrouter" ? "openrouter" : PROVEDOR_DO_JEV;
+
 export function jevNoPonto(
   d: DadosDoJev | null,
   pontoId: string,
@@ -233,7 +373,8 @@ export function jevNoPonto(
   // A IA de sempre é a do clima (`tem_ia_de_sempre`), e só o clima decide sem ela (DEC-012 #5).
   if (!d.tem_ia_de_sempre && tarefa.id === TAREFA_DO_CLIMA.id) return "sozinho";
   if (tarefa.estado !== "decidindo") return "observacao";
-  const frase = doRegistro(tarefa.id)?.aoDecidirNoPonto;
+  const frase = tarefa.id === "roteador" && roteadorSobDemanda(d)
+    ? ROTEADOR_SOB_DEMANDA : doRegistro(tarefa.id)?.aoDecidirNoPonto;
   return frase === undefined ? null : { decide: frase };
 }
 
@@ -330,14 +471,30 @@ export function CartaoDoJev({
         <p className="mt-1 max-w-2xl text-sm text-muted-foreground">{t(dados.provedor.quandoUsar)}</p>
       </div>
 
+      {/* DEC-012 #2: quem é da área da saúde manda dado sensível (LGPD), e o
+          contrato da TypeSafe precisa cobrir isso. O produto não guarda o nicho
+          como categoria, então o aviso aparece para todos em forma condicional.
+          A ida para os EUA já está no consentimento, mais abaixo. */}
+      <p className="mt-3 rounded-md bg-warning-bg p-3 text-sm text-warning-fg" data-testid="jev-aviso-area-saude">
+        {t(
+          "Se a sua empresa é da área da saúde: as mensagens que o Jev lê podem conter dado de saúde, que a LGPD trata como sensível. Antes de ligar, confira com quem cuida da LGPD da empresa se o contrato da TypeSafe cobre esse tipo de dado.",
+        )}
+      </p>
+
       {/* Depois de colar a chave nada confirmava que ela FUNCIONA: esta linha é
-          o resultado do teste, dito em palavras (o ✓ é enfeite). */}
+          o resultado do teste, dito em palavras (o ✓ é enfeite). O nome do
+          provedor acompanha a origem: via OpenRouter, quem conferiu foi a
+          OpenRouter, e a chave é a mesma da conversa. */}
       {dados.chave.validada && (
         <p className="mt-3 flex items-center gap-1.5 text-xs text-success-fg" data-testid="jev-chave-conferida">
           <span aria-hidden>✓</span>
-          {t("Chave conferida com a TypeSafe")}
+          {origemDoCartao(dados) === "openrouter"
+            ? t("Chave conferida na OpenRouter")
+            : t("Chave conferida com a TypeSafe")}
         </p>
       )}
+
+      <DeOndeResponde dados={dados} recarregar={recarregar} />
 
       {estado === "sem_chave" && <SemChave dados={dados} recarregar={recarregar} />}
 
@@ -373,15 +530,120 @@ function SeloDoEstado({ estado, emParte }: { estado: Estado; emParte: boolean })
   return <Badge variant="neutral">{t("Desligado")}</Badge>;
 }
 
+/**
+ * DE ONDE O JEV RESPONDE (`lib/ai/decisao/origem`).
+ *
+ * O Jev é o mesmo modelo nos dois caminhos, e o que muda é o ENDEREÇO, o NOME do
+ * modelo e a CHAVE: a TypeSafe direto, com uma chave só para ele, ou via
+ * OpenRouter, reaproveitando a credencial OpenRouter que a empresa já cadastrou
+ * para a conversa — sem segunda conta e sem segunda chave (issue #2947).
+ *
+ * A troca é um PATCH com `origem`, e a rota só a aceita com a credencial da
+ * origem nova já validada: sem isto, trocar para OpenRouter numa empresa sem
+ * chave de lá deixaria o Jev mudo. A recusa da rota já vem escrita para leigo, e
+ * é ela que explica o que falta.
+ */
+function DeOndeResponde({ dados, recarregar }: { dados: DadosDoJev; recarregar: () => Promise<void> }) {
+  const t = useT();
+  const { mudar, enviando } = useMudarOJev(recarregar);
+  const origem = origemDoCartao(dados);
+  const podeReaproveitar = dados.openrouter?.disponivel === true;
+  // O aceite gravado nomeava só a TypeSafe AI: ir para a OpenRouter pede o
+  // aceite de novo antes do PATCH (a rota recusa sem ele).
+  const [confirmandoOpenRouter, setConfirmandoOpenRouter] = useState(false);
+  const [concordo, setConcordo] = useState(false);
+  const escolher = (nova: string) => {
+    if (nova === "openrouter" && dados.config.aceite !== null) {
+      setConcordo(false);
+      setConfirmandoOpenRouter(true);
+      return;
+    }
+    setConfirmandoOpenRouter(false);
+    void mudar({ origem: nova }, t("Origem do Jev salva."));
+  };
+
+  return (
+    <div className="mt-4 space-y-1" data-testid="jev-origem">
+      <label htmlFor="jev-origem-escolha" className="block text-xs font-medium">
+        {t("De onde o Jev responde")}
+      </label>
+      <select
+        id="jev-origem-escolha"
+        className="block w-full max-w-md rounded-md border bg-background p-2 text-sm"
+        value={confirmandoOpenRouter ? "openrouter" : origem}
+        disabled={!dados.pode_editar || enviando}
+        onChange={(e) => escolher(e.target.value)}
+      >
+        <option value="typesafe">{t("TypeSafe AI (chave própria)")}</option>
+        <option value="openrouter">{t("OpenRouter (reaproveita a credencial OpenRouter)")}</option>
+      </select>
+      {confirmandoOpenRouter && (
+        <div className="max-w-2xl rounded-md border border-border p-3 text-sm" data-testid="jev-origem-aceite">
+          <div className="flex items-start gap-2">
+            <input
+              id="jev-origem-aceite"
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 accent-[var(--color-accent)]"
+              checked={concordo}
+              onChange={(e) => setConcordo(e.target.checked)}
+            />
+            <label htmlFor="jev-origem-aceite" className="text-sm">
+              {t(
+                "Concordo com o envio de cada mensagem dos clientes, uma de cada vez e sem o resto da conversa, para a TypeSafe AI, pela OpenRouter, nos Estados Unidos.",
+              )}
+            </label>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              disabled={!concordo || enviando}
+              onClick={() => {
+                setConfirmandoOpenRouter(false);
+                void mudar({ origem: "openrouter", aceite_lgpd: true }, t("Origem do Jev salva."));
+              }}
+            >
+              {t("Trocar para a OpenRouter")}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setConfirmandoOpenRouter(false)}>
+              {t("Cancelar")}
+            </Button>
+          </div>
+        </div>
+      )}
+      {origem === "openrouter" ? (
+        <p className="max-w-2xl text-xs text-muted-foreground" data-testid="jev-origem-openrouter">
+          {podeReaproveitar
+            ? t(
+                "O Jev responde pela OpenRouter usando a credencial OpenRouter desta empresa — a mesma chave da conversa, sem segunda conta e sem segunda chave.",
+              )
+            : t(
+                "Para o Jev responder pela OpenRouter, cadastre a chave da OpenRouter em Credenciais. É a mesma chave que a sua IA de conversa usa.",
+              )}
+        </p>
+      ) : (
+        <p className="max-w-2xl text-xs text-muted-foreground" data-testid="jev-origem-typesafe">
+          {t("O Jev responde direto na TypeSafe AI, com a chave dele cadastrada em Credenciais.")}
+        </p>
+      )}
+      {podeReaproveitar && origem === "typesafe" && (
+        <p className="max-w-2xl text-xs text-muted-foreground" data-testid="jev-origem-pode-reaproveitar">
+          {t("Esta empresa já tem uma credencial OpenRouter conferida: dá para o Jev usá-la sem cadastrar chave nova.")}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function SemChave({ dados, recarregar }: { dados: DadosDoJev; recarregar: () => Promise<void> }) {
   const t = useT();
   const [colando, setColando] = useState(false);
+  const pelaOpenRouter = origemDoCartao(dados) === "openrouter";
 
   return (
     <div className="mt-4 flex flex-wrap items-center gap-3">
       <Button asChild size="sm" variant="outline">
         <a href={dados.provedor.ondePegarAChave} target="_blank" rel="noreferrer">
-          {t("Pegar a chave na TypeSafe")}
+          {pelaOpenRouter ? t("Pegar a chave na OpenRouter") : t("Pegar a chave na TypeSafe")}
         </a>
       </Button>
       {dados.pode_editar ? (
@@ -392,7 +654,7 @@ function SemChave({ dados, recarregar }: { dados: DadosDoJev; recarregar: () => 
           <AddCredentialDialog
             open={colando}
             onOpenChange={setColando}
-            providerInicial={PROVEDOR_DO_JEV}
+            providerInicial={provedorDaCredencialDoCartao(dados)}
             aoSalvar={() => {
               void recarregar();
               // O teste da chave roda depois da resposta (ver a rota de criar), com
@@ -409,10 +671,17 @@ function SemChave({ dados, recarregar }: { dados: DadosDoJev; recarregar: () => 
         </p>
       )}
       {/* O Jev é pago à parte, numa conta da TypeSafe: sem esta frase a pessoa
-          só descobria o crédito pela falha. */}
+          só descobria o crédito pela falha. Via OpenRouter, quem cobra é a
+          OpenRouter, pela chave que a empresa já tem — e a frase muda. */}
       <p className="w-full text-xs text-muted-foreground" data-testid="jev-como-pegar-a-chave">
-        {t(
-          "Para pegar a chave, você cria uma conta na TypeSafe AI e põe crédito: cada mensagem medida custa uma fração de centavo de dólar, cobrada lá. A chave começa com",
+        {pelaOpenRouter ? (
+          t(
+            "Não precisa de uma segunda conta: o Jev via OpenRouter usa a credencial OpenRouter desta empresa, e quem cobra o uso é a própria OpenRouter. A chave começa com",
+          )
+        ) : (
+          t(
+            "Para pegar a chave, você cria uma conta na TypeSafe AI e põe crédito: cada mensagem medida custa uma fração de centavo de dólar, cobrada lá. A chave começa com",
+          )
         )}{" "}
         <span className="font-mono">{dados.provedor.prefixoDaChave}</span>
       </p>
@@ -423,7 +692,11 @@ function SemChave({ dados, recarregar }: { dados: DadosDoJev; recarregar: () => 
 function ProblemaDaChave({ dados, recarregar }: { dados: DadosDoJev; recarregar: () => Promise<void> }) {
   const t = useT();
   const [testando, setTestando] = useState(false);
-  const erro = descreverErroDeValidacao(dados.chave.erro_de_validacao, PROVEDOR_DO_JEV);
+  // O nome na frase de recusa acompanha a origem: via OpenRouter, quem recusou
+  // foi a OpenRouter (issue #2947) — dizer "a TypeSafe recusou" à chave errada
+  // mandaria a pessoa conferir a conta errada.
+  const pelaOpenRouter = origemDoCartao(dados) === "openrouter";
+  const erro = descreverErroDeValidacao(dados.chave.erro_de_validacao, provedorDaCredencialDoCartao(dados));
   const motivo = !dados.chave.existe
     ? t("O Jev está ligado, mas sem chave ativa: enquanto isso, ele não mede nada.")
     : !dados.chave.erro_de_validacao
@@ -473,7 +746,8 @@ function ProblemaDaChave({ dados, recarregar }: { dados: DadosDoJev; recarregar:
             {testando ? t("Testando…") : t("Testar de novo")}
           </Button>
         )}
-        {/* "Gere uma nova" precisa de caminho: a chave recusada leva à TypeSafe. */}
+        {/* "Gere uma nova" precisa de caminho: a chave recusada leva ao provedor
+            DA ORIGEM — via OpenRouter, à OpenRouter. */}
         {erro.chaveErrada && (
           <a
             className="text-xs underline underline-offset-4"
@@ -481,7 +755,7 @@ function ProblemaDaChave({ dados, recarregar }: { dados: DadosDoJev; recarregar:
             target="_blank"
             rel="noreferrer"
           >
-            {t("Pegar uma chave nova na TypeSafe")}
+            {pelaOpenRouter ? t("Pegar uma chave nova na OpenRouter") : t("Pegar uma chave nova na TypeSafe")}
           </a>
         )}
         <Link className="text-xs underline underline-offset-4" href="/app/ai/credentials">
@@ -537,7 +811,18 @@ function ProntoParaLigar({ dados, recarregar }: { dados: DadosDoJev; recarregar:
   const doClima = tarefas.find(({ tarefa }) => tarefa.id === TAREFA_DO_CLIMA.id);
   const climaSozinho = !dados.tem_ia_de_sempre && doClima !== undefined && doClima.aoLigar !== "desligada";
   const climaPausadoSemIa = !dados.tem_ia_de_sempre && doClima?.aoLigar === "desligada";
-  const algumaDecide = tarefas.some(({ tarefa, aoLigar }) => aoLigar === "decidindo" && !parada(tarefa));
+  // O que vai rodar ao ligar, pela família — a frase é verdadeira para isso,
+  // como a do cartão ligado (`fraseObservando`): nos pedidos do cliente não há
+  // IA de sempre nem o que comparar, e com só eles rodando a frase de comparar
+  // era falsa por inteiro.
+  const vaoRodar = tarefas.filter(({ tarefa, aoLigar }) => aoLigar !== "desligada" && !parada(tarefa));
+  const comparam = vaoRodar.filter(({ tarefa }) => !avisaAEquipe(tarefa.id));
+  const pedidos = vaoRodar.filter(({ tarefa }) => avisaAEquipe(tarefa.id));
+  const algumaDecide = comparam.some(({ aoLigar }) => aoLigar === "decidindo");
+  // As que vão só observar são todas das que não decidem nesta versão (a do
+  // follow-up): "antes de deixar o Jev decidir" prometeria um botão que não há.
+  const observam = comparam.filter(({ aoLigar }) => aoLigar === "observando");
+  const observamSemPoderDecidir = observam.length > 0 && observam.every(({ tarefa }) => !podeDecidir(tarefa.id));
   const algumaPausada = tarefas.some(({ aoLigar }) => aoLigar === "desligada");
 
   return (
@@ -557,11 +842,37 @@ function ProntoParaLigar({ dados, recarregar }: { dados: DadosDoJev; recarregar:
                     : tarefa.id === TAREFA_DO_CLIMA.id && climaSozinho
                       ? t("Decide sozinho")
                       : aoLigar === "decidindo"
-                        ? t("Decide")
+                        ? avisaAEquipe(tarefa.id)
+                          ? t("Avisa a equipe")
+                          : t("Decide")
                         : t("Só observa")}
                 )
               </span>
               <span className="text-muted-foreground"> — {t(tarefa.oQueFaz)}</span>
+              {/* Antes de ligar também: "Não roda" sem o porquê deixava o leigo
+                  sem saber o que fazer — é a primeira impressão de quem ainda
+                  não publicou um agente. */}
+              {aoLigar !== "desligada" && tarefa.sem_atendente === "ninguem_no_ar" && (
+                <span className="text-muted-foreground" data-testid={`jev-ao-ligar-sem-atendente-${tarefa.id}`}>
+                  {" "}
+                  {t("Não roda agora: nenhum atendente automático está no ar — o Jev só é perguntado onde um atendente responderia. Publique um agente num número, ou tire um agente da pausa, em Agentes.")}
+                </span>
+              )}
+              {aoLigar !== "desligada" && tarefa.sem_atendente === "externo" && (
+                <span className="text-muted-foreground" data-testid={`jev-ao-ligar-sem-atendente-${tarefa.id}`}>
+                  {" "}
+                  {t("Não roda agora: quem conduz as conversas desta empresa é um sistema de fora. O Jev só é perguntado onde um atendente automático daqui responderia.")}
+                </span>
+              )}
+              {aoLigar !== "desligada" && tarefa.sem_fluxo === true && (
+                <span className="text-muted-foreground" data-testid={`jev-ao-ligar-sem-fluxo-${tarefa.id}`}>
+                  {" "}
+                  {t("Não roda agora: nenhum follow-up publicado tem o passo “Classificar (IA)” com duas saídas ou mais. O Jev só lê a resposta do cliente onde a sua IA de sempre escolhe entre saídas — publique, em Follow-ups, um fluxo com esse passo.")}{" "}
+                  <Link className="underline underline-offset-4" href="/app/ai/followups">
+                    {t("Abrir os follow-ups")}
+                  </Link>
+                </span>
+              )}
             </li>
           ))}
         </ul>
@@ -570,13 +881,29 @@ function ProntoParaLigar({ dados, recarregar }: { dados: DadosDoJev; recarregar:
             ? t(
                 "Sem uma IA principal que meça o clima, o Jev já começa decidindo sozinho nessa tarefa: não há com quem comparar nem quem cubra uma falha dele.",
               )
-            : algumaDecide
+            : comparam.length === 0
+              ? null
+              : algumaDecide
+                ? observamSemPoderDecidir
+                  ? t(
+                      "Onde ele decide, vale a escolha que você fez antes de desligá-lo; onde só observa, a sua IA de sempre continua decidindo.",
+                    )
+                  : t(
+                      "Onde ele decide, vale a escolha que você fez antes de desligá-lo; onde só observa, a sua IA de sempre continua decidindo, e você compara os dois antes de deixar o Jev decidir.",
+                    )
+                : observamSemPoderDecidir
+                  ? t("Onde ele só observa, a sua IA de sempre continua decidindo.")
+                  : t(
+                      "Onde ele só observa, a sua IA de sempre continua decidindo, e você compara os dois antes de deixar o Jev decidir.",
+                    )}{" "}
+          {pedidos.length > 0 &&
+            (pedidos.some(({ aoLigar }) => aoLigar === "decidindo")
               ? t(
-                  "Onde ele decide, vale a escolha que você fez antes de desligá-lo; onde só observa, a sua IA de sempre continua decidindo, e você compara os dois antes de deixar o Jev decidir.",
+                  "Nos pedidos do cliente, o Jev conta as mensagens em que a regra de hoje não reconheceu o pedido e avisa a equipe na Central — ele não decide nada no atendimento.",
                 )
               : t(
-                  "Onde ele só observa, a sua IA de sempre continua decidindo, e você compara os dois antes de deixar o Jev decidir.",
-                )}{" "}
+                  "Nos pedidos do cliente, o Jev só conta as mensagens em que a regra de hoje não reconheceu o pedido — nada muda no atendimento.",
+                ))}{" "}
           {algumaPausada &&
             t("As tarefas pausadas continuam assim: depois de ligar o Jev, religue-as na lista que aparece aqui.")}{" "}
           {climaPausadoSemIa &&
@@ -586,9 +913,14 @@ function ProntoParaLigar({ dados, recarregar }: { dados: DadosDoJev; recarregar:
 
       <div className="rounded-md border border-border p-3 text-sm">
         <p>
-          {t(
-            "Ao ligar, cada mensagem que o cliente manda vai para a TypeSafe AI, nos Estados Unidos, uma de cada vez e sem o resto da conversa, para o Jev avaliar. Antes de sair, o sistema apaga CPF, telefone e e-mail do texto. Com o Jev desligado, nada é enviado.",
-          )}
+          {/* O aceite nomeia QUEM recebe: via OpenRouter a mensagem passa por ela antes da TypeSafe. */}
+          {origemDoCartao(dados) === "openrouter"
+            ? t(
+                "Ao ligar, cada mensagem que o cliente manda vai para a TypeSafe AI, pela OpenRouter, nos Estados Unidos, uma de cada vez e sem o resto da conversa, para o Jev avaliar. Antes de sair, o sistema apaga CPF, telefone e e-mail do texto. Com o Jev desligado, nada é enviado.",
+              )
+            : t(
+                "Ao ligar, cada mensagem que o cliente manda vai para a TypeSafe AI, nos Estados Unidos, uma de cada vez e sem o resto da conversa, para o Jev avaliar. Antes de sair, o sistema apaga CPF, telefone e e-mail do texto. Com o Jev desligado, nada é enviado.",
+              )}
         </p>
         {aceite === null ? (
           <div className="mt-3 flex items-start gap-2">
@@ -601,9 +933,13 @@ function ProntoParaLigar({ dados, recarregar }: { dados: DadosDoJev; recarregar:
               disabled={!dados.pode_editar}
             />
             <label htmlFor="jev-aceite" className="text-sm">
-              {t(
-                "Concordo com o envio de cada mensagem dos clientes, uma de cada vez e sem o resto da conversa, para a TypeSafe AI, nos Estados Unidos.",
-              )}
+              {origemDoCartao(dados) === "openrouter"
+                ? t(
+                    "Concordo com o envio de cada mensagem dos clientes, uma de cada vez e sem o resto da conversa, para a TypeSafe AI, pela OpenRouter, nos Estados Unidos.",
+                  )
+                : t(
+                    "Concordo com o envio de cada mensagem dos clientes, uma de cada vez e sem o resto da conversa, para a TypeSafe AI, nos Estados Unidos.",
+                  )}
             </label>
           </div>
         ) : (
@@ -671,12 +1007,8 @@ function Ligado({
   return (
     <div className="mt-4 space-y-4">
       <p className="text-sm">
-        {estado === "observando" &&
-          t("Observando — a sua IA de sempre ainda decide. Compare os dois antes de deixar o Jev decidir.")}
-        {estado === "decidindo" &&
-          (decideEmParte(dados)
-            ? t("Decidindo em parte — cada tarefa abaixo diz se o Jev decide ou só observa nela.")
-            : t("Decidindo — cada tarefa abaixo diz o que o Jev decide nela."))}
+        {estado === "observando" && fraseObservando(dados, t)}
+        {estado === "decidindo" && fraseDecidindo(dados, t)}
         {estado === "sozinho" &&
           t(
             "Decidindo sozinho no clima — a empresa ainda não tem uma IA principal que meça o clima, então o Jev mede sem reserva. As outras tarefas dizem abaixo o que fazem.",
@@ -697,7 +1029,10 @@ function Ligado({
           decide sozinho e só se pausa; as outras seguem como sempre. */}
       <ul className="divide-y divide-border rounded-md border border-border" data-testid="jev-tarefas">
         {tarefasDoCartao(dados).map((tarefa) => {
-          const aoDecidir = doRegistro(tarefa.id)?.aoDecidir;
+          const registro = doRegistro(tarefa.id);
+          const aoDecidir = tarefa.id === "roteador" && roteadorSobDemanda(dados)
+            ? ROTEADOR_SOB_DEMANDA : registro?.aoDecidir;
+          const avisa = avisaAEquipe(tarefa.id);
           const climaSozinho = estado === "sozinho" && tarefa.id === TAREFA_DO_CLIMA.id;
           const climaSemIa = tarefa.id === TAREFA_DO_CLIMA.id && !dados.tem_ia_de_sempre;
           return (
@@ -725,7 +1060,9 @@ function Ligado({
                         ? t("Decide sozinho")
                         : tarefa.estado === "observando"
                           ? t("Só observa")
-                          : t("Decide")}
+                          : avisa
+                            ? t("Avisa a equipe")
+                            : t("Decide")}
                 </Badge>
               )}
               {/* "Nova": a tarefa é feminina. A chave "Novo" é a do agente novo. */}
@@ -733,10 +1070,15 @@ function Ligado({
             </div>
 
             {/* O selo sozinho não explicava nada e nunca sumia: diz o que ele
-                quer dizer, e "Manter só observando" (abaixo) o tira. */}
-            {rodando && tarefa.novo && tarefa.estado === "observando" && (
+                quer dizer, e "Manter só observando" (abaixo) o tira. Parada, ela
+                não observa nada — a linha do "Não roda" diz por quê. */}
+            {rodando && tarefa.novo && tarefa.estado === "observando" && !parada(tarefa) && (
               <p className="text-sm text-muted-foreground" data-testid={`jev-nova-${tarefa.id}`}>
-                {t("Começou sozinha, só observando: nada muda para o cliente até você deixar o Jev decidir.")}
+                {avisa
+                  ? t("Começou sozinha, só observando: nada muda até você pedir para o Jev avisar a equipe.")
+                  : podeDecidir(tarefa.id)
+                    ? t("Começou sozinha, só observando: nada muda para o cliente até você deixar o Jev decidir.")
+                    : t("Começou sozinha, só observando: nada muda para o cliente.")}
               </p>
             )}
 
@@ -764,6 +1106,43 @@ function Ligado({
                 </Link>
               </p>
             )}
+            {rodando && tarefa.estado !== "desligada" && tarefa.sem_fluxo === true && (
+              <p className="text-sm text-muted-foreground" data-testid={`jev-sem-fluxo-${tarefa.id}`}>
+                {t(
+                  "Não roda agora: nenhum follow-up publicado tem o passo “Classificar (IA)” com duas saídas ou mais. O Jev só lê a resposta do cliente onde a sua IA de sempre escolhe entre saídas — publique, em Follow-ups, um fluxo com esse passo.",
+                )}{" "}
+                <Link className="underline underline-offset-4" href="/app/ai/followups">
+                  {t("Abrir os follow-ups")}
+                </Link>
+              </p>
+            )}
+            {/* As de pedido só são perguntadas onde o atendimento automático
+                responderia: sem ele em número nenhum, "Só observa" com "nenhuma
+                mensagem" seria para sempre. */}
+            {rodando && tarefa.estado !== "desligada" && tarefa.sem_atendente === "ninguem_no_ar" && (
+              <p className="text-sm text-muted-foreground" data-testid={`jev-sem-atendente-${tarefa.id}`}>
+                {t(
+                  "Não roda agora: nenhum atendente automático está no ar — o Jev só é perguntado onde um atendente responderia. Publique um agente num número, ou tire um agente da pausa, em Agentes.",
+                )}{" "}
+                <Link className="underline underline-offset-4" href="/app/ai/agents">
+                  {t("Abrir os agentes")}
+                </Link>
+              </p>
+            )}
+            {rodando && tarefa.estado !== "desligada" && tarefa.sem_atendente === "externo" && (
+              <p className="text-sm text-muted-foreground" data-testid={`jev-sem-atendente-${tarefa.id}`}>
+                {t(
+                  "Não roda agora: quem conduz as conversas desta empresa é um sistema de fora. O Jev só é perguntado onde um atendente automático daqui responderia.",
+                )}
+              </p>
+            )}
+
+            {/* Sem o botão, o porquê: a tarefa que só observa nesta versão. */}
+            {rodando && roda(tarefa) && registro?.soObserva !== undefined && (
+              <p className="text-sm text-muted-foreground" data-testid={`jev-so-observa-${tarefa.id}`}>
+                {t(registro.soObserva)}
+              </p>
+            )}
 
             {rodando && roda(tarefa) && tarefa.estado === "decidindo" && aoDecidir !== undefined && (
               <p className="text-sm text-muted-foreground" data-testid={`jev-decide-${tarefa.id}`}>
@@ -773,11 +1152,22 @@ function Ligado({
 
             {/* A concordância de cada tarefa com a IA de sempre — o que se lê antes
                 de deixar o Jev decidir. O clima conta "chamariam uma pessoa"; as
-                outras, o mesmo rótulo (em `jev_observacoes`). */}
-            {rodando && roda(tarefa) && tarefa.estado === "observando" && !climaSozinho && concordanciaDa(tarefa, dados) !== null && (
+                outras, o mesmo rótulo (em `jev_observacoes`). A em cascata não
+                concorda com nada — a regra de hoje sempre disse não onde ele foi
+                perguntado —, e conta as mensagens em que ele percebeu o pedido. */}
+            {rodando && roda(tarefa) && registro?.familia === "cascata" && tarefa.percebidos && (
+              <PercebidosDaTarefa
+                tarefa={tarefa}
+                p={tarefa.percebidos}
+                frase={registro.percebidos}
+                formatar={(n) => inteiro.format(n)}
+              />
+            )}
+            {rodando && roda(tarefa) && tarefa.estado === "observando" && !climaSozinho && registro?.familia !== "cascata" && concordanciaDa(tarefa, dados) !== null && (
               <ConcordanciaDaTarefa
                 tarefa={tarefa}
                 o={concordanciaDa(tarefa, dados)!}
+                frase={registro?.concordancia ?? TAREFA_DO_CLIMA.concordancia}
                 formatar={(n) => inteiro.format(n)}
               />
             )}
@@ -786,13 +1176,13 @@ function Ligado({
               <div className="flex flex-wrap items-center gap-3">
                 {/* Parada pela camada ou sem roteador, não há o que comparar antes
                     de decidir; e o clima sem a IA de sempre já decide sozinho. */}
-                {tarefa.estado === "observando" && !parada(tarefa) && !climaSozinho && (
+                {tarefa.estado === "observando" && !parada(tarefa) && !climaSozinho && podeDecidir(tarefa.id) && (
                   <Button
                     size="sm"
                     disabled={enviando}
                     onClick={() => setAConfirmar({ tarefa, aberto: true })}
                   >
-                    {t("Deixar o Jev decidir")}
+                    {avisa ? t("Avisar a equipe") : t("Deixar o Jev decidir")}
                   </Button>
                 )}
                 {/* Sem este caminho, quem deixou o Jev decidir só voltaria a
@@ -809,8 +1199,9 @@ function Ligado({
                     {t("Voltar a só observar")}
                   </Button>
                 )}
-                {/* Grava o estado que já vale: o selo "Nova" sai, e nada muda. */}
-                {tarefa.novo && tarefa.estado === "observando" && (
+                {/* Grava o estado que já vale: o selo "Nova" sai, e nada muda.
+                    Parada, ela não observa nada — o botão prometeria o contrário. */}
+                {tarefa.novo && tarefa.estado === "observando" && !parada(tarefa) && (
                   <Button
                     size="sm"
                     variant="outline"
@@ -852,6 +1243,25 @@ function Ligado({
                     {t("Religar")}
                   </Button>
                 )}
+              </div>
+            )}
+            {tarefa.id === "roteador" && tarefa.estado === "decidindo" && rodando && (
+              <div className="mt-2 space-y-1 text-xs" data-testid="jev-modo-roteador">
+                <label htmlFor="jev-router-mode" className="block font-medium">{t("Como o roteador consulta as IAs")}</label>
+                <select id="jev-router-mode" className="block rounded-md border bg-background p-2 text-sm"
+                  value={roteadorSobDemanda(dados) ? "sob_demanda" : "comparacao"} disabled={!dados.pode_editar || enviando}
+                  onChange={(e) => void mudar({ modo_roteador: e.target.value }, t("Modo do roteador salvo."))}>
+                  <option value="comparacao">{t("Comparar o Jev e a IA de sempre")}</option>
+                  <option value="sob_demanda" disabled={dados.roteador_tem_ia_de_sempre !== true}>{t("Jev; IA de sempre só como reserva")}</option>
+                </select>
+                {dados.roteador_tem_ia_de_sempre !== true ? (
+                  <p className="text-muted-foreground" data-testid="jev-modo-roteador-sem-ia">{t(ROTEADOR_SOB_DEMANDA_SEM_IA)}</p>
+                ) : (
+                  <p className="text-muted-foreground">{roteadorSobDemanda(dados)
+                    ? t("A IA de sempre só é chamada se o Jev falhar ou estiver inseguro.")
+                    : t("As duas IAs respondem; a escolha do Jev decide.")}</p>
+                )}
+                <Link href="/app/ai/runs?tab=roteamento" className="underline underline-offset-4">{t("Ver resultados do roteamento")}</Link>
               </div>
             )}
             {dados.pode_editar && rodando && tarefa.estado === "desligada" && climaSemIa && (
@@ -937,9 +1347,15 @@ function Ligado({
       </div>
 
       <ConfirmarDecidir
+        modoRoteador={roteadorSobDemanda(dados) ? "sob_demanda" : "comparacao"}
         pedido={aConfirmar}
         aoFechar={() => setAConfirmar((p) => p && { ...p, aberto: false })}
-        aoConfirmar={(tarefa) => void mudar(corpoDaMudanca(tarefa, "decidindo"), t("Agora o Jev decide."))}
+        aoConfirmar={(tarefa) =>
+          void mudar(
+            corpoDaMudanca(tarefa, "decidindo"),
+            avisaAEquipe(tarefa.id) ? t("Agora o Jev avisa a equipe.") : t("Agora o Jev decide."),
+          )
+        }
       />
     </div>
   );
@@ -951,22 +1367,26 @@ function Ligado({
  * o caminho de volta.
  */
 function ConfirmarDecidir({
+  modoRoteador,
   pedido,
   aoFechar,
   aoConfirmar,
 }: {
+  modoRoteador?: "comparacao" | "sob_demanda";
   pedido: { tarefa: TarefaNoCartao; aberto: boolean } | null;
   aoFechar: () => void;
   aoConfirmar: (tarefa: TarefaNoCartao) => void;
 }) {
   const t = useT();
   const tarefa = pedido?.tarefa ?? null;
-  const efeito = tarefa ? doRegistro(tarefa.id)?.aoConfirmarDecidir : undefined;
+  const efeito = tarefa?.id === "roteador" && modoRoteador === "sob_demanda"
+    ? ROTEADOR_SOB_DEMANDA : tarefa ? doRegistro(tarefa.id)?.aoConfirmarDecidir : undefined;
+  const avisa = tarefa !== null && avisaAEquipe(tarefa.id);
   return (
     <AlertDialog open={pedido?.aberto === true} onOpenChange={(aberto) => !aberto && aoFechar()}>
       <AlertDialogContent data-testid="jev-confirmar-decidir" data-tarefa={tarefa?.id}>
         <AlertDialogHeader>
-          <AlertDialogTitle>{t("Deixar o Jev decidir?")}</AlertDialogTitle>
+          <AlertDialogTitle>{avisa ? t("Avisar a equipe?") : t("Deixar o Jev decidir?")}</AlertDialogTitle>
           <AlertDialogDescription asChild>
             <div className="space-y-2">
               {tarefa && <p className="font-medium text-foreground">{t(tarefa.rotulo)}</p>}
@@ -977,7 +1397,9 @@ function ConfirmarDecidir({
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>{t("Cancelar")}</AlertDialogCancel>
-          <AlertDialogAction onClick={() => tarefa && aoConfirmar(tarefa)}>{t("Deixar o Jev decidir")}</AlertDialogAction>
+          <AlertDialogAction onClick={() => tarefa && aoConfirmar(tarefa)}>
+            {avisa ? t("Avisar a equipe") : t("Deixar o Jev decidir")}
+          </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
@@ -987,16 +1409,17 @@ function ConfirmarDecidir({
 function ConcordanciaDaTarefa({
   tarefa,
   o,
+  frase,
   formatar,
 }: {
   tarefa: TarefaNoCartao;
   o: Concordancia;
+  /** EM QUE os dois concordaram — a régua da tarefa, do registro. */
+  frase: { antes: string; depois: string };
   formatar: (n: number) => string;
 }) {
   const t = useT();
   const doClima = tarefa.id === TAREFA_DO_CLIMA.id;
-  // Cada tarefa diz EM QUE os dois concordaram — a régua dela, do registro.
-  const frase = (doRegistro(tarefa.id) ?? TAREFA_DO_CLIMA).concordancia;
   // O testid do clima é o da onda 1: as specs o leem.
   return (
     <p className="text-sm" data-testid={doClima ? "jev-concordancia" : `jev-concordancia-${tarefa.id}`}>
@@ -1029,6 +1452,71 @@ function ConcordanciaDaTarefa({
         </>
       )}
     </p>
+  );
+}
+
+/**
+ * "Nos últimos 30 dias, o Jev percebeu N mensagens pedindo … em que a regra de
+ * hoje não reconheceu o pedido." — e, quando há, as conversas das mais
+ * recentes, para quem quer ver o que o cliente disse. Cada link diz de quando é
+ * a mensagem: cinco "Abrir conversa" iguais não diriam qual é qual.
+ *
+ * A frase é traduzida INTEIRA (a do registro, para nenhuma, uma ou várias) e só
+ * então recebe os números: o `{n}` em destaque é onde a tradução o pôs. O zero
+ * tem frase própria, sem número: "percebeu 0 mensagens" lia-se como defeito.
+ */
+function PercebidosDaTarefa({
+  tarefa,
+  p,
+  frase,
+  formatar,
+}: {
+  tarefa: TarefaNoCartao;
+  p: NonNullable<TarefaNoCartao["percebidos"]>;
+  /** A frase do registro, com `{dias}` e `{n}` (a de nenhuma, só `{dias}`). */
+  frase: { nenhuma: string; uma: string; varias: string };
+  formatar: (n: number) => string;
+}) {
+  const t = useT();
+  const tagDoIdioma = useTagDeIdioma();
+  const quando = new Intl.DateTimeFormat(tagDoIdioma, {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const escolhida = p.mensagens === 0 ? frase.nenhuma : p.mensagens === 1 ? frase.uma : frase.varias;
+  const [antes = "", depois] = t(escolhida).replace("{dias}", formatar(p.dias)).split("{n}");
+  return (
+    <div className="space-y-1 text-sm">
+      <p data-testid={`jev-percebidos-${tarefa.id}`}>
+        {antes}
+        {depois !== undefined && (
+          <>
+            <span className="font-medium tabular-nums">{formatar(p.mensagens)}</span>
+            {depois}
+          </>
+        )}
+      </p>
+      {p.mensagens > 0 && p.conversas.length > 0 && (
+        <p className="flex flex-wrap items-center gap-x-3 gap-y-1" data-testid={`jev-percebidos-conversas-${tarefa.id}`}>
+          <span className="text-muted-foreground">{t("Ver as conversas:")}</span>
+          {p.conversas.map((c) => {
+            const em = quando.format(new Date(c.em));
+            return (
+              <Link
+                key={c.href}
+                className="inline-block py-1 underline underline-offset-4"
+                href={c.href}
+                aria-label={`${t("Abrir a conversa do pedido de")} ${em}`}
+              >
+                {em}
+              </Link>
+            );
+          })}
+        </p>
+      )}
+    </div>
   );
 }
 

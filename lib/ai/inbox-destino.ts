@@ -15,6 +15,7 @@ interface Alvo { tabela: string; papel: Role; rotulo: string; href: (id: string,
 /** Apenas entidades que têm produtor e superfície atual; agenda nasce com a Task 6. */
 export const REFERENCIAS_DE_AVISO = {
   ai_agent: { tabela: "ai_agents", papel: "admin", rotulo: "Revisar agente", href: (id: string) => `/app/ai/agents/${id}`, ativo: true },
+  agenda_reminder_sender: { tabela: "calendar_appointments", papel: "manager", rotulo: "Configurar canal do lembrete", href: () => "/app/settings/tenant/agenda" },
   appointment: {tabela:"calendar_appointments",papel:"agent",rotulo:"Abrir compromisso",href:(id:string)=>`/app/agenda?compromisso=${id}`},
   conversation: { tabela: "conversations", papel: "agent", rotulo: "Abrir conversa", href: (id: string) => `/app/inbox/${id}` },
   contact: { tabela: "contacts", papel: "agent", rotulo: "Ver contato", href: (id: string) => `/app/contacts/${id}` },
@@ -32,9 +33,15 @@ export const REFERENCIAS_DE_AVISO = {
   // O remédio é recarregar na conta do provedor, fora do CRM; a tela de
   // credenciais é onde se confere QUAL chave é, e onde se troca por outra.
   ai_provider_credential: { tabela: "ai_provider_credentials", papel: "admin", rotulo: "Revisar credencial", href: () => "/app/ai/credentials" },
+  // (migration 0655, issue #2529) A tarefa que vence ou que já venceu: o aviso
+  // de prazo leva ao TRABALHO que pede gente, e a lista de tarefas é onde ele
+  // está (o mesmo destino do push de tarefa criada, em
+  // `lib/tarefas/criar-tarefa.ts`). Sem referência o botão cairia na Central,
+  // meio caminho — quem recebe o aviso já está nela.
+  task: { tabela: "crm_tasks", papel: "agent", rotulo: "Abrir tarefa", href: () => "/app/tasks" },
 } satisfies Record<string, Alvo>;
 
-export type InboxRefKind = keyof typeof REFERENCIAS_DE_AVISO | "organization" | "ai_budget" | "job_queue" | "cron_jobs";
+export type InboxRefKind = keyof typeof REFERENCIAS_DE_AVISO | "organization" | "ai_budget" | "plano" | "job_queue" | "cron_jobs";
 type ContextoGeral = { papel: Role; href: string; rotulo: string };
 interface Politica { refs: readonly InboxRefKind[]; orientacao: string; geral?: ContextoGeral }
 const EVOLUCAO: ContextoGeral = { papel: "manager", href: "/app/ai/evolution", rotulo: "Abrir evolução do assistente" };
@@ -57,7 +64,9 @@ export const POLITICAS_DE_AVISO = {
   qr_rescan: { refs: ["channel_session"], orientacao: "Peça a quem administra para revisar a conexão do WhatsApp." },
   job_dead: { refs: ["conversation", "job_queue", "cron_jobs"], orientacao: "Confira o motivo deste aviso com quem administra antes de tentar a operação novamente." },
   event_dead: { refs: [], orientacao: "Peça a quem administra para conferir o processamento descrito neste aviso." },
-  budget_exceeded: { refs: ["ai_budget"], orientacao: "Peça ao gestor para revisar o limite e o uso de IA." },
+  // `plano` é o teto de IA do plano de cobrança (spec cobrança §5): a IA parou
+  // porque o uso incluído acabou, e quem resolve é o admin, na tela do plano.
+  budget_exceeded: { refs: ["ai_budget", "plano"], orientacao: "Peça ao gestor para revisar o limite e o uso de IA." },
   budget_warning: { refs: ["ai_budget"], orientacao: "Peça ao gestor para revisar o limite e o uso de IA." },
   // `conversation` primeiro porque é o que o produtor grava hoje (o corpo do
   // aviso ficou CURTO e o contexto foi para dentro da conversa, onde a RLS o
@@ -83,6 +92,12 @@ export const POLITICAS_DE_AVISO = {
   // A orientação evita "revisar a conexão": nada caiu, e o conserto é um clique
   // de autorização em Conexões — dizer "revisar" mandaria procurar um defeito.
   canal_mudo_sem_numero: { refs: ["channel_session"], orientacao: "Peça a quem administra para autorizar os números de teste em Conexões ou abrir o canal ao público." },
+  // Sem `geral`, pelo mesmo motivo do vizinho acima: o item nasce SEMPRE
+  // apontando para a conexão que foi pausada (`ref_kind: channel_session`).
+  // Nada quebrou, então a orientação não manda "revisar" — manda retomar a
+  // pausa, que é o único clique que devolve o canal ao ar. E o aviso fecha
+  // sozinho quando isso acontecer.
+  canal_pausado: { refs: ["channel_session"], orientacao: "Se este canal precisar voltar a operar, retome a pausa em Conexões — este aviso se resolve sozinho quando a pausa for desfeita." },
   promise_unfulfilled: { refs: ["conversation"], orientacao: "Confira o compromisso descrito e defina quem fica responsável." },
   contact_proposal_expired: { refs: ["organization"], orientacao: "A sugestão venceu. Se a informação ainda for relevante, confirme com o cliente antes de editar sua ficha." },
   conhecimento_nao_indexado: { refs: ["ai_knowledge_source"], orientacao: "Peça ao gestor para conferir o material e o motivo da falha na base de conhecimento." },
@@ -113,6 +128,10 @@ export const POLITICAS_DE_AVISO = {
   // está pendente é o ATENDIMENTO, e quem abre o aviso precisa cair nele. A
   // conferência da conexão é o segundo passo, e vai na orientação.
   aviso_de_caso_nao_entregue: { refs: ["agent_case"], orientacao: "O aviso deste atendimento não saiu no WhatsApp. Abra o atendimento — ele continua esperando — e confira a conexão de avisos em Configurações." },
+  // O Jev percebeu o pedido NA conversa (`lib/ai/decisao/pedidos.ts`): o botão
+  // leva a ela, onde está o que o cliente escreveu — a Central não o repete.
+  jev_pedido_de_humano: { refs: ["conversation"], orientacao: "Abra a conversa e decida se alguém da equipe assume o atendimento." },
+  jev_parar_de_receber: { refs: ["conversation"], orientacao: "Abra a conversa e confira se o cliente quer mesmo parar de receber mensagens." },
   // Mesmo par de `message_send_stuck`, para a proposta — o cron devolve a
   // rascunho sozinho, sem reenviar; quem lê decide se envia de novo.
   proposta_travada: { refs: ["proposal"], orientacao: "Confira a proposta antes de decidir se precisa enviar novamente." },
@@ -120,9 +139,54 @@ export const POLITICAS_DE_AVISO = {
     refs: ["proposal"],
     orientacao: "A IA rascunhou esta proposta — confirme o modelo sugerido (ou escolha outro) e confira se todos os itens têm preço antes de enviar.",
   },
-  // `agent_case`: o caso que a IA abriu, na Central no instante da abertura
-  // (`lib/escalacao/caso-na-central.handler.ts`).
-  other: { refs: ["lead", "channel_session", "appointment", "ai_agent", "ai_provider_credential", "agent_case"], orientacao: "Confira a situação descrita neste aviso com a pessoa responsável." },
+  // A revisão depois da reativação (`fn_reativar_organizacao`). Nasce SEM
+  // referência: o aviso é sobre N conversas, não sobre uma, e com
+  // `ref_kind='organization'` o resolvedor não chegaria ao Inbox. O Inbox não
+  // tem parâmetro de aba na URL (`app/app/inbox/page.tsx` só lê `id` e
+  // `rascunho`), por isso o botão leva ao Inbox e a orientação nomeia as abas.
+  // As DUAS: numa empresa com IA, a conversa sem dono e sem silêncio é
+  // classificada como `automatico` (comando-da-conversa.ts) e só cai na Fila
+  // quando a empresa não tem atendimento automático.
+  // 0583: o aviso também nasce SEM conversa (agendamento de disparo único
+  // desligado, passo de follow-up descartado). A fila deles é a de
+  // IA › Follow-ups (QueueTab lê cron_jobs); a orientação nomeia os dois lugares.
+  org_reativada: {
+    refs: [],
+    orientacao: "A IA não respondeu nem vai responder sozinha às conversas que chegaram durante a suspensão: abra o Inbox e procure-as nas abas Fila e Automático. Os agendamentos e os passos de follow-up que este aviso cita também não voltam sozinhos: confira em IA › Follow-ups.",
+    geral: { papel: "agent", href: "/app/inbox", rotulo: "Abrir o Inbox" },
+  },
+  // A cobrança do revendedor (spec cobrança §2.5). Os avisos da régua nascem
+  // SEM referência e vão pelo `geral`; o de 80% do teto de IA nasce com
+  // `ref_kind='plano'` e usa o ramo de `plano` do resolvedor. Os dois levam ao
+  // mesmo lugar — Plano e cobrança, onde está o "Pagar agora" — e só quem
+  // administra a empresa chega lá (a entrada do menu é `minRole: "admin"`).
+  cobranca: {
+    refs: ["plano"],
+    orientacao:
+      "Abra Plano e cobrança: lá estão o link para pagar, a troca do cartão e a troca de plano. Só quem administra a empresa vê essa tela.",
+    geral: { papel: "admin", href: "/app/settings/billing", rotulo: "Abrir plano e cobrança" },
+  },
+  // A troca do e-mail de login pelo admin da plataforma. Sem referência: o
+  // aviso não leva o id da pessoa (a Central é lida por toda a empresa), e
+  // quem precisa conferir é quem administra a equipe.
+  email_de_login_trocado: {
+    refs: [],
+    orientacao: "Confirme com a pessoa que ela reconhece a troca. Se não reconhece, fale com quem administra o servidor.",
+    geral: { papel: "admin", href: "/app/team", rotulo: "Abrir a equipe" },
+  },
+  // Os dois avisos de prazo de tarefa (#2529) levam à tarefa, e a orientação
+  // diz as DUAS saídas possíveis — concluir ou reagendar — porque as duas são
+  // conclusões legítimas do aviso: ele não pede que a pessoa se desculpe pelo
+  // atraso, pede que o prazo volte a ser verdade.
+  task_due: {
+    refs: ["task"],
+    orientacao: "Abra a tarefa e conclua antes do prazo — ou reagende agora, se já dá para ver que não vai caber.",
+  },
+  task_overdue: {
+    refs: ["task"],
+    orientacao: "A tarefa venceu sem conclusão. Abra e conclua, ou reagende o prazo se ele não for mais possível.",
+  },
+  other: { refs: ["agenda_reminder_sender", "lead", "channel_session", "appointment", "ai_agent", "ai_provider_credential", "agent_case"], orientacao: "Confira a situação descrita neste aviso com a pessoa responsável." },
 } satisfies Record<InboxKind, Politica>;
 
 /**
@@ -140,6 +204,9 @@ const ROTULO_POR_KIND: Record<string, string> = {
   // "Abrir o fluxo" convida a olhar; o aviso pede CONFERIR qual fluxo está
   // parado antes de ir ligá-lo no agente.
   followup_sem_agente: "Ver o fluxo parado",
+  // O aviso é sobre o que o cliente escreveu ali: a ação é ler e decidir.
+  jev_pedido_de_humano: "Abrir a conversa",
+  jev_parar_de_receber: "Abrir a conversa",
 };
 
 const SEM_DESTINO: DestinoDoAviso = { estado: "sem_destino", orientacao: "Este aviso não tem um contexto que possa ser aberto nesta versão." };
@@ -222,9 +289,26 @@ export async function resolverDestinosDosAvisos<T extends ReferenciaDoAviso>(
             : item.kind === "contact_proposal_expired" ? { estado: "sem_destino", orientacao: p.orientacao }
             : !permite(papel, item.ref_kind === "ai_budget" ? "manager" : "agent") ? semPermissao("manager")
             : { estado: "disponivel", href: item.ref_kind === "ai_budget" ? "/app/ai/usage" : "/app/radar", rotulo: item.ref_kind === "ai_budget" ? "Abrir uso de IA" : "Abrir Radar" };
+        } else if (item.ref_kind === "plano") {
+          // Plano é assunto do ADMIN (a entrada de Configurações é `minRole: "admin"`).
+          destination = item.ref_id !== organizationId ? INDISPONIVEL
+            : !permite(papel, "admin") ? semPermissao("admin")
+            : { estado: "disponivel", href: "/app/settings/billing", rotulo: "Abrir plano e cobrança" };
         } else destination = { estado: "sem_destino", orientacao: p.orientacao };
       }
     }
     return { ...item, destination };
   });
+}
+
+/**
+ * Quem ENXERGA um aviso da Central (migration 0689, doc de decisão 162): sem
+ * `para_user_id` é da empresa inteira; com ele, só daquela pessoa. É o filtro
+ * `.or()` do PostgREST que a lista, o contador do sino, o "Marcar todos
+ * resolvidos" e o resolver de um aviso aplicam — os quatro com o mesmo texto,
+ * para que o que a pessoa vê seja exatamente o que ela resolve. `userId` vem do
+ * JWT validado (`requireRole` → `getUser`), nunca do corpo.
+ */
+export function avisoVisivelPara(userId: string): string {
+  return `para_user_id.is.null,para_user_id.eq.${userId}`;
 }

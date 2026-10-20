@@ -12,14 +12,24 @@ import { type NextRequest } from "next/server";
 import { audit } from "@/lib/audit";
 import { fail, ok } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
-import { mencaoAtingeUsuario, tokensDeMencao } from "@/lib/notifications/mentions";
+import {
+  idsDeMencaoEstrutural,
+  mencaoAtingeUsuario,
+  textoLegivelDeMencao,
+  tokensDeMencao,
+} from "@/lib/notifications/mentions";
+import { isMediaPathOwnedBy } from "@/lib/messaging/media/upload-validation";
 import { createNoteSchema } from "@/lib/schemas/notes";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { traduzir } from "@/lib/i18n/dicionario";
 
 export const dynamic = "force-dynamic";
-const COLS = "id, conversation_id, body, created_by_user_id, created_by_name, created_at";
+// As três colunas de anexo (migration 0483) entram nos DOIS caminhos: sem elas
+// no SELECT o card da nota devolveria `undefined` em vez de `null` e o renderer
+// ligaria o anexo com um path inexistente.
+const COLS =
+  "id, conversation_id, body, created_by_user_id, created_by_name, created_at, media_storage_path, media_mime, media_size_bytes";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -81,6 +91,19 @@ export async function POST(req: NextRequest, { params }: RouteParams): Promise<R
     });
   }
 
+  // `anexo` é o trio que a rota de upload acabou de devolver. Ele NÃO é
+  // validado de novo aqui (mime/tamanho são da allowlist do upload, que já
+  // rodou com o arquivo na mão) — só a forma, pelo schema. `isMediaPathOwnedBy`
+  // é o corte de posse: um path fora de {org}/{conversa}/ não pode virar anexo
+  // de uma conversa que não é dele, nem que o cliente tenha agent.
+  const anexo = parsed.data.anexo;
+  if (anexo && !isMediaPathOwnedBy(anexo.storage_path, org.orgId, id)) {
+    return fail("validation_failed", t("Dados inválidos."), 422, {
+      requestId,
+      details: { anexo: ["anexo fora desta conversa."] },
+    });
+  }
+
   const { data, error } = await supabase
     .from("conversation_notes")
     .insert({
@@ -89,6 +112,13 @@ export async function POST(req: NextRequest, { params }: RouteParams): Promise<R
       body: parsed.data.body,
       created_by_user_id: user.id,
       created_by_name: user.full_name ?? null,
+      ...(anexo
+        ? {
+            media_storage_path: anexo.storage_path,
+            media_mime: anexo.media_mime,
+            media_size_bytes: anexo.media_size_bytes,
+          }
+        : {}),
     })
     .select(COLS)
     .single();
@@ -118,7 +148,12 @@ async function emitirMencoesDaNota(input: {
   body: string;
   fromUserId: string;
 }): Promise<void> {
-  if (tokensDeMencao(input.body).length === 0) return;
+  // DOIS caminhos, e a ordem deles importa: o ESTRUTURAL (gravado pelo
+  // autocompletar da #2372) carrega o id no corpo, então não depende de
+  // nome nenhum; o textual legado continua de pé para nota escrita à mão.
+  const estruturais = new Set(idsDeMencaoEstrutural(input.body));
+  const textuais = tokensDeMencao(input.body);
+  if (estruturais.size === 0 && textuais.length === 0) return;
   const admin = createAdminClient();
   const { data: members } = await admin
     .from("user_organizations")
@@ -126,28 +161,42 @@ async function emitirMencoesDaNota(input: {
     .eq("organization_id", input.organizationId)
     .is("revoked_at", null);
   const ids = ((members ?? []) as Array<{ user_id: string }>).map((m) => m.user_id).filter((id) => id !== input.fromUserId);
-  const preview = input.body.trim().slice(0, 140);
+  // Legível ANTES de cortar: cortar o corpo cru poderia deixar meio token solto
+  // (`…(mencao:2f9c`) e a tela mostraria o escombro dele.
+  const preview = textoLegivelDeMencao(input.body.trim()).slice(0, 140);
+
+  const emitir = (userId: string) =>
+    admin.rpc("emit_event", {
+      p_event_type: "user.mentioned",
+      p_entity_kind: "conversation_note",
+      p_entity_id: input.conversationId,
+      p_payload: {
+        conversation_id: input.conversationId,
+        to_user_id: userId,
+        from_user_id: input.fromUserId,
+        body_preview: preview,
+      },
+      p_metadata: {},
+      p_organization_id: input.organizationId,
+    });
+
   await Promise.all(
     ids.map(async (userId) => {
+      // Estrutural: `userId` já veio da membership desta org, então o id no
+      // corpo só pode ser de alguém daqui — sem ida ao auth, sem olhar nome
+      // ou e-mail. É o caminho que notifica a PESSOA ESCOLHIDA e mais ninguém.
+      if (estruturais.has(userId.toLowerCase())) {
+        await emitir(userId);
+        return;
+      }
+      if (textuais.length === 0) return;
       const { data: userRes } = await admin.auth.admin.getUserById(userId);
       const u = userRes?.user;
       if (!u?.email) return;
       const fullName =
         (typeof u.user_metadata?.full_name === "string" ? u.user_metadata.full_name : null) ?? null;
       if (!mencaoAtingeUsuario(input.body, { id: userId, email: u.email, full_name: fullName })) return;
-      await admin.rpc("emit_event", {
-        p_event_type: "user.mentioned",
-        p_entity_kind: "conversation_note",
-        p_entity_id: input.conversationId,
-        p_payload: {
-          conversation_id: input.conversationId,
-          to_user_id: userId,
-          from_user_id: input.fromUserId,
-          body_preview: preview,
-        },
-        p_metadata: {},
-        p_organization_id: input.organizationId,
-      });
+      await emitir(userId);
     }),
   );
 }

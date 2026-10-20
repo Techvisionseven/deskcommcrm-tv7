@@ -134,6 +134,58 @@ describe("embedText", () => {
     expect(request.headers).toMatchObject({ authorization: "Bearer chave-ficticia-openrouter" });
   });
 
+  // #1130 (@vgamkt): a base pode ser preparada pelo Google. A pergunta-chave é a
+  // DIMENSÃO: o Gemini devolve 3072 por padrão e a coluna é `vector(1536)`. O
+  // caso mede o pedido que sai de verdade para o Google (via `doEmbed` com
+  // `fetch` dublado), não só o objeto que montamos.
+  it("Google: provider explícito, 1536 dimensões pedidas ao provedor e o par documento×pergunta", async () => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({
+      // Um valor só = `:embedContent`, cuja resposta é `{ embedding: { values } }`.
+      embedding: { values: Array(1536).fill(0) },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchSpy);
+    chaveMock = () => ({
+      apiKey: "chave-ficticia-google",
+      baseUrl: null,
+      provedor: "google",
+      viaGateway: false,
+      origem: "binding_do_ponto",
+      rotulo: "Google",
+      avisos: [],
+    });
+
+    const r = await embedText("oi", { organizationId: "org-1", ponto: "embedding_consultar" });
+    await embedText("oi", { organizationId: "org-1" });
+
+    expect(r.model).toBe("google/gemini-embedding-001");
+    const [consulta, indexacao] = embedSpy.mock.calls.map((c) => c[0]) as Array<{
+      model: {
+        modelId: string;
+        doEmbed: (args: { values: string[]; providerOptions?: unknown }) => Promise<unknown>;
+      };
+      providerOptions?: { google?: Record<string, unknown> };
+    }>;
+    expect(consulta!.providerOptions?.google).toEqual({
+      outputDimensionality: 1536,
+      taskType: "RETRIEVAL_QUERY",
+    });
+    expect(indexacao!.providerOptions?.google?.taskType).toBe("RETRIEVAL_DOCUMENT");
+    expect(consulta!.model.modelId).toBe("gemini-embedding-001");
+
+    await consulta!.model.doEmbed({ values: ["oi"], providerOptions: consulta!.providerOptions });
+    const [url, request] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toContain("generativelanguage.googleapis.com");
+    expect(url).toContain("gemini-embedding-001");
+    expect(JSON.stringify(JSON.parse(String(request.body)))).toContain('"outputDimensionality":1536');
+    expect(request.headers).toMatchObject({ "x-goog-api-key": "chave-ficticia-google" });
+  });
+
+  it("OpenAI não recebe opção do Google", async () => {
+    await embedText("oi", { organizationId: "org-1", ponto: "embedding_consultar" });
+    const arg = embedSpy.mock.calls[0]?.[0] as { providerOptions?: unknown };
+    expect(arg.providerOptions).toBeUndefined();
+  });
+
   it("organização SEM chave nenhuma vira erro tipado, não uma falha genérica", async () => {
     chaveMock = () => null;
 

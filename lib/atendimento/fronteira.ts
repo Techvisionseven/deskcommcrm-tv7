@@ -19,7 +19,7 @@ export class StaleServiceBoundaryError extends Error {
 }
 /** `followup_stale` deixou de ser 40001 (serialization_failure): o cliente retentava para sempre. */
 export function isFollowupCasRecusado(error: { code?: string; message?: string } | null | undefined): boolean {
-  return error?.code === "40001" || error?.message === "followup_stale";
+  return error?.code === "PT409" || error?.code === "40001" || error?.message === "followup_stale";
 }
 /**
  * ABRIR A PRIMEIRA DEMANDA NÃO É ATENDIMENTO NOVO — e quem diz isso é o schema.
@@ -69,6 +69,19 @@ export function assertCurrentServiceBoundary(
   ) {
     throw new StaleServiceBoundaryError();
   }
+}
+/** Mesma identidade de atendimento: org, contato, conversa, revisão e demanda. */
+export function mesmaFronteira(a: ServiceBoundary | null, b: ServiceBoundary | null): boolean {
+  return (
+    !!a &&
+    !!b &&
+    a.organization_id === b.organization_id &&
+    a.contact_id === b.contact_id &&
+    a.conversation_id === b.conversation_id &&
+    a.service_revision === b.service_revision &&
+    a.demanda_id === b.demanda_id &&
+    a.demanda_revision === b.demanda_revision
+  );
 }
 export function parseServiceBoundary(value: unknown): ServiceBoundary | null {
   if (!value || typeof value !== "object") return null;

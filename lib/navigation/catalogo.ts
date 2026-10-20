@@ -111,6 +111,26 @@ export const NAV_GROUPS: NavGroup[] = [
 export const GRUPO_NO_RODAPE: NavGroupId = "organizacao";
 
 /**
+ * A PORTA SOBE AO MENU LATERAL? — a regra, num lugar só.
+ *
+ * `sidebarGroups` (`lib/navigation/registry.ts`) e o texto de "onde o módulo aparece"
+ * (`lib/navigation/onde-o-modulo-aparece.ts`) precisam concordar: se o primeiro desenha a porta no
+ * menu e o segundo anuncia o passo do hub, o produto mente para quem liga o módulo. A condição
+ * estava ESCRITA NOS DOIS — copiada —, e cópia de regra diverge sem avisar.
+ *
+ * `temEscolhaExplicita` é "a empresa escreveu lista de áreas à mão". Ele só importa para grupo SEM
+ * hub: ali não há "Ver tudo" para hospedar a porta, então ela sobe ao menu quando a empresa
+ * personalizou. Com hub, quem decide é só o `sidebar` do destino.
+ */
+export function sobeAoMenuLateral(
+  d: Pick<NavMetadata, "sidebar" | "group">,
+  temEscolhaExplicita: boolean,
+): boolean {
+  const grupo = NAV_GROUPS.find((g) => g.id === d.group);
+  return !!d.sidebar || (!grupo?.hub && temEscolhaExplicita);
+}
+
+/**
  * Como `minRole` foi escolhido — medido tela a tela, não estimado:
  *
  *   1. A página redireciona por papel?  → usa esse papel. Assim a navegação
@@ -278,6 +298,20 @@ export const NAV_CATALOG = [
     sidebar: true,
   },
   {
+    // A porta dos planos de tarefa (#1752): montar a sequência UMA vez e o
+    // `apply_task_plan` aplicá-la a cada negócio. Fica no MESMO hub de Tarefas,
+    // mas SEM `sidebar` pelo critério já usado em Empresas/Pessoas: é
+    // CADASTRO, não uso diário — quem monta um plano abre esta tela poucas
+    // vezes, e o menu de 900px (`tests/e2e/navegacao.spec.ts`) não ganha mais
+    // um pixel por isso.
+    href: "/app/tasks/planos",
+    label: "Planos de tarefa",
+    description: "Sequências reutilizáveis de tarefas — montar uma vez e aplicar a cada negócio.",
+    icon: "FlowArrow",
+    group: "crm",
+    section: "O dia a dia da venda",
+  },
+  {
     // Módulo VoIP (migration 0347). No grupo do CRM pelo mesmo critério de
     // Tarefas: quem atende confere ligações perdidas e transcrições no dia a
     // dia, não como revisão deliberada.
@@ -431,6 +465,10 @@ export const NAV_CATALOG = [
     // O balcão continua a um clique: CRM › Ver tudo em CRM › "O dia a dia da
     // venda", e pelo ⌘K digitando "comanda".
     minRole: "viewer",
+    // Módulo de tabela (ADR-0002, #1907): as cinco tabelas da comanda nascem na
+    // instalação do `financeiro` em `/admin/modulos`; sem ele a porta some, como
+    // `/app/honorarios`. O caixa (Configurações › Financeiro) é núcleo e fica.
+    modulo: "financeiro",
   },
   {
     // O catálogo financeiro: contas, formas de pagamento e plano de contas.
@@ -753,6 +791,21 @@ export const NAV_CATALOG = [
     minRole: "viewer",
   },
   {
+    // Módulo opcional (ADR-0002), fonte `modulos_instalados` — a porta só existe
+    // depois que o administrador da instalação instala `honorarios` em
+    // `/admin/modulos`. Mesmo mecanismo genérico de `banco_externo` acima, só
+    // que a fonte é a TABELA, não a flag de `platform_config`; `deModuloDesligado`
+    // e este filtro não sabem a diferença, e não precisam saber.
+    href: "/app/honorarios",
+    label: "Honorários",
+    description: "O modelo de cobrança de cada caso e o calendário de parcelas.",
+    icon: "ChartBar",
+    group: "analise",
+    section: "Dinheiro",
+    minRole: "viewer",
+    modulo: "honorarios",
+  },
+  {
     href: "/app/metrics",
     label: "Desempenho",
     description: "Funil e performance por atendente nos últimos 30 dias.",
@@ -858,6 +911,20 @@ export const NAV_CATALOG = [
     minRole: "manager",
   },
   {
+    // A porta do freio POR EMPRESA do passo `ai_decide` (issue #2367). O #2228
+    // criou o passo e o deixou opcional POR REGRA; sem esta tela, desligar de
+    // uma vez todos os `ai_decide` de uma organização só existiria como
+    // `UPDATE` à mão no `organizations.settings` — o anti-exemplo de "toda
+    // configuração tem superfície" (docs/doctrine/restricao-de-canal.md).
+    href: "/app/settings/automacoes",
+    label: "Automações",
+    description: "O freio único do passo em que a IA escolhe entre as opções de uma regra, para a empresa inteira.",
+    icon: "FlowArrow",
+    group: "organizacao",
+    section: "Sua empresa",
+    minRole: "manager",
+  },
+  {
     // A porta que faltava para o vocabulário de etiquetas (issue #852). Até
     // aqui a etiqueta só ENTRAva no vocabulário — cada agente escrevia a que
     // quisesse em `add_tag` — e não havia por onde corrigir, juntar as duas
@@ -876,6 +943,20 @@ export const NAV_CATALOG = [
     icon: "Tag",
     group: "organizacao",
     section: "Sua empresa",
+    minRole: "manager",
+  },
+  {
+    // A área única dos recursos opcionais (pedido do mantenedor, doc 73/80):
+    // tudo o que a empresa pode ligar, com o estado e o caminho até a tela onde
+    // se liga. Só leitura — quem liga continua sendo a tela do assunto.
+    href: "/app/settings/recursos",
+    label: "Recursos opcionais",
+    description: "Tudo o que se liga e desliga, se está ligado e onde se ajusta.",
+    icon: "ListChecks",
+    group: "organizacao",
+    section: "Sua empresa",
+    // `manager`: o gerente decide metade das chaves da lista. Atendente e
+    // leitor não ajustam nenhuma, e a tela redireciona os dois para /403.
     minRole: "manager",
   },
   {
@@ -941,8 +1022,10 @@ export const NAV_CATALOG = [
   },
   {
     href: "/app/settings/billing",
-    label: "Billing",
-    description: "Plano e cobrança.",
+    // Spec da cobrança §9: as mensagens de limite e a Central mandam para
+    // "Configurações › Plano e cobrança" — o item precisa ter esse nome.
+    label: "Plano e cobrança",
+    description: "Pagamento, troca de plano e faturas da sua empresa.",
     icon: "Receipt",
     group: "organizacao",
     section: "Sua empresa",
@@ -971,6 +1054,32 @@ export const NAV_CATALOG = [
     label: "Trunk SIP",
     description: "Credenciais do provedor SIP para chamadas de voz por IA.",
     icon: "Phone",
+    group: "organizacao",
+    section: "Dados e acesso",
+    minRole: "admin",
+  },
+  {
+    // A porta do cadastro do servidor MCP externo (#2948). Em "Dados e acesso"
+    // pela MESMA razão de API Tokens e Dados externos: é o eixo "por onde dado
+    // entra e sai do CRM" — o endereço e a chave são de um sistema de fora que
+    // a IA da empresa consulta. Antes desta linha, a action que grava
+    // (`definirServidorMcpExterno`) existia e não era chamada de lugar nenhum:
+    // registrar o servidor só era possível por fora da interface.
+    //
+    // SEM `sidebar`, como as duas vizinhas: trocar a credencial de um ERP é
+    // tarefa de uma vez, e o hub + o ⌘K já são porta suficiente.
+    //
+    // ⚠️ `minRole: "admin"` é o mais perto que este registro chega do que a
+    // tela cobra: quem ESCREVE é o dono da INSTALAÇÃO (`is_platform_admin`, a
+    // `regraPlatformAdmin` da action), e o catálogo não modela esse papel — a
+    // mesma limitação que a allowlist de `/app/settings/atualizacao` já
+    // registra em `tests/unit/navegacao-completude.test.ts`. Quem clicar sem a
+    // permissão recebe `/403` da própria tela; a porta existe porque a tela
+    // nova precisa de por onde ser encontrada (item 14 da Definition of Done).
+    href: "/app/settings/servidor-mcp-externo",
+    label: "Servidor MCP externo",
+    description: "O endereço e a chave do sistema de fora que a IA da empresa pode consultar.",
+    icon: "Plugs",
     group: "organizacao",
     section: "Dados e acesso",
     minRole: "admin",

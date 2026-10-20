@@ -29,6 +29,11 @@ import type pg from 'pg';
 
 import { expectativaDeAtendimento } from '@/lib/escalacao/disponibilidade';
 import {
+  CHAVE_DO_HANDOFF_TECNICO,
+  derivacaoPendenteDoGatilho,
+  turnoSemPalavraDoCliente,
+} from '@/lib/escalacao/handoff-tecnico';
+import {
   montarBriefingDaPassagem,
   type BriefingDaPassagem,
   type CheckpointParaBriefing,
@@ -111,6 +116,10 @@ export async function isLeadInHandoff(db: pg.Pool, tenantId: string, leadId: str
   const { rows } = await db.query<{ handoff: boolean }>(
     `select (
        c.force_human
+       -- A marca PERMANENTE "sempre atendimento humano" (issue 2379): mesma
+       -- leitura, mesmo efeito — o turno nem começa. force_human é a trava de
+       -- handoff, que a devolução limpa; esta é a que ela não alcança.
+       or c.ai_opt_out
        or exists (
          select 1 from conversations v
          where v.organization_id = $1 and v.contact_id = c.id
@@ -173,6 +182,32 @@ export async function performHumanHandoff(
      * aberto na informação.
      */
     avisoAoLead?: DesfechoDoAviso;
+    /**
+     * A mensagem cuja derivação ainda estava ABERTA quando o handoff disparou
+     * (#2210). Presente = o handoff nasceu de falha de infraestrutura, e a marca
+     * gravada em `conversations.metadata.handoff_tecnico` autoriza a devolução
+     * automática quando `media_derived_status` virar `ready`.
+     *
+     * Só `applyRequestHumanHandoff` o preenche, e só quando nada do que o
+     * cliente disse no turno era legível (`turnoSemPalavraDoCliente`). Os
+     * outros chamadores — pedido explícito detectado, opt-out, "Assumir eu",
+     * orçamento — nunca o passam, e a ferramenta do modelo não o passa quando
+     * havia palavra do cliente (um pedido explícito em texto, por exemplo):
+     * sem marca, o handoff continua `infinity`.
+     */
+    derivacaoPendente?: { messageId: string };
+    /**
+     * Os campos que um fluxo DETERMINÍSTICO coletou no turno (pergunta de um
+     * campo por turno), em pares rótulo/valor — nome, exame, data…
+     *
+     * Presente E `passagem` ausente = o handoff grava sozinho a linha de
+     * `passagens_de_atendimento` com motivo canônico `verificacao_manual`, e os
+     * campos chegam a quem assume SOB `fn_can_view_conversation` — nunca no
+     * corpo da Central, que a rota entrega a qualquer `agent`. Com `passagem`
+     * declarada (o caminho da ferramenta do modelo), este campo é ignorado: o
+     * briefing do chamador já carrega o que o turno tem.
+     */
+    camposColetados?: Readonly<Record<string, string>>;
     log: Logger;
   },
 ): Promise<void> {
@@ -188,6 +223,20 @@ export async function performHumanHandoff(
   // está (nunca rouba do humano nem reabre encerrada). Fase 3: junto, zera a aderência
   // ao agente do router — se o bot for reativado, o router decide de novo (não reassume
   // o mesmo agente por inércia).
+  // #2210: a marca só existe quando o handoff nasceu com a derivação ABERTA.
+  // Escrevemos e apagamos na MESMA cláusula (`- $5 || $6`): um handoff sem
+  // marca remove qualquer marca anterior — um handoff novo por outro motivo
+  // invalida o antigo, e é o `motivo_gravado` que amarra um ao outro.
+  const marcaDaDerivacao = opts.derivacaoPendente
+    ? JSON.stringify({
+        [CHAVE_DO_HANDOFF_TECNICO]: {
+          causa: "derivacao_ausente",
+          message_id: opts.derivacaoPendente.messageId,
+          motivo_gravado: opts.reason,
+        },
+      })
+    : "{}";
+
   await guardServiceEffect();
   await db.query(
     `update conversations
@@ -195,11 +244,16 @@ export async function performHumanHandoff(
             bot_silenced_until = $3,
             last_handoff_at = now(),
             last_handoff_reason = $4,
+            -- marcado_em sai do now() do BANCO, o mesmo relógio do created_at
+            -- das mensagens com que a reação compara (handoff-tecnico.ts).
+            metadata = (coalesce(metadata, '{}'::jsonb) - $5::text)
+                       || case when $6::jsonb = '{}'::jsonb then '{}'::jsonb
+                               else jsonb_set($6::jsonb, array[$5::text, 'marcado_em'], to_jsonb(now())) end,
             active_ai_agent_id = null,
             active_intent = null,
             active_agent_set_at = null
       where organization_id = $1 and id = $2`,
-    [ids.tenantId, ids.conversationId, SILENCE_INFINITY, opts.reason],
+    [ids.tenantId, ids.conversationId, SILENCE_INFINITY, opts.reason, CHAVE_DO_HANDOFF_TECNICO, marcaDaDerivacao],
   );
 
   // (c) Cancela os crons PENDENTES do lead (follow-ups agendados — F3-01/02). Idempotente,
@@ -233,6 +287,38 @@ export async function performHumanHandoff(
     // Central abaixo sai do mesmo jeito.
     if (!gravou.gravada) {
       opts.log.warn('passagem não registrada — o aviso sai, o contexto não', { erro: gravou.erro });
+    }
+  }
+
+  // (c3) SEM passagem declarada, mas com DADOS COLETADOS: o fluxo
+  // determinístico que pergunta campo a campo encerra em handoff, e os campos
+  // perguntados precisam chegar a quem assume. Chegam na PASSAGEM — o lugar
+  // que a rota da Central lê sob `fn_can_view_conversation` —, e nunca no
+  // corpo do aviso, que a mesma rota entrega a QUALQUER `agent`. O motivo é o
+  // canônico `verificacao_manual`: o cliente não pediu uma pessoa, um fluxo
+  // coletou dados e precisa de verificação humana — o rótulo tem de dizer o
+  // que houve, porque é a primeira frase de quem abre a conversa.
+  if (opts.passagem === undefined && temCamposColetados(opts.camposColetados)) {
+    await guardServiceEffect();
+    const briefing = montarBriefingDaPassagem({
+      checkpoint: null,
+      camposColetados: opts.camposColetados,
+      motivo: { codigo: 'verificacao_manual' },
+    });
+    const gravou = await registrarPassagem(db, {
+      organizationId: ids.tenantId,
+      contactId: ids.leadId,
+      conversationId: ids.conversationId,
+      motor: 'engine',
+      origem: 'runtime_nativo',
+      motivoCodigo: 'verificacao_manual',
+      briefing,
+    });
+    // Mesma disciplina do (c2): a passagem já aconteceu, o erro vira log.
+    if (!gravou.gravada) {
+      opts.log.warn('passagem com dados coletados não registrada — o aviso sai, os campos não', {
+        erro: gravou.erro,
+      });
     }
   }
 
@@ -317,6 +403,17 @@ export async function performHumanHandoff(
     motivo_codigo: opts.passagem?.motivoCodigo ?? 'nao_declarado',
     origem: opts.passagem?.origem ?? 'nao_declarada',
   });
+}
+
+/**
+ * Há algum campo realmente preenchido? Um objeto `{ nome: "  " }` é coleta sem
+ * resultado — e sem resultado não há passagem a gravar: o caminho é o legado,
+ * byte a byte, que `tests/invariants/escalacao-ciclo-humano.test.ts` (arquivo
+ * congelado) chama com a assinatura antiga.
+ */
+function temCamposColetados(campos: Readonly<Record<string, string>> | undefined): boolean {
+  if (campos === undefined) return false;
+  return Object.values(campos).some((v) => typeof v === 'string' && v.trim() !== '');
 }
 
 /**
@@ -405,6 +502,7 @@ async function corpoDaCentral(
  * tentou, nem o que o cliente pediu com as palavras dele.
  */
 export const requestHumanHandoffInputSchema = z.strictObject({
+  motivo_codigo: z.enum(['requested_human', 'critical_stage']).optional(),
   reason: z.string().min(1).max(500).optional(),
   por_que: z.string().min(1).max(500).optional(),
   o_que_tentei: z
@@ -420,7 +518,8 @@ export const requestHumanHandoffInputSchema = z.strictObject({
 });
 
 const PAYLOAD_TEACHING =
-  'Campos aceitos: por_que (por que você está passando, em uma frase), o_que_tentei (lista curta ' +
+  'Campos aceitos: motivo_codigo (requested_human para pedido de uma pessoa; critical_stage para ' +
+  'uma etapa do atendimento que exige finalização humana), por_que (por que você está passando, em uma frase), o_que_tentei (lista curta ' +
   'do que você já tentou, com o desfecho de cada um), cliente_quer (o que a pessoa está pedindo, ' +
   'nas palavras dela). `reason` ainda é aceito como sinônimo de por_que. Nada além disso. Lead, ' +
   'organização e conversa vêm do runtime, nunca do payload da tool.';
@@ -453,6 +552,13 @@ export async function applyRequestHumanHandoff(
       pendentesDoCliente?: readonly string[];
       declaracaoDoTurno?: DeclaracaoDoTurno | null;
     };
+    /**
+     * A mensagem que TRIGGOU o turno (#2210). Com ela o handoff pergunta ao
+     * banco se a derivação da mídia ainda estava em aberto — e, se estiver,
+     * grava a marca que permite devolver o atendimento sozinho quando o texto
+     * chegar. Sem gatilho não há marca (chamador sem turno), que é o caso seguro.
+     */
+    gatilho?: { inboundMessageId?: string };
     log: Logger;
   },
   rawInput: unknown,
@@ -472,6 +578,9 @@ export async function applyRequestHumanHandoff(
   // os dois está declarando o mesmo campo duas vezes.
   const declarado = parsed.data;
   const porQue = declarado.por_que ?? declarado.reason ?? null;
+  // Ausente = comportamento legado. O código classifica a passagem, sem
+  // escolher destino nem alterar a autoridade da ferramenta.
+  const motivoCodigo = declarado.motivo_codigo ?? 'requested_human';
   const briefing = montarBriefingDaPassagem({
     checkpoint: opts.contextoDoTurno?.checkpoint ?? null,
     declaradoPeloModelo: {
@@ -484,14 +593,25 @@ export async function applyRequestHumanHandoff(
     ...(opts.contextoDoTurno?.declaracaoDoTurno !== undefined
       ? { declaracaoDoTurno: opts.contextoDoTurno.declaracaoDoTurno }
       : {}),
-    motivo: { codigo: 'requested_human', texto: porQue },
+    motivo: { codigo: motivoCodigo, texto: porQue },
   });
 
+  // #2210: o handoff só carrega a marca quando a causa é a falta de texto —
+  // a mensagem que disparou o turno ainda sem derivação E nada legível do
+  // cliente no turno. Com palavra do cliente (um pedido explícito em texto no
+  // mesmo lote do áudio, por exemplo) o motivo pode ser ela, e não há marca.
+  // `reason` e a marca saem do MESMO `opts.porQue`, e é esse par que a reação
+  // compara depois para saber se o handoff atual ainda é o marcado.
+  const derivacaoPendente = turnoSemPalavraDoCliente(opts.contextoDoTurno?.pendentesDoCliente)
+    ? await derivacaoPendenteDoGatilho(db, ids.tenantId, opts.gatilho?.inboundMessageId)
+    : null;
+
   await performHumanHandoff(db, ids, {
-    reason: porQue ?? 'requested_human',
+    reason: porQue ?? motivoCodigo,
     conversationSummary: briefing.body,
-    passagem: { origem: 'ferramenta_do_modelo', motivoCodigo: 'requested_human', briefing },
+    passagem: { origem: 'ferramenta_do_modelo', motivoCodigo, briefing },
     ...(opts.avisoAoLead !== undefined ? { avisoAoLead: opts.avisoAoLead } : {}),
+    ...(derivacaoPendente !== null ? { derivacaoPendente } : {}),
     log: opts.log,
   });
 

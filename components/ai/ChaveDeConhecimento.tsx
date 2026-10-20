@@ -5,7 +5,7 @@ import { useT } from "@/hooks/i18n/useT";
  * A CHAVE QUE FAZ O MATERIAL VIRAR CONHECIMENTO — dita na tela, resolvida ali.
  *
  * Preparar um material para o agente encontrá-lo exige uma chave de embedding,
- * da OpenAI ou OpenRouter. Antes, a tela de
+ * da OpenAI, OpenRouter ou Google. Antes, a tela de
  * conhecimento prometia "a indexação começa em instantes", o material subia, e
  * numa instalação sem chave nada acontecia — para sempre, sem erro, sem estado,
  * sem aviso.
@@ -20,35 +20,54 @@ import { useT } from "@/hooks/i18n/useT";
  *
  * Quando JÁ existe chave, o componente não some: ele diz qual está valendo. Sem
  * isso, "por que ele indexou com a chave errada?" não tem resposta na tela.
+ *
+ * E diz QUEM prepara a base — OpenAI ou Google (contribuição de @vgamkt, #1130) —
+ * com a troca ali mesmo. A troca refaz a base inteira, então o aviso vem num
+ * diálogo ANTES de trocar, nunca num toast depois.
  */
 import { useState } from "react";
 import Link from "next/link";
 import { KeyRound, CheckCircle2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { apiClient } from "@/lib/api/client";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
+import type { ProvedorDaBase } from "@/lib/ai/embeddings/chave";
+import type { EstadoDaChave } from "@/lib/ai/embeddings/estado";
 
-export interface EstadoDaChave {
-  pode_indexar: boolean;
-  origem: string | null;
-  explicacao: string | null;
-  chave_em_uso: string | null;
-  avisos: string[];
-  credenciais_embedding: Array<{
-    id: string;
-    provider: "openai" | "openrouter";
-    label: string;
-    api_key_last4: string | null;
-    validated_at: string | null;
-    validation_error: string | null;
-    is_active: boolean;
-  }>;
-}
+export type { EstadoDaChave };
+
+type ProvedorDaChave = "openai" | "openrouter" | "google";
+
+const NOME_DO_PROVEDOR: Record<ProvedorDaBase, string> = { openai: "OpenAI", google: "Google" };
+
+const ONDE_PEGAR: Record<ProvedorDaChave, { url: string; texto: string; placeholder: string }> = {
+  openai: {
+    url: "https://platform.openai.com/api-keys",
+    texto: "platform.openai.com/api-keys",
+    placeholder: "sk-…",
+  },
+  openrouter: { url: "https://openrouter.ai/keys", texto: "openrouter.ai/keys", placeholder: "sk-or-…" },
+  google: {
+    url: "https://aistudio.google.com/apikey",
+    texto: "aistudio.google.com/apikey",
+    placeholder: "AIza…",
+  },
+};
 
 interface Props {
   estado: EstadoDaChave;
@@ -59,11 +78,18 @@ interface Props {
 export function ChaveDeConhecimento({ estado, onChaveCadastrada }: Props) {
   const t = useT();
   const [abrindo, setAbrindo] = useState(false);
-  const [provedor, setProvedor] = useState<"openai" | "openrouter">("openai");
+  // A base já tem família e a chave dela sumiu: o cadastro começa nela.
+  const semChave = estado.familia_sem_chave;
+  const [provedor, setProvedor] = useState<ProvedorDaChave>(semChave ?? "openai");
   const [rotulo, setRotulo] = useState("");
   const [chave, setChave] = useState("");
   const [enviando, setEnviando] = useState(false);
-  const nomeDaChave = provedor === "openrouter" ? t("Chave da OpenRouter") : t("Chave da OpenAI");
+  const nomeDaChave =
+    provedor === "openrouter"
+      ? t("Chave da OpenRouter")
+      : provedor === "google"
+        ? t("Chave do Google")
+        : t("Chave da OpenAI");
 
   async function cadastrar() {
     if (chave.trim().length < 8) {
@@ -137,6 +163,13 @@ export function ChaveDeConhecimento({ estado, onChaveCadastrada }: Props) {
             {t(a)}
           </span>
         ))}
+        {estado.provedor ? (
+          <TrocaDeProvedor
+            atual={estado.provedor}
+            destino={estado.pode_trocar_para}
+            onTrocado={onChaveCadastrada}
+          />
+        ) : null}
       </div>
     );
   }
@@ -150,15 +183,33 @@ export function ChaveDeConhecimento({ estado, onChaveCadastrada }: Props) {
         <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-warning-fg" aria-hidden />
         <div className="space-y-1">
           <h3 className="text-sm font-medium">
-            {t("Falta uma chave de embedding para o agente aprender o seu material")}
+            {semChave === "google"
+              ? t("A base é preparada pelo Google, e a chave do Google não está mais utilizável")
+              : semChave === "openai"
+                ? t("A base é preparada pela OpenAI, e não há mais chave da OpenAI utilizável")
+                : t("Falta uma chave de embedding para o agente aprender o seu material")}
           </h3>
           <p className="text-xs text-text-muted">
-            {t(
-              "O material usa text-embedding-3-small, acessível pela OpenAI ou OpenRouter. Sem uma dessas chaves, você pode cadastrar o documento, mas ele fica esperando para ser preparado.",
-            )}
+            {semChave
+              ? // Falha aberta na informação: outra chave cadastrada NÃO assume
+                // sozinha — perguntar com outro modelo não acharia nada do que
+                // já foi preparado. Quem troca é a pessoa, e a troca refaz a base.
+                t(
+                  "O agente não consegue consultar o material até isso ser resolvido. Chaves de outro provedor não são usadas sozinhas: o material já preparado só é encontrado com o mesmo provedor. Cadastre a chave de novo ou troque o provedor, o que refaz a base.",
+                )
+              : t(
+                  "O material é preparado pela OpenAI (text-embedding-3-small, também pela OpenRouter) ou pelo Google (gemini-embedding-001). Sem uma dessas chaves, você pode cadastrar o documento, mas ele fica esperando para ser preparado.",
+                )}
           </p>
         </div>
       </div>
+      {semChave ? (
+        <TrocaDeProvedor
+          atual={semChave}
+          destino={estado.pode_trocar_para}
+          onTrocado={onChaveCadastrada}
+        />
+      ) : null}
 
       {abrindo ? (
         <div className="space-y-3">
@@ -188,6 +239,18 @@ export function ChaveDeConhecimento({ estado, onChaveCadastrada }: Props) {
                 />
                 OpenRouter
               </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="embedding-provider"
+                  value="google"
+                  data-testid="conhecimento-provedor-google"
+                  checked={provedor === "google"}
+                  onChange={() => setProvedor("google")}
+                  disabled={enviando}
+                />
+                Google
+              </label>
             </div>
             <p className="text-xs text-text-muted">
               {t("O texto dos materiais é enviado ao provedor escolhido para preparar a busca.")}
@@ -209,7 +272,7 @@ export function ChaveDeConhecimento({ estado, onChaveCadastrada }: Props) {
               id="chave-valor"
               data-testid="conhecimento-chave-input"
               type="password"
-              placeholder={provedor === "openrouter" ? "sk-or-…" : "sk-…"}
+              placeholder={ONDE_PEGAR[provedor].placeholder}
               value={chave}
               onChange={(e) => setChave(e.target.value)}
               disabled={enviando}
@@ -218,16 +281,12 @@ export function ChaveDeConhecimento({ estado, onChaveCadastrada }: Props) {
             <p className="text-xs text-text-muted">
               {t("Você pega em")}{" "}
               <a
-                href={
-                  provedor === "openrouter"
-                    ? "https://openrouter.ai/keys"
-                    : "https://platform.openai.com/api-keys"
-                }
+                href={ONDE_PEGAR[provedor].url}
                 target="_blank"
                 rel="noreferrer"
                 className="font-medium text-foreground underline underline-offset-4"
               >
-                {provedor === "openrouter" ? "openrouter.ai/keys" : "platform.openai.com/api-keys"}
+                {ONDE_PEGAR[provedor].texto}
               </a>
               . {t("Ela é guardada cifrada e nunca aparece de volta na tela.")}
             </p>
@@ -269,5 +328,114 @@ export function ChaveDeConhecimento({ estado, onChaveCadastrada }: Props) {
         </div>
       )}
     </Card>
+  );
+}
+
+/**
+ * "Quem prepara a base" + a troca. O diálogo é o aviso: trocar refaz a base
+ * inteira, e até o indexador terminar o agente não acha o que ainda não foi
+ * refeito. Quem não tem chave do outro lado recebe o caminho, não um botão
+ * que devolveria erro.
+ */
+function TrocaDeProvedor({
+  atual,
+  destino,
+  onTrocado,
+}: {
+  atual: ProvedorDaBase;
+  destino: ProvedorDaBase | null;
+  onTrocado: () => void;
+}) {
+  const t = useT();
+  const [aberto, setAberto] = useState(false);
+  const [trocando, setTrocando] = useState(false);
+
+  async function trocar() {
+    if (!destino) return;
+    setTrocando(true);
+    try {
+      const r = await apiClient.put<{ data: { fila: { total: number; emitidos: number } | null } }>(
+        "/api/v1/ai/knowledge/provedor",
+        { provedor: destino },
+      );
+      const fila = r.data.fila;
+      if (fila && fila.emitidos < fila.total) {
+        toast.warning(
+          t("Provedor trocado, mas parte do material não entrou na fila. Use “Preparar tudo de novo”."),
+        );
+      } else if (!fila) {
+        toast.warning(
+          t("Provedor trocado, mas a base não começou a ser refeita. Use “Preparar tudo de novo”."),
+        );
+      } else {
+        toast.success(t("Provedor trocado. A base está sendo refeita."));
+      }
+      setAberto(false);
+      onTrocado();
+    } catch (err) {
+      showApiError(err);
+    } finally {
+      setTrocando(false);
+    }
+  }
+
+  return (
+    <span data-testid="conhecimento-provedor" className="flex w-full flex-wrap items-center gap-2">
+      <span>
+        {t("Quem prepara a base:")}{" "}
+        <span className="font-medium text-foreground">{NOME_DO_PROVEDOR[atual]}</span>.
+      </span>
+      {destino ? (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 text-xs"
+          onClick={() => setAberto(true)}
+          data-testid="conhecimento-trocar-provedor"
+        >
+          {destino === "google" ? t("Trocar para o Google") : t("Trocar para a OpenAI")}
+        </Button>
+      ) : atual === "openai" ? (
+        <span>
+          {t("Para usar o Google, cadastre a chave dele em")}{" "}
+          <Link
+            href="/app/ai/credentials"
+            className="font-medium text-foreground underline underline-offset-4"
+          >
+            {t("IA › Credenciais")}
+          </Link>
+          .
+        </span>
+      ) : null}
+      <AlertDialog open={aberto} onOpenChange={(v) => !trocando && setAberto(v)}>
+        <AlertDialogContent data-testid="conhecimento-trocar-provedor-dialogo">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {destino === "google"
+                ? t("Trocar para o Google refaz a base inteira")
+                : t("Trocar para a OpenAI refaz a base inteira")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                "Todo o material é preparado de novo com o novo provedor. Enquanto isso acontece, o agente pode não encontrar o que ainda não foi refeito. O texto dos materiais passa a ser enviado ao novo provedor.",
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={trocando}>{t("Cancelar")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void trocar();
+              }}
+              disabled={trocando}
+              data-testid="conhecimento-trocar-provedor-confirmar"
+            >
+              {trocando ? t("Trocando…") : t("Trocar e refazer a base")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </span>
   );
 }

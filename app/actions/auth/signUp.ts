@@ -2,7 +2,11 @@
 
 import { headers } from "next/headers";
 
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { moduloLigado } from "@/lib/instalacao/modulos";
+import { cadastroExigeEscolhaDePlano, lerPlanosDoCadastro } from "@/lib/cobranca/cadastro";
 import {
   signupSchema,
   signupComConviteSchema,
@@ -94,7 +98,7 @@ export async function signUp(
   const hdrs = await headers();
   const origin = hdrs.get("origin") ?? env.NEXT_PUBLIC_APP_URL;
   const requestId = hdrs.get("x-request-id");
-  const ip = hdrs.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
+  const ip = ipDoCliente(hdrs);
   const userAgent = hdrs.get("user-agent") ?? null;
 
   // Criar conta é fluxo raro por pessoa: teto baixo por IP evita fábrica de
@@ -132,6 +136,26 @@ export async function signUp(
       userAgent,
     });
     return { ok: false, error: "somente_convite" };
+  }
+
+  const planoEscolhido = !convite && "cobranca_plan_id" in parsed.data ? parsed.data.cobranca_plan_id : undefined;
+  if (!convite) {
+    const admin = createAdminClient();
+    if (await moduloLigado(admin, "cobranca")) {
+      // Recusa ANTES de criar a conta no GoTrue o que o gatilho da 0679 recusaria
+      // depois — senão o usuário ficaria órfão, sem organização. Leitura dos
+      // PLANOS que falha recusa: é ação, não informação. A da CHAVE do módulo, não:
+      // `moduloLigado` trata a falha como "desligado", e aí a conta nasce e quem
+      // decide é o gatilho; se ele recusar, a saída é /get-started, que pede o plano.
+      const planos = await lerPlanosDoCadastro(admin);
+      if (planoEscolhido) {
+        if (!planos?.oferecidos.some((p) => p.id === planoEscolhido)) {
+          return { ok: false, error: "validation_error", details: { cobranca_plan_id: ["plano_indisponivel"] } };
+        }
+      } else if (!planos || cadastroExigeEscolhaDePlano(planos)) {
+        return { ok: false, error: "validation_error", details: { cobranca_plan_id: ["plano_obrigatorio"] } };
+      }
+    }
   }
 
   // ── O GoTrue com o cadastro público FECHADO (#1653) ──────────────────────────
@@ -207,7 +231,7 @@ export async function signUp(
             invite_token: convite,
             full_name: (parsed.data as SignupComConviteInput).full_name,
           }
-        : { org_name: (parsed.data as SignupInput).org_name },
+        : { org_name: (parsed.data as SignupInput).org_name, ...(planoEscolhido ? { cobranca_plan_id: planoEscolhido } : {}) },
     },
   });
 

@@ -35,6 +35,14 @@ export type SkipReason =
   | "agent_inactive_or_missing"
   | "kb_version_missing"
   | "contact_blocked"
+  /** Contato marcado como pessoal (spec 21): o turno nem começa, como no bloqueio. */
+  | "contact_personal"
+  /**
+   * Contato com a marca PERMANENTE "sempre atendimento humano" (issue 2379):
+   * `contacts.ai_opt_out`, que a devolução (manual ou automática) não desfaz.
+   * Família do `force_human`, mas sem prazo.
+   */
+  | "ai_opt_out"
   | "force_human"
   | "assigned_to_human"
   | "window_24h_expired"

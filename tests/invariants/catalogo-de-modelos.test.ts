@@ -124,9 +124,12 @@ describe("catálogo de modelos", () => {
          left join public.ai_pricing p on p.model = m.model_id
         where m.deprecated_at is null
           and m.model_id in ('claude-opus-5','claude-sonnet-5','claude-opus-4-8',
+                             'claude-haiku-5-5','claude-sonnet-5-5','claude-opus-5-5',
+                             'gpt-6-luna','gpt-6.1-sol','gpt-6-astra',
                              'gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5',
                              'gpt-5.5-pro','gpt-5.4','gpt-5.4-mini','gpt-5.4-nano',
                              'gpt-5.4-pro','gemini-3.1-pro-preview','gemini-3.5-flash',
+                             'gemini-3.5-flash-lite',
                              'gemini-2.5-flash-lite','gemini-2.0-flash')
           and (p.model is null or p.notes not like 'catálogo%')
         order by 1;`,
@@ -139,19 +142,39 @@ describe("catálogo de modelos", () => {
   });
 
   it("a geração corrente dos três provedores está no catálogo", () => {
-    // Ids VERIFICADOS no provedor (GET /v1/models) para Anthropic e OpenAI. Este
+    // Ids VERIFICADOS no provedor (GET /v1/models) para Anthropic e OpenAI — os
+    // Claude 5.5 e os GPT-6 só na documentação oficial (ver os cabeçalhos da
+    // 0675 e da 0646). Este
     // caso é o que reprova quando o catálogo envelhece: sem ele, "o padrão é o
     // melhor disponível" vira uma frase que ninguém mede.
     const ids = new Set(modelosDoCatalogo().map((m) => m.model_id));
     for (const esperado of [
       "claude-opus-5",
       "claude-sonnet-5",
+      "claude-haiku-5-5",
+      "claude-sonnet-5-5",
+      "claude-opus-5-5",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
+      "gpt-6-luna",
+      "gpt-6.1-sol",
+      "gpt-6-astra",
       "gemini-3.5-flash",
+      "gemini-3.5-flash-lite",
     ]) {
       expect(ids.has(esperado), `${esperado} ausente do catálogo`).toBe(true);
     }
+  });
+
+  it("Gemini 3.5 Flash-Lite pode ser selecionado e validado para ferramentas e visão", () => {
+    const out = sql(
+      `select provider || '|' || model_id || '|' || supports_tools || '|' ||
+              supports_vision || '|' || is_default_for_provider
+         from public.ai_models
+        where provider = 'google' and model_id = 'gemini-3.5-flash-lite'
+          and deprecated_at is null;`,
+    );
+    expect(out.trim()).toBe("google|gemini-3.5-flash-lite|true|true|false");
   });
 });

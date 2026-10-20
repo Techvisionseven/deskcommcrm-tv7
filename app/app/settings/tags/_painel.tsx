@@ -51,7 +51,7 @@ import { Label } from "@/components/ui/label";
 import { ChipDeEtiqueta } from "@/components/tags/ChipDeEtiqueta";
 import { invalidarCoresDasEtiquetas } from "@/components/tags/CoresDasEtiquetas";
 import { cn } from "@/lib/utils";
-import { PALETA_DE_ETIQUETAS } from "@/lib/tags/cor-da-etiqueta";
+import { PALETA_DE_ETIQUETAS, NOME_DO_TOM, normalizarCorDeEtiqueta } from "@/lib/tags/cor-da-etiqueta";
 import { traduzir } from "@/lib/i18n/dicionario";
 import type { Idioma } from "@/lib/i18n/idiomas";
 import type { AcaoDeVocabulario, LinhaDeVocabulario } from "@/lib/schemas/tags";
@@ -74,24 +74,30 @@ import type { AcaoDeVocabulario, LinhaDeVocabulario } from "@/lib/schemas/tags";
 const TETO_DA_LISTA = 500;
 
 /**
- * O NOME DE CADA TOM DA PALETA, e o teste que impede os dois divergirem.
- *
- * `tests/unit/tags-cor-de-etiqueta.test.ts` cobra que este mapa tenha
- * EXATAMENTE as chaves de `PALETA_DE_ETIQUETAS`. Sem ele, acrescentar um tom à
- * paleta deixaria um quarto círculo mudo na fileira (o `?? tom` abaixo cobre a
- * tela, mas o nome iria embora em silêncio) — o mesmo defeito que o `TETO_DA_LISTA`
- * previne para o `limit` do SQL.
+ * O NOME DE CADA TOM DA PALETA mora em `@/lib/tags/cor-da-etiqueta` desde a
+ * #2718 — junto da paleta, que o seletor de criação também usa. O teste
+ * `tests/unit/tags-cor-de-etiqueta.test.ts` cobra que o mapa tenha
+ * EXATAMENTE as chaves de `PALETA_DE_ETIQUETAS`.
  */
-const NOME_DO_TOM: Record<string, string> = {
-  "#ffe629": "Amarelo",
-  "#ffb224": "Âmbar",
-  "#e54d2e": "Vermelho",
-  "#12a594": "Verde-água",
-  "#0091ff": "Azul",
-  "#3e63dd": "Índigo",
-  "#ab4aba": "Roxo",
-  "#6f6f6f": "Cinza",
-};
+
+/**
+ * ONDE O NOME DE UMA ETIQUETA ESTÁ EM CACHE no cliente — e por isso precisa ser
+ * relido depois de renomear, juntar ou excluir. Prefixos: invalidar `["contact"]`
+ * alcança `["contact", id]` e as sub-chaves. `invalidarCoresDasEtiquetas` sozinho
+ * repintava o MAPA de cores, mas a lista, o cartão e o editor do Inbox seguiam com
+ * o nome antigo (cinza, já sem verbete de cor) por até 30 s, e o filtro de
+ * etiquetas oferecia o nome morto por até 5 min (`staleTime` dos vocabulários).
+ * Medido na prova de tela do #2784.
+ */
+export const CHAVES_COM_NOME_DE_ETIQUETA = [
+  ["conversations"],
+  ["conversation"],
+  ["conversation-tag-vocabulary"],
+  ["contacts"],
+  ["contact"],
+  ["contact-tag-vocabulary"],
+  ["board"],
+] as const;
 
 /** Cada recusa do servidor vira uma frase que diz O QUE FAZER. */
 const ERRO_EM_PORTUGUES: Record<string, string> = {
@@ -117,14 +123,34 @@ export function PainelDeTags({ tags, idioma }: { tags: LinhaDeVocabulario[]; idi
     [tags, alvo],
   );
 
+  /**
+   * O nome digitado já É uma etiqueta desta organização (issue #2801).
+   *
+   * Nesse caso `renomear` não renomeia: ele junta as duas entradas numa só, e
+   * o que sobra de cor/descrição é decidido pelo vocabulário, não por quem
+   * digitou. A tela avisa ANTES do clique — o marcador `juntou` da resposta
+   * só chega depois, quando já não há o que desfazer. Mesma régua visual do
+   * aviso de `excluir`: uma frase que diz o que vai acontecer, não um "tem
+   * certeza?".
+   *
+   * Compara com `destinos`, que já exclui a própria etiqueta: mudar só a caixa
+   * ("cliente" → "Cliente") é renome, não junção.
+   */
+  const destinoJaExiste =
+    acao === "renomear" &&
+    destino.trim().length > 0 &&
+    destinos.some((linha) => linha.tag.toLowerCase() === destino.trim().toLowerCase());
+
   function abrir(linha: LinhaDeVocabulario, qual: AcaoDeVocabulario) {
     setAlvo(linha);
     setAcao(qual);
     setDestino("");
     // A cor já vem do servidor (`linha.cor`): a fileira abre com a escolha atual
     // marcada. Sem isso, abrir a cor de uma etiqueta que JÁ tem uma faria parecer
-    // que ela não tem nenhuma, e "Confirmar" apagaria o que estava lá.
-    setCor(qual === "definir_cor" ? (linha.cor ?? null) : null);
+    // que ela não tem nenhuma, e "Confirmar" apagaria o que estava lá. Lida pela
+    // normalização porque `linha.cor` vem crua do SQL: uma etiqueta com o tom
+    // antigo da #2373 abre com o tom novo marcado.
+    setCor(qual === "definir_cor" ? normalizarCorDeEtiqueta(linha.cor) : null);
   }
 
   async function enviar() {
@@ -153,19 +179,46 @@ export function PainelDeTags({ tags, idioma }: { tags: LinhaDeVocabulario[]; idi
         return;
       }
       const dados = corpo?.data ?? {};
+      // TODA ação mexe no verbete de cor, não só `definir_cor`. `renomear` move
+      // o nome na MESMA escrita em que o verbete de cor vai junto (a 0336 faz o
+      // `jsonb_set` só em `{tag}`), `juntar` junta dois verbetes e `excluir`
+      // tira o de baixo — e é o MAPA do provider que pinta a lista de
+      // conversas, o funil, os filtros e os editores do Inbox. Invalidar só na
+      // cor era o que deixava o chip novo CINZO depois de um rename, por até 5
+      // minutos (o `staleTime`), até alguém dar F5: "renomear descolora"
+      // (#2771). O dado já estava certo no banco; quem não acompanhava era a
+      // tela.
+      invalidarCoresDasEtiquetas(queryClient);
       if (acao === "definir_cor") {
-        // Escrever a cor é o ÚNICO caso em que esta tela muda o que outra tela
-        // mostra: o chip da lista de conversas, o funil e os filtros leem o mapa
-        // do provider. Sem esta invalidação o operador trocaria a cor, voltaria
-        // para o Inbox e veria a antiga até o `staleTime` de 5 min vencer.
-        invalidarCoresDasEtiquetas(queryClient);
         toast.success(t("Cor da etiqueta atualizada."));
         setAlvo(null);
         router.refresh();
         return;
       }
+      for (const queryKey of CHAVES_COM_NOME_DE_ETIQUETA) {
+        void queryClient.invalidateQueries({ queryKey: [...queryKey] });
+      }
       const alterados =
         Number(dados.contatos ?? 0) + Number(dados.leads ?? 0) + Number(dados.conversas ?? 0);
+      if (dados.juntou === true) {
+        // ⚠️ O AVISO DE JUNÇÃO (issue #2801). Renomear para um nome que já
+        // existia JUNTAVA as duas etiquetas e respondia como renome simples:
+        // a frase de sucesso abaixo era indistinguível da de um rename que não
+        // juntou nada, e o operador só descobria depois, na lista. O marcador
+        // vem do BANCO — é ali que se sabe se o destino já existia como
+        // entrada do vocabulário; a tela só tem a lista que ela mesma leu, e o
+        // caso interessante é justamente o que já vinha como duas linhas.
+        //
+        // `toast.warning` e não `toast.success`: a operação foi concluída, mas
+        // ela fez ALGO A MAIS do que o botão prometia, e isso não pode sair
+        // com o mesmo tom de um renome normal.
+        toast.warning(
+          `${t("Etiqueta juntada em")} ${destino} — ${t("as duas etiquetas viraram uma só.")}`,
+        );
+        setAlvo(null);
+        router.refresh();
+        return;
+      }
       // ⚠️ O DADO ENTRA FORA DO `t()`. `traduzir()` casa a string EXATA, então
       // uma frase montada em runtime nunca casa chave nenhuma —
       // a frase sai em português para quem escolheu espanhol, e o guarda de i18n
@@ -378,6 +431,20 @@ export function PainelDeTags({ tags, idioma }: { tags: LinhaDeVocabulario[]; idi
                 maxLength={60}
                 placeholder={alvo.tag}
               />
+              {destinoJaExiste && (
+                // O AVISO ANTES DO CLIQUE (issue #2801). Renomear para um nome
+                // que já existe não renomeia: junta as duas etiquetas numa só,
+                // e a cor/descrição que sobra é decidida pelo vocabulário. O
+                // `juntou` da resposta só chega DEPOIS, quando já não há o que
+                // desfazer — então quem lê este aviso ainda pode escolher
+                // "Juntar" de propósito, ou outro nome. Mesma régua visual do
+                // aviso de `excluir` abaixo: a frase diz o que vai acontecer.
+                <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                  {t(
+                    "Este nome já existe no vocabulário — confirmar vai juntar as duas etiquetas numa só.",
+                  )}
+                </p>
+              )}
             </div>
           )}
 

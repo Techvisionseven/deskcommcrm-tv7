@@ -6,8 +6,9 @@ import { z } from "zod";
 
 import { invalidarAppDaMeta } from "@/lib/channels/meta/app";
 import { audit } from "@/lib/audit";
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 import { logger } from "@/lib/logger";
-import { requirePlatformAdmin } from "@/lib/auth/requirePlatformAdmin";
+import { escritaDeAdminOuRecusa } from "@/lib/auth/escritaDeAdminOuRecusa";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { encryptWebhookSecret } from "@/lib/webhooks/secrets";
 
@@ -130,7 +131,7 @@ async function gravar(
     // trilha ficaria sem a linha — sem sintoma em tela nenhuma.
     resourceId: null,
     requestId: cabecalhos.get("x-request-id") ?? undefined,
-    ip: cabecalhos.get("x-forwarded-for") ?? undefined,
+    ip: ipDoCliente(cabecalhos) ?? undefined,
     userAgent: cabecalhos.get("user-agent") ?? undefined,
     actingAsPlatformAdmin: true,
     // O QUE mudou, jamais o valor — nem o verify token recém-gerado.
@@ -192,7 +193,9 @@ const SEM_SEGREDO: UpdateMetaAppResult = { ok: false, error: "app_secret_obrigat
  * que o produto oferece desse valor.
  */
 export async function updateMetaApp(input: MetaAppInput): Promise<UpdateMetaAppResult> {
-  const { user: authUser } = await requirePlatformAdmin();
+  const escrita = await escritaDeAdminOuRecusa();
+  if (!escrita.ok) return escrita;
+  const { user: authUser } = escrita.ctx;
 
   const parsed = entradaSchema.safeParse(input);
   if (!parsed.success) {
@@ -264,7 +267,9 @@ export async function updateMetaApp(input: MetaAppInput): Promise<UpdateMetaAppR
  * avisa em vez de trocar sozinha.
  */
 export async function rotacionarVerifyTokenDaMeta(): Promise<UpdateMetaAppResult> {
-  const { user: authUser } = await requirePlatformAdmin();
+  const escrita = await escritaDeAdminOuRecusa();
+  if (!escrita.ok) return escrita;
+  const { user: authUser } = escrita.ctx;
 
   const gravado = await oQueEstaGravado();
   if (!gravado.ok) return gravado.recusa;

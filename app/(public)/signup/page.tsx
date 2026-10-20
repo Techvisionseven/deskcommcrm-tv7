@@ -3,12 +3,14 @@ import Link from "next/link";
 import { EntrarComGoogle } from "@/components/auth/EntrarComGoogle";
 import { SignupForm } from "@/components/auth/SignupForm";
 import { Button } from "@/components/ui/button";
-import { branding } from "@/lib/branding";
+import { marcaDaSaida } from "@/lib/branding/saida";
 import { verifyInviteToken } from "@/lib/auth/invite-token";
 import { modoDeCadastro } from "@/lib/auth/politica-de-cadastro";
 import { createClient } from "@/lib/supabase/server";
 import { idiomaDoVisitante } from "@/lib/i18n/idiomaAnonimo";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { lerCadastroNaTela, planoInicialDoSeletor } from "@/lib/cobranca/cadastro";
 
 export const metadata = { title: "Criar conta" };
 
@@ -52,6 +54,18 @@ export default async function SignupPage({
     (user?.user_metadata?.locale as string | undefined) ?? null,
   );
   const t = (texto: string) => traduzir(texto, idioma);
+  // O nome da marca vem do resolvedor que LÊ O BANCO (`marcaDaSaida`: banco
+  // acima do `.env`, e nunca lança) — `branding()` só veria a semente do `.env`,
+  // e o convite não muda isso (#2511, mesmo defeito das páginas `/legal`).
+  const marca = await marcaDaSaida(null);
+  // Com plano oferecido, o seletor aparece. O Google não leva a escolha: ele
+  // some enquanto não há plano padrão — o gatilho recusaria a empresa —, e com
+  // padrão a empresa dele nasce no padrão. Sem plano nenhum, nasce isenta e o
+  // Google fica (doc 146, opção B). O critério é o de `lib/cobranca/cadastro.ts`,
+  // o mesmo do gatilho. Leitura que falha não esconde nada: quem recusa é a action.
+  const cadastro = convite ? null : await lerCadastroNaTela(createAdminClient());
+  const planos = cadastro?.oferecidos ?? [];
+  const googleSemPlano = cadastro?.exigeEscolha ?? false;
 
   // Convite VÁLIDO passa em qualquer modo — é o ponto inteiro do convite.
   const modo = convite ? null : await modoDeCadastro();
@@ -88,7 +102,7 @@ export default async function SignupPage({
         <p className="text-sm text-muted-foreground">
           {convite
             ? t("Crie sua senha para entrar na empresa que te convidou")
-            : `${t("Comece a usar o")} ${branding().name} ${t("em minutos")}`}
+            : `${t("Comece a usar o")} ${marca.nome} ${t("em minutos")}`}
         </p>
         {modo === "com_aprovacao" && (
           <p className="text-sm text-muted-foreground">
@@ -108,10 +122,19 @@ export default async function SignupPage({
         </p>
       )}
 
-      <SignupForm convite={convite} />
+      <SignupForm convite={convite} planos={planos} planoInicial={planoInicialDoSeletor(planos, cadastro?.padraoId ?? null)} />
       {/* O convite atravessa o Google na URL de retorno: sem ele, quem foi
           convidado e cria a conta com Google ganharia uma empresa própria. */}
-      <EntrarComGoogle convite={convite?.token} />
+      {googleSemPlano ? (
+        <p className="text-center text-xs text-muted-foreground">{t("Para garantir que o plano selecionado seja contratado, conclua o cadastro com e-mail e senha.")}</p>
+      ) : (
+        <>
+          <EntrarComGoogle convite={convite?.token} />
+          {planos.length > 0 && (
+            <p className="text-center text-xs text-muted-foreground">{t("Com o Google, a empresa começa no plano padrão. Para escolher outro, use e-mail e senha.")}</p>
+          )}
+        </>
+      )}
 
       <p className="text-center text-sm text-muted-foreground">
         {t("Já tem conta?")}{" "}

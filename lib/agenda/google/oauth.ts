@@ -64,8 +64,75 @@ export const ESCOPOS_OBRIGATORIOS: readonly string[] = [
   "https://www.googleapis.com/auth/calendar.readonly",
 ];
 
+/**
+ * Escopos OPCIONAIS que entram no consentimento só quando a organização liga a
+ * opção que os exige (#2063).
+ *
+ * `meetings.space.created` permite criar espaços de reunião abertos pela API do
+ * Meet. NÃO vem em `ESCOPOS_OBRIGATORIOS` de propósito: exigir o escopo novo
+ * derrubaria toda conexão existente em `scope_missing` e pediria reconexão a
+ * cada operador no `update.sh`, o que a doutrina de packaging proíbe. Sem o
+ * escopo na conexão, o comportamento atual é preservado byte a byte.
+ */
+export const ESCOPOS_OPCIONAIS: readonly string[] = [
+  "https://www.googleapis.com/auth/meetings.space.created",
+];
+
+/** O escopo do Meet pedido por #2063, isolado para o gate do executor. */
+export const ESCOPO_MEET_ESPACO_ABERTO: string = ESCOPOS_OPCIONAIS[0]!;
+
+/** Um `scope` concedido contém o escopo do espaço aberto do Meet? */
+export function temEscopoDeEspacoAberto(concedidos: string[] | string | null | undefined): boolean {
+  const lista =
+    typeof concedidos === "string"
+      ? concedidos.split(/\s+/).filter(Boolean)
+      : Array.isArray(concedidos)
+        ? concedidos.filter((s): s is string => typeof s === "string")
+        : [];
+  return lista.map((s) => s.trim()).includes(ESCOPO_MEET_ESPACO_ABERTO);
+}
+
+/**
+ * O gate do executor (#2063): o espaço aberto SÓ é criado quando a opção da
+ * organização está LIGADA **e** a conexão tem o escopo opcional.
+ *
+ * Sem o gate duplo a feature ligava (e corria o risco de "quem tiver o link
+ * entra") numa conexão que nem pediu o escopo; e sem ele o escopo obrigatório
+ * teria que mudar. As duas condições juntas, contrato fechado, nunca lança.
+ */
+export function deveCriarEspacoAberto(opcao: { ligada: boolean }, escoposConcedidos: string[] | string | null | undefined): boolean {
+  return opcao.ligada && temEscopoDeEspacoAberto(escoposConcedidos);
+}
+
 export const ENDERECO_DE_CONSENTIMENTO = "https://accounts.google.com/o/oauth2/v2/auth";
 export const ENDERECO_DE_TOKEN = "https://oauth2.googleapis.com/token";
+
+/**
+ * O conjunto de caracteres de um client secret do Google — e o guarda contra a
+ * colagem errada.
+ *
+ * Um client secret do Google só contém `[A-Za-z0-9_-]`. A cerca é no CONJUNTO
+ * de caracteres de propósito, e não no prefixo `GOCSPX-`: secrets antigos não o
+ * têm, e o Google pode mudar o formato. O que não muda é que aspa, vírgula,
+ * espaço e chave nunca pertencem a um secret.
+ *
+ * O defeito que isto fecha foi medido em produção: colar, no campo da tela, o
+ * secret JUNTO com o resto da linha do arquivo JSON de credenciais —
+ * `GOCSPX-xxxx","redirect_uris` — que carrega aspa e vírgula. O campo é
+ * `type="password"` e nunca volta a aparecer, então ninguém relê o que ficou
+ * gravado; a única pista chegava lá na frente, na troca do código, como
+ * `invalid_client` do Google — um erro que aponta para o Google e não para a
+ * colagem.
+ *
+ * Pura, sem rede e sem `process.env`: a server action que grava e o formulário
+ * que avisa na hora bebem da MESMA regra, para não divergirem.
+ */
+export const FORMATO_DO_CLIENT_SECRET = /^[A-Za-z0-9_-]+$/;
+
+/** `true` quando o texto (já aparado) tem o formato de um client secret do Google. */
+export function clientSecretTemFormato(secret: string): boolean {
+  return FORMATO_DO_CLIENT_SECRET.test(secret.trim());
+}
 
 /**
  * Renovar com folga, não no vencimento.
@@ -94,7 +161,7 @@ export interface AppDoGoogle {
  */
 export function montarUrlDeConsentimento(
   app: AppDoGoogle,
-  opcoes: { state: string; contaSugerida?: string | null },
+  opcoes: { state: string; contaSugerida?: string | null; escoposOpcionais?: readonly string[] },
 ): string {
   const clientId = app.clientId?.trim();
   const redirectUri = app.redirectUri?.trim();
@@ -106,7 +173,7 @@ export function montarUrlDeConsentimento(
     client_id: clientId,
     redirect_uri: redirectUri,
     response_type: "code",
-    scope: ESCOPOS_OBRIGATORIOS.join(" "),
+    scope: [...ESCOPOS_OBRIGATORIOS, ...(opcoes.escoposOpcionais ?? [])].join(" "),
     // Sem `offline` não vem refresh_token nenhum; sem `consent` ele some na
     // segunda vez; sem `select_account` o Google pula o seletor de contas e
     // autoriza direto a conta do `login_hint`. Os três juntos, sempre — ver o
@@ -145,7 +212,12 @@ export type MotivoDeTokenIlegivel = "resposta_invalida" | "erro_do_google" | "se
 
 export type LeituraDeToken =
   | { ok: true; token: TokenDoGoogle }
-  | { ok: false; motivo: MotivoDeTokenIlegivel; detalhe: string };
+  /**
+   * `status` é o HTTP da resposta quando HOUVE uma; `null` quando o Google não
+   * respondeu (rede). Quem classifica precisa dos dois lados: sem ele, uma
+   * recusa 400 do Google chegava ao cron como "sem resposta" (#2393).
+   */
+  | { ok: false; motivo: MotivoDeTokenIlegivel; detalhe: string; status: number | null };
 
 function texto(v: unknown): string | null {
   return typeof v === "string" && v.trim() ? v.trim() : null;
@@ -156,22 +228,29 @@ function texto(v: unknown): string | null {
  *
  * Não lança: a resposta vem da rede, e um `throw` aqui viraria 500 numa rota que
  * precisa redirecionar o navegador com um motivo legível.
+ *
+ * O `status` chega de fora porque esta camada é pura: quem fala com a rede
+ * (`token.ts`) é quem o tem em mãos. Sem ele, `null` — "o Google não respondeu".
  */
-export function lerRespostaDeToken(bruto: unknown, opcoes: { agora: Date }): LeituraDeToken {
+export function lerRespostaDeToken(
+  bruto: unknown,
+  opcoes: { agora: Date; status?: number | null },
+): LeituraDeToken {
+  const status = opcoes.status ?? null;
   if (typeof bruto !== "object" || bruto === null) {
-    return { ok: false, motivo: "resposta_invalida", detalhe: `resposta não é objeto: ${typeof bruto}` };
+    return { ok: false, motivo: "resposta_invalida", detalhe: `resposta não é objeto: ${typeof bruto}`, status };
   }
   const r = bruto as Record<string, unknown>;
 
   const erro = texto(r.error);
   if (erro) {
     const descricao = texto(r.error_description);
-    return { ok: false, motivo: "erro_do_google", detalhe: descricao ? `${erro}: ${descricao}` : erro };
+    return { ok: false, motivo: "erro_do_google", detalhe: descricao ? `${erro}: ${descricao}` : erro, status };
   }
 
   const accessToken = texto(r.access_token);
   if (!accessToken) {
-    return { ok: false, motivo: "sem_access_token", detalhe: "resposta sem `access_token`" };
+    return { ok: false, motivo: "sem_access_token", detalhe: "resposta sem `access_token`", status };
   }
 
   // Sem validade declarada, tratamos como JÁ vencido. É o desfecho conservador:

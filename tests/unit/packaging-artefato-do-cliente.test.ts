@@ -125,6 +125,51 @@ describe("packaging — o artefato que o cliente instala", () => {
     ).toBe(true);
   });
 
+  /**
+   * Worker, scheduler e voz: `image:` + `build:` no mesmo bloco. O Compose
+   * constrói sozinho em QUALQUER falha de pull (medido: tag inexistente,
+   * registro fora por DNS, "no matching manifest", com `pull_policy` `always`,
+   * `missing` ou sem a chave) — e o build desses três é barato (`pnpm install`
+   * e `apk add`), então o escape fica: é o que faz um `up -d` rodado à mão
+   * (a dica que o próprio kit imprime) se sair sozinho.
+   */
+  const COM_BUILD = ["worker", "scheduler", "voice-agent"] as const;
+
+  it.each(COM_BUILD)(
+    "o serviço '%s' declara build: ao lado do image: — escape barato (#1060)",
+    (nome) => {
+      const bloco = servicos.get(nome);
+      expect(bloco, `serviço '${nome}' sumiu do compose de produção`).toBeDefined();
+
+      const temBuild = /^ {4}build:/m.test(bloco!);
+      expect(
+        temBuild,
+        `'${nome}' perdeu o build: ao lado do image:. Sem ele, um 'up -d' à mão numa VPS ` +
+          `cuja arquitetura não é a das imagens publicadas (Oracle Ampere/ARM) morre com ` +
+          `"No such image" — e o build desses três é barato, não o next-build do app. ` +
+          `Ver docs/doctrine/packaging.md, invariante 1.`,
+      ).toBe(true);
+    },
+  );
+
+  it("o serviço 'app' NÃO declara build: no compose de produção — de propósito (#1060)", () => {
+    const bloco = servicos.get("app");
+    expect(bloco, "serviço 'app' sumiu do compose de produção").toBeDefined();
+
+    const temBuild = /^ {4}build:/m.test(bloco!);
+    expect(
+      temBuild,
+      `'app' ganhou build: ao lado do image: no compose de produção. Medido no Compose: ` +
+        `com os dois presentes o 'up -d' CONSTRÓI em QUALQUER falha de pull (tag inexistente, ` +
+        `registro fora por DNS, "no matching manifest"), e o portão ` +
+        `'build_local_permitido' do update.sh — que recusa construir com o registro fora, ` +
+        `depois do OOM no next-build da #1955 — só é consultado quando o 'up -d' FALHA. ` +
+        `Sem build: aqui é isso que entrega a decisão a ele. Quem quer construir o app usa ` +
+        `o docker-compose.build.yml, que passa APP_VERSION como argumento (por este build: o ` +
+        `app sairia com APP_VERSION=dev do Dockerfile).`,
+    ).toBe(false);
+  });
+
   it("nenhum serviço de produção é build-only", () => {
     const buildOnly = [...servicos.entries()]
       .filter(([, bloco]) => /^\s{4}build:/m.test(bloco) && !/^\s{4}image:\s*\S/m.test(bloco))
@@ -317,6 +362,47 @@ describe("packaging — o artefato que o cliente instala", () => {
     expect(semComentarios, "publish-image.yml deixou de reagir a push de tag").toMatch(
       /tags:\s*\["?v\*/,
     );
+  });
+});
+
+describe("packaging — o caminho Cloudflare Tunnel (docker-compose.cloudflared.yml)", () => {
+  // O gate de imagem upstream acima lê só o `docker-compose.prod.yml`; este
+  // override roda na VPS do cliente tanto quanto ele. Sem esta sonda, trocar a
+  // tag fixa do cloudflared por `:latest` (ou omitir a tag) passaria batido.
+  const overlay = fs.readFileSync(path.join(RAIZ, "docker-compose.cloudflared.yml"), "utf8");
+  const servicos = lerServicos(overlay);
+
+  it("o parser enxerga o cloudflared, o caddy desligado e o app", () => {
+    expect([...servicos.keys()].sort()).toEqual(["app", "caddy", "cloudflared"]);
+  });
+
+  it("o app lê o endereço de quem acessa do cabeçalho que a Cloudflare escreve", () => {
+    // Sem isto, `ipDoCliente` usa o 1º salto do x-forwarded-for — que, atrás
+    // da borda da Cloudflare, é o que o cliente mandou.
+    expect(servicos.get("app")!).toMatch(/^\s{6}IP_DO_CLIENTE_HEADER:\s*cf-connecting-ip\s*$/m);
+  });
+
+  it("a imagem do cloudflared está pinada — nunca :latest nem tag implícita", () => {
+    const bloco = servicos.get("cloudflared")!;
+    const ref = (bloco.match(/^\s{4}image:\s*(\S+)/m)?.[1] ?? "").replace(
+      /^\$\{[A-Z_]+:-(.+)\}$/,
+      "$1",
+    );
+    expect(ref, "cloudflared sem image:").not.toBe("");
+
+    // `cloudflared` é upstream: referencia-se com tag fixa, nunca se republica
+    // (docs/doctrine/packaging.md). Digest também serve como pin, mas aqui a
+    // escolha é a tag de versão — e ela não pode ser `latest`.
+    if (!ref.includes("@sha256:")) {
+      const depoisDoHost = ref.split("/").pop() ?? "";
+      const tag = depoisDoHost.includes(":") ? depoisDoHost.split(":").pop() : null;
+      expect(tag, `cloudflared sem tag: ${ref}`).toBeTruthy();
+      expect(tag, `cloudflared na tag móvel: ${ref}`).not.toBe("latest");
+    }
+
+    // Tag de versão é imutável → `missing`, para a subida do túnel não ficar
+    // amarrada à disponibilidade do Docker Hub.
+    expect(bloco.match(/^\s{4}pull_policy:\s*(\S+)/m)?.[1]).toBe("missing");
   });
 });
 

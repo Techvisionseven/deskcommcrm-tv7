@@ -23,6 +23,7 @@ import { EmptyAgenda } from "@/components/empty";
 import { rotuloDoLocal } from "@/lib/agenda/locais";
 import { ancoraAoFecharPainel } from "@/lib/agenda/ancora-depois-de-marcar";
 import { ancoraLocalDoDia } from "@/lib/agenda/semana-semente";
+import { dataDeParede, diaLocalISO, partesNoFuso } from "@/lib/agenda/fuso";
 import { janelaDoMesVisivel } from "@/lib/agenda/janela-do-mes-visivel";
 import { recorteDaGrade as recorteDaGradeDe } from "@/lib/agenda/recorte-da-grade";
 import { resolverResponsavelDoPainel } from "@/lib/agenda/responsavel-do-painel";
@@ -74,6 +75,7 @@ const VISOES: Array<{ id: VisaoDaAgenda; rotulo: string }> = [
  * imports sem querer.
  */
 export function AgendaClient({
+  fusoDaAgenda,
   fusoDeApresentacao,
   hojeNaOrganizacao,
   usuarioId,
@@ -86,6 +88,12 @@ export function AgendaClient({
   agendamentosIniciais,
   podeMarcar,
 }: {
+  /**
+   * O fuso RESOLVIDO da organização (`fusoUtilizavel(activeOrg.timezone)`,
+   * calculado em `page.tsx`). É a régua da grade: sem ele a agenda desenha
+   * hora de parede no relógio do navegador (issue #1362).
+   */
+  fusoDaAgenda: string;
   fusoDeApresentacao: string | null;
   /**
    * A data de HOJE no fuso da ORGANIZAÇÃO, resolvida pelo servidor
@@ -347,11 +355,20 @@ export function AgendaClient({
     const mapa: Record<string, Array<{ instante: string; rotulo: string }>> = {};
     for (const s of horarios?.slots ?? []) {
       const d = new Date(s.inicio);
-      const chave = format(d, "yyyy-MM-dd");
-      (mapa[chave] ??= []).push({ instante: s.inicio, rotulo: format(d, "HH:mm") });
+      // A CHAVE E O RÓTULO SAEM DO FUSO DA ORGANIZAÇÃO: o slot das 09:00 da
+      // clínica é daquele dia e daquela hora PARA ELA, não para quem está
+      // olhando (issue #1362). O lookup em `PainelDeMarcacao` continua batendo,
+      // porque ele indexa pela data de calendário da mesma âncora.
+      const chave = diaLocalISO(d, fusoDaAgenda);
+      const p = partesNoFuso(d, fusoDaAgenda);
+      const dois = (n: number) => String(n).padStart(2, "0");
+      (mapa[chave] ??= []).push({
+        instante: s.inicio,
+        rotulo: `${dois(p.hora)}:${dois(p.minuto)}`,
+      });
     }
     return mapa;
-  }, [horarios]);
+  }, [horarios, fusoDaAgenda]);
 
   // OS AGENDAMENTOS SÃO REAIS, e agora TAMBÉM se atualizam sem recarregar.
   //
@@ -568,7 +585,24 @@ export function AgendaClient({
           */}
           <span
             data-testid="periodo"
-            className="truncate text-sm font-semibold first-letter:uppercase"
+            /*
+              QUEBRA EM DUAS LINHAS NO CELULAR, em vez de cortar.
+
+              Era `truncate`. Em 360px, "Segunda-feira, 5 de outubro" vira
+              "Segunda-feira, 5 de outu…" — e o que o corte come é justamente o
+              MÊS, a informação que diz onde a pessoa está no calendário. Medido
+              na captura de 360px: a reticência caía depois de "outu".
+
+              Trocar o formato por viewport exigiria decidir layout em
+              JavaScript, que é o que a casa recusa (pisca na hidratação), e o
+              padrão é traduzível — ele vem do dicionário, não do código. Duas
+              linhas custam ~20px e dizem a data inteira.
+
+              `lg:truncate` devolve uma linha onde a largura sobra: ali o corte
+              nunca chegava a acontecer, e manter o `truncate` protege a barra
+              de uma data longa num idioma mais verboso.
+            */
+            className="text-sm font-semibold text-balance first-letter:uppercase lg:truncate"
           >
             {periodo}
           </span>
@@ -593,7 +627,15 @@ export function AgendaClient({
                 aria-pressed={visao === v.id}
                 onClick={() => setVisao(v.id)}
                 className={cn(
-                  "rounded-sm px-2.5 py-1 text-xs transition-colors duration-fast ease-out",
+                  // `min-h-11 px-3` até `lg` — o alternador de visão media
+                  // **24px de altura** em 360px (`py-1` em volta de `text-xs`),
+                  // pouco mais da metade do piso de 44px da Apple HIG. É o
+                  // controle que decide o que a agenda mostra, e no celular ele
+                  // era uma tira fina entre dois outros controles.
+                  //
+                  // `lg:` devolve o compacto onde quem aciona é cursor, no mesmo
+                  // corte que `components/ui/button.tsx` já usa.
+                  "min-h-11 rounded-sm px-3 py-1 text-xs transition-colors duration-fast ease-out lg:min-h-0 lg:px-2.5",
                   "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-500",
                   visao === v.id
                     ? "bg-accent font-semibold text-accent-foreground"
@@ -706,11 +748,11 @@ export function AgendaClient({
           <div className="grid shrink-0 gap-3 rounded-lg border p-3 lg:grid-cols-2">
             {!remarcandoId ? (
               <div className="lg:col-span-2">
-              <VinculoDaMarcacao
-                contactId={contactId}
-                conversationId={conversationId}
-                onChange={(contact, conversation) => escolherVinculo({ contact, conversation })}
-              />
+                <VinculoDaMarcacao
+                  contactId={contactId}
+                  conversationId={conversationId}
+                  onChange={(contact, conversation) => escolherVinculo({ contact, conversation })}
+                />
               </div>
             ) : null}
             {tiposIniciais.length > 1 && (
@@ -789,10 +831,7 @@ export function AgendaClient({
             </div>
             {!remarcandoId ? (
               <>
-                <EnderecoDaMarcacao
-                  value={endereco}
-                  onChange={setEnderecoEditado}
-                />
+                <EnderecoDaMarcacao value={endereco} onChange={setEnderecoEditado} />
                 <div>
                   <label className="block" htmlFor="observacao-do-compromisso">
                     {t("Observação")}{" "}
@@ -855,6 +894,10 @@ export function AgendaClient({
                 fontesDefasadas={horarios?.fontes_defasadas}
                 googleCoberturaParcial={horarios?.google_cobertura_parcial}
                 onMesVisivel={onMesVisivel}
+                // `data` do React Query é da chave ATUAL (sem `placeholderData`),
+                // então chegou = é do `mesDoPainel`. É o que deixa o painel saber
+                // "este mês acabou" em vez de "ainda carregando".
+                mesCarregado={horarios ? mesDoPainel : null}
                 horarioInicial={horarioEscolhido ?? undefined}
                 // O ENCAIXE é desta tela, e só dela: aqui quem marca é uma
                 // pessoa da equipe com sessão, que é exatamente o ator a quem a
@@ -969,7 +1012,11 @@ export function AgendaClient({
                 const alvo = todos.find((a) => a.id === cancelandoId);
                 if (!alvo) return t("Este agendamento não está mais na lista.");
                 const quem = alvo.quemSeraAtendido ? ` ${t("de")} ${alvo.quemSeraAtendido}` : "";
-                return `${alvo.titulo}${quem}, ${format(new Date(alvo.comeca), t("d 'de' MMMM 'às' HH:mm"), { locale: localeDaData })}.`;
+                return `${alvo.titulo}${quem}, ${format(
+                  dataDeParede(new Date(alvo.comeca), fusoDaAgenda),
+                  t("d 'de' MMMM 'às' HH:mm"),
+                  { locale: localeDaData },
+                )}.`;
               })()}
             </p>
             <label
@@ -1052,6 +1099,9 @@ export function AgendaClient({
         agendamentos={agendamentosAcionaveis}
         pessoas={pessoas}
         agora={new Date()}
+        // Mesma régua da grade ao lado: sem isto a lista imprime o relógio do
+        // navegador e a MESMA tela diz duas horas para o mesmo compromisso.
+        fuso={fusoDaAgenda}
         className="max-h-[320px]"
         // ⚠️ ESTAS DUAS PROPS FALTAVAM, e a ausência tinha cara de permissão.
         // `HistoricoDaAgenda` usa `disabled={!onRemarcar}`; sem elas os botões
@@ -1125,6 +1175,7 @@ export function AgendaClient({
           proposta de remarcação, o otimismo com volta atrás) mora em
           `AgendaInterativa`; aqui fica só o que esta tela já sabia. */}
       <AgendaInterativa
+        fuso={fusoDaAgenda}
         visao={visao}
         ancora={ancora}
         agora={new Date()}
@@ -1140,7 +1191,13 @@ export function AgendaClient({
         onMarcarEm={
           podeMarcar
             ? (instante) => {
-                setHorarioEscolhido({ instante, rotulo: format(new Date(instante), "HH:mm") });
+                setHorarioEscolhido({
+                  instante,
+                  // HH:mm no MESMO fuso em que a grade desenhou o clique: sem
+                  // isto o resumo guardava a hora do NAVEGADOR e não batia com
+                  // a célula que a pessoa acabou de escolher.
+                  rotulo: format(dataDeParede(new Date(instante), fusoDaAgenda), "HH:mm"),
+                });
                 setRemarcandoId(null);
                 // `abrirMarcacao` e não `setMarcando(true)`: clicar num bloco
                 // livre abre uma marcação NOVA, e ela nasce com o vínculo da rota.

@@ -13,7 +13,7 @@ import {
   type PacingKnobs,
 } from "@/lib/agent-engine/pacing/defaults";
 import { warmupCapFor } from "@/lib/agent-engine/pacing/engine";
-import { fusoDaJanela, parseWarmupCaps } from "@/lib/agent-engine/pacing/store";
+import { fusoDaJanela, parseDiasDaProspeccao, parseWarmupCaps } from "@/lib/agent-engine/pacing/store";
 
 function isValidTimezone(tz: string): boolean {
   try {
@@ -111,9 +111,29 @@ export const pacingKnobsUpdateSchema = z
     channel_session_id: z.string().uuid(),
     throttle_ms: z.number().int().min(0).max(KNOB_BOUNDS.intervalMaxMs).nullable().optional(),
     jitter_max_ms: z.number().int().min(0).max(KNOB_BOUNDS.intervalMaxMs).nullable().optional(),
+    // Atraso humano antes da 1ª bolha (0499). null = voltar ao default (defaults.ts).
+    atraso_notar_ms: z.number().int().min(0).max(KNOB_BOUNDS.intervalMaxMs).nullable().optional(),
+    ms_por_caractere: z.number().int().min(0).max(KNOB_BOUNDS.msPorCaractereMax).nullable().optional(),
+    atraso_minimo_ms: z.number().int().min(0).max(KNOB_BOUNDS.intervalMaxMs).nullable().optional(),
+    atraso_maximo_ms: z.number().int().min(0).max(KNOB_BOUNDS.atrasoMaximoMsMax).nullable().optional(),
     window_start_hour: z.number().int().min(0).max(KNOB_BOUNDS.hourLastStart).nullable().optional(),
     window_end_hour: z.number().int().min(1).max(KNOB_BOUNDS.hourEnd).nullable().optional(),
+    /**
+     * Janela da RESPOSTA do agente (0495). `0` e `24` são valores LEGÍTIMOS —
+     * é assim que o dono declara "responde 24h" — então o schema é o mesmo do
+     * par de disparo, e quem valida start<end é `windowIsValid` sobre o par
+     * RESULTANTE, depois de mesclar com o que já está gravado.
+     */
+    resposta_start_hour: z.number().int().min(0).max(KNOB_BOUNDS.hourLastStart).nullable().optional(),
+    resposta_end_hour: z.number().int().min(1).max(KNOB_BOUNDS.hourEnd).nullable().optional(),
     allow_sunday: z.boolean().nullable().optional(),
+    /**
+     * Dias da prospecção (0642, 0=dom … 6=sáb). Omitido = mantém o que está
+     * gravado (linha nova nasce no default do banco: todos os dias). Sem
+     * `null`: dia não tem "voltar ao padrão" parcial — o padrão É a lista
+     * cheia, e ela se declara marcando todos os dias na ficha.
+     */
+    prospeccao_dias: z.array(z.number().int().min(0).max(6)).min(1).max(7).optional(),
     timezone: z
       .string()
       .refine(isValidTimezone, "timezone IANA inválida (ex.: America/Sao_Paulo)")
@@ -163,7 +183,17 @@ export interface ChannelKnobsRow {
   jitter_max_ms: number | null;
   window_start_hour: number | null;
   window_end_hour: number | null;
+  /** Janela da RESPOSTA (0495). Ausente/null = herda a janela de disparo. */
+  resposta_start_hour?: number | null;
+  resposta_end_hour?: number | null;
+  /** Atraso humano antes da 1ª bolha (0499). Ausente/null = default. */
+  atraso_notar_ms?: number | null;
+  ms_por_caractere?: number | null;
+  atraso_minimo_ms?: number | null;
+  atraso_maximo_ms?: number | null;
   allow_sunday: boolean | null;
+  /** Dias da prospecção (0642). Ausente/null = default (todos os dias). */
+  prospeccao_dias?: number[] | null;
   timezone: string | null;
   warmup_daily_caps: unknown;
   /** idade do número p/ warm-up (linha ausente = engine trata como idade 0). */
@@ -189,9 +219,21 @@ export function effectiveKnobs(row: ChannelKnobsRow | null, fusoDaOrg?: string |
   return {
     throttleMs: row?.throttle_ms ?? PACING_DEFAULTS.throttleMs,
     jitterMaxMs: row?.jitter_max_ms ?? PACING_DEFAULTS.jitterMaxMs,
+    atrasoNotarMs: row?.atraso_notar_ms ?? PACING_DEFAULTS.atrasoNotarMs,
+    msPorCaractere: row?.ms_por_caractere ?? PACING_DEFAULTS.msPorCaractere,
+    atrasoMinimoMs: row?.atraso_minimo_ms ?? PACING_DEFAULTS.atrasoMinimoMs,
+    atrasoMaximoMs: row?.atraso_maximo_ms ?? PACING_DEFAULTS.atrasoMaximoMs,
     windowStartHour: row?.window_start_hour ?? PACING_DEFAULTS.windowStartHour,
     windowEndHour: row?.window_end_hour ?? PACING_DEFAULTS.windowEndHour,
+    // Mesma regra do store do engine: coluna vazia herda a janela de DISPARO.
+    // A tela mostra `null` como "Usar o padrão" — e o padrão É o par de disparo,
+    // então mostrar 7h-22h aqui não mente: é o que o motor vai aplicar.
+    respostaStartHour: row?.resposta_start_hour ?? row?.window_start_hour ?? PACING_DEFAULTS.respostaStartHour,
+    respostaEndHour: row?.resposta_end_hour ?? row?.window_end_hour ?? PACING_DEFAULTS.respostaEndHour,
     allowSunday: row?.allow_sunday ?? PACING_DEFAULTS.allowSunday,
+    // Dias próprios da prospecção (0642). Inválido/vazio = todos os dias, que
+    // é o default do banco e o comportamento de antes — display não veta.
+    prospeccaoDias: parseDiasDaProspeccao(row?.prospeccao_dias) ?? PACING_DEFAULTS.prospeccaoDias,
     timezone: fusoDaJanela(row?.timezone, fusoDaOrg),
     warmupDailyCaps: parseWarmupCaps(row?.warmup_daily_caps) ?? PACING_DEFAULTS.warmupDailyCaps,
   };
@@ -207,11 +249,35 @@ export function warmupEstaPulado(row: ChannelKnobsRow | null): boolean {
 }
 
 /** Dias completos desde a ativação do número. Sem data = 0 (o motor é conservador). */
-export function idadeEmDias(row: ChannelKnobsRow | null, agora: Date = new Date()): number {
+export function idadeEmDias(
+  row: Pick<ChannelKnobsRow, "number_activated_at"> | null,
+  agora: Date = new Date(),
+): number {
   const iso = row?.number_activated_at;
   if (!iso) return 0;
   const ms = agora.getTime() - new Date(iso).getTime();
   return Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 86_400_000)) : 0;
+}
+
+/**
+ * O número já passou do aquecimento? A régua é a do controle de ritmo (#2432):
+ * o aquecimento terminou quando ele não põe mais teto por idade — a data em
+ * "Este número é usado desde" chegou ao último degrau, ou o dono ligou "pular o
+ * aquecimento" (`WARMUP_PULADO`), ou degraus próprios já chegaram ao "sem
+ * limite". Sem linha de knobs = idade 0 = ainda aquecendo (erra para o seguro).
+ *
+ * É a mesma conta do `cap_today` de `knobsView`, e é ela que decide QUANDO
+ * `channel_sessions.warmup_completed_at` é gravado (a ingestão do status da sessão).
+ * A marca gravada não volta: se o dono depois desligar "pular o aquecimento" ou
+ * declarar uma data mais recente, ela segue "sim" enquanto o controle de ritmo volta
+ * a limitar. Por isso nada no envio lê a marca — quem decide envio chama esta função.
+ */
+export function numeroJaAquecido(
+  row: Pick<ChannelKnobsRow, "number_activated_at" | "warmup_daily_caps"> | null,
+  agora: Date = new Date(),
+): boolean {
+  const degraus = parseWarmupCaps(row?.warmup_daily_caps) ?? PACING_DEFAULTS.warmupDailyCaps;
+  return warmupCapFor(idadeEmDias(row, agora), degraus) === null;
 }
 
 /**

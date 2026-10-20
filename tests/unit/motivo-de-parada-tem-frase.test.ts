@@ -90,6 +90,13 @@ const ORIGENS: DeclaracaoDeOrigem[] = [
     produtor: { arquivo: "lib/automation/guarda-do-contato.ts" },
   },
   {
+    arquivo: "lib/automation/actions/send-whatsapp.ts",
+    expressao: "classificada.motivo",
+    porque:
+      "a recusa da mídia que não é imagem nem PDF (#2734) chega à tela pelo `error` do resultado; o motivo é a frase de gente que o produtor escreve, e o produtor é varrido ao lado",
+    produtor: { arquivo: "lib/messaging/media/midia-com-legenda.ts" },
+  },
+  {
     arquivo: "lib/automation/actions/send-ai-message.ts",
     expressao: "acesso.motivo",
     porque:
@@ -109,6 +116,27 @@ const ORIGENS: DeclaracaoDeOrigem[] = [
     porque:
       "a recusa da tarefa (sem alvo, sem dono, título vazio, falha de gravação) chega à tela pelo `reason` do resultado; os códigos possíveis são quatro e estão escritos no tipo ResultadoDaTarefa",
     produtor: { arquivo: "lib/tarefas/criar-tarefa.ts" },
+  },
+  {
+    arquivo: "lib/automation/actions/apply-task-plan.ts",
+    expressao: "resultado.codigo",
+    porque:
+      "a recusa do PLANO de tarefas (#1752 — plano inexistente, sem alvo, sem dono, título vazio, falha de gravação) chega à tela pelo `reason` do resultado; os códigos possíveis estão escritos no tipo CodigoDaAplicacao",
+    produtor: { arquivo: "lib/tarefas/plano.ts" },
+  },
+  {
+    arquivo: "lib/automation/actions/ai-decide.ts",
+    expressao: "decisao.motivo",
+    porque:
+      "a resposta da IA que não virou escolha (JSON vazio, sem JSON, escolha ausente ou fora do conjunto) chega aos dois canais pelo `reason` da decisão; os códigos possíveis são escritos no tipo MotivoDaDecisao, no produtor declarado ao lado",
+    produtor: { arquivo: "lib/automation/decider.ts" },
+  },
+  {
+    arquivo: "lib/automation/actions/send-email.ts",
+    expressao: "para.motivo",
+    porque:
+      "o veredito do destinatário (sem contato, bloqueado, opt-out, sem e-mail, responsável sem e-mail) chega à tela pelo `reason` do resultado; os códigos possíveis são escritos nos retornos de `resolverDestinatario`, no próprio produtor",
+    produtor: { arquivo: "lib/automation/actions/send-email.ts" },
   },
 ];
 

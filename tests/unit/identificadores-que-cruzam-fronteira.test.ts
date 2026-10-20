@@ -163,12 +163,26 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   { arquivo: "workers/lgpd-export-worker.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "workers/media-persist-worker.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "lib/ai/skills/install.ts", fronteira: "storage.chave-de-objeto" },
+  // Herança de arquivos do pacote no save textual (#2047): a chave é montada
+  // com os MESMOS pedaços do install — org (uuid do JWT), name (vem da
+  // skill_version já instalada, não do payload) e versionId (uuid do INSERT) —
+  // e o sufixo é o path que o .zip passou pela validação de alfabeto do
+  // package.ts. Nada de texto digitado pelo operador entra na chave.
+  { arquivo: "lib/ai/skills/package-files.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/products/[id]/fotos/route.ts", fronteira: "storage.chave-de-objeto" },
+  // #2526: a imagem que o operador carrega na Resposta rápida. O caminho é gerado
+  // aqui (`${orgId}/templates/${templateId}/uuid.jpg|png`) — a forma é a mesma do
+  // registro acima: UUID v4 de alfabeto ASCII + `.jpg`/`.png` conhecido pela
+  // ASSINATURA dos bytes, nunca pelo content-type que o cliente diz.
+  { arquivo: "app/api/v1/message-templates/[id]/midias/route.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/cron/contact-avatars/route.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/channels/partner/templates/media/route.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/settings/sons/route.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/marca/logo/route.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/conversations/[id]/media/route.ts", fronteira: "storage.chave-de-objeto" },
+  // O anexo da nota interna (#1863, F3): MESMO molde de chave da rota irmã
+  // (`{org}/{conversa}/note-{uuid}.{ext}`), bucket próprio `internal-media`.
+  { arquivo: "app/api/v1/conversations/[id]/notes/media/route.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/ai/knowledge/sources/upload/route.ts", fronteira: "storage.chave-de-objeto" },
   { arquivo: "app/api/v1/ai/knowledge/sources/route.ts", fronteira: "storage.chave-de-objeto" },
   // O PDF da proposta comercial (#1832): `<org>/<proposta>.pdf`, dois uuids.
@@ -176,6 +190,7 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   // Chave de idempotência: os geradores (manda UUID) e os validadores (exige UUID).
   { arquivo: "app/onboarding/connect-whatsapp/_client.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "components/extensions/ExtensionsManager.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
+  { arquivo: "components/modulos/ModulosManager.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "hooks/ai/useSkills.ts", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "hooks/contacts/useImportContacts.ts", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "lib/api/client.ts", fronteira: "api.idempotency-key", papel: "gerador" },

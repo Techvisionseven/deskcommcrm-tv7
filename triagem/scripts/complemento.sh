@@ -69,7 +69,15 @@ MIG=$(f -c '^supabase/migrations/[0-9].*\.sql$')
 if [ "$MIG" -gt 0 ]; then
   BL=$(f -c '^supabase/baseline.sql$')
   MF=$(f -c '^supabase/migrations/MANIFEST.md$')
-  p migration_tripla "migrations=$MIG baseline=$BL manifest=$MF $([ "$BL" -ge 1 ] && [ "$MF" -ge 1 ] && echo COMPLETA || echo INCOMPLETA)"
+  # Desde o #2149 a descrição pode morar no cabeçalho `-- manifest:` do próprio
+  # .sql em vez de numa linha do MANIFEST.md; contar só o MANIFEST dava
+  # "INCOMPLETA" falso em toda migration do formato novo (#2259, #2260, #2263).
+  # Conta ARQUIVOS de migration (não linhas do diff inteiro) cujo conteúdo
+  # adicionado traz o cabeçalho — linha `-- manifest:` em teste/doc, ou duas num
+  # mesmo .sql, não podem cobrir outra migration que não o tem.
+  HM=$(awk '/^\+\+\+ b\//{f=substr($0,7); next} f ~ /^supabase\/migrations\/[0-9][^\/]*\.sql$/ && /^\+-- manifest:/ {seen[f]=1} END{n=0; for(k in seen) n++; print n}' <<<"$DIFF")
+  [ "$HM" -ge "$MIG" ] && MF=$((MF + HM))
+  p migration_tripla "migrations=$MIG baseline=$BL manifest=$MF (cabecalho=$HM) $([ "$BL" -ge 1 ] && [ "$MF" -ge 1 ] && echo COMPLETA || echo INCOMPLETA)"
   # A população é a da pergunta (#1273): a main do PRODUTO mais as outras refs do
   # clone, com a âncora do nome canônico. A versão anterior media `git ls-tree
   # origin/main` e contava com `grep -c "_${NUM}_"` — a main de um fork em vez da
@@ -132,7 +140,33 @@ else p tabela_nova "n/a"; fi
 
 # --- security definer exposta ---
 if c -qi 'security definer'; then
-  c -qiE 'revoke execute on function.*from.*(public|anon)' && p definer_revoke "tem revoke" || p definer_revoke "security definer SEM revoke — as DUAS origens"
+  # As origens se SOMAM por FUNÇÃO. O regex anterior fechava em `(public|anon)`
+  # e aceitava o revoke de UMA origem só, embora a mensagem já falasse das DUAS
+  # (medido na main no #2304); a primeira correção passou a exigir as duas, mas
+  # na MESMA declaração — e aí reprovava função correta que parte o revoke em
+  # duas linhas, uma para `public` e outra para `anon` (as migrations 0428 e
+  # 0442 revogam assim). Agora o `from public` de uma linha e o `from anon` de
+  # outra, para a MESMA função, somam; e as origens de funções DIFERENTES NÃO se
+  # misturam (misturar continua reprovando). A chave é a referência entre
+  # `on function` e o `from`, lida sem diferenciar maiúscula, e o
+  # `revoke[[:space:]]+…[[:space:]]+on[[:space:]]+function` aceita espaço
+  # múltiplo (as 0428/0442 alinham `revoke all     on`). Bash 3.2 não tem array
+  # associativo — o awk, que o script já usa, tem, e agrega por chave numa passada.
+  REVOGA=$(c -iE 'revoke[[:space:]]+(execute|all([[:space:]]+privileges)?)[[:space:]]+on[[:space:]]+function.*from')
+  DEF_OK=$(awk '
+    {
+      low = tolower($0)
+      lista = low; sub(/.*from/, "", lista)
+      fn = low
+      sub(/.*on[[:space:]]+function/, "", fn)
+      sub(/from.*/, "", fn)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", fn)
+      if (lista ~ /(^|[^[:alnum:]_])public([^[:alnum:]_]|$)/) rev_pub[fn] = 1
+      if (lista ~ /(^|[^[:alnum:]_])anon([^[:alnum:]_]|$)/)   rev_anon[fn] = 1
+    }
+    END { for (f in rev_pub) if (f in rev_anon) { print 1; exit } print 0 }
+  ' <<<"$REVOGA")
+  [ "$DEF_OK" = 1 ] && p definer_revoke "tem revoke" || p definer_revoke "security definer SEM revoke — as DUAS origens"
 fi
 
 # --- 4. console.log (no-console é warn, o CI não reprova) ---

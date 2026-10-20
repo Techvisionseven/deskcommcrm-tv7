@@ -2,12 +2,14 @@ import { redirect } from "next/navigation";
 
 import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import { createClient } from "@/lib/supabase/server";
-import { branding } from "@/lib/branding";
+import { marcaDaSaida } from "@/lib/branding/saida";
 import { RecoverOrganizationForm } from "@/components/auth/RecoverOrganizationForm";
 import { modoDeCadastro } from "@/lib/auth/politica-de-cadastro";
 import { estadoDoPedido } from "@/lib/auth/registration-requests";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { IdiomaProvider } from "@/lib/i18n/IdiomaProvider";
+import { lerCadastroNaTela, planoInicialDoSeletor } from "@/lib/cobranca/cadastro";
+import { createAdminClient } from "@/lib/supabase/admin";
 
 /**
  * A saída do beco: quem confirmou o e-mail e ficou sem organização termina o
@@ -51,13 +53,27 @@ export default async function GetStartedPage() {
   const pedido = comAprovacao ? await estadoDoPedido(user.id) : null;
   const aguardando = pedido === "pending" || pedido === "rejected";
 
+  // O nome em texto vem do resolvedor do BANCO (`marcaDaSaida`), não do
+  // `branding()` — o banco vence e o `.env` é o piso.
+  const marca = await marcaDaSaida(null);
+
+  // Os planos do cadastro (#2846): quem chega aqui sem plano escolhido (conta
+  // nova pelo Google, ou cadastro anterior à cobrança) escolhe agora. Vem
+  // marcado o que a pessoa escolheu no cadastro, se ainda é oferecido; senão o padrão.
+  const cadastro = aguardando ? null : await lerCadastroNaTela(createAdminClient());
+  const planos = cadastro?.oferecidos ?? [];
+  const escolhido = authUser?.user_metadata?.cobranca_plan_id;
+  const planoInicial = planos.some((p) => p.id === escolhido)
+    ? (escolhido as string)
+    : planoInicialDoSeletor(planos, cadastro?.padraoId ?? null);
+
   return (
     <IdiomaProvider locale={user.idioma}>
       <main className="bg-muted/40 flex min-h-screen items-center justify-center px-4 py-10">
         <div className="w-full max-w-md space-y-6 rounded-lg border bg-background p-6 shadow-sm">
           <div className="space-y-2">
             <p className="text-xs uppercase tracking-wider text-muted-foreground">
-              {branding().name}
+              {marca.nome}
             </p>
             <h1 className="text-2xl font-semibold tracking-tight">
               {pedido === "pending"
@@ -85,7 +101,7 @@ export default async function GetStartedPage() {
             </p>
           </div>
           {!aguardando && (
-            <RecoverOrganizationForm nomeSugerido={nomeSugerido} comAprovacao={comAprovacao} />
+            <RecoverOrganizationForm nomeSugerido={nomeSugerido} comAprovacao={comAprovacao} planos={planos} planoInicial={planoInicial} />
           )}
           <p className="text-xs leading-relaxed text-muted-foreground">
             {t(

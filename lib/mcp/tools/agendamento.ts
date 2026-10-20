@@ -36,6 +36,7 @@ import {
 } from "@/app/api/v1/agenda/agendamentos/_handler";
 import { ApiError } from "@/lib/api/types";
 import { SITUACOES_DO_AGENDAMENTO } from "@/lib/agenda/tipos";
+import { contatoDoNegocio } from "@/lib/operacao/modelos-de-mensagem";
 import type { McpContext, McpToolDefinition } from "@/lib/mcp/types";
 import { resolveUserNames } from "./_users";
 
@@ -160,7 +161,7 @@ const horariosLivresShape = {
     .optional()
     .describe(
       `quantos dias olhar a partir de agora (padrão ${DIAS_PADRAO}). Use ESTE campo se você não sabe a data de hoje. ` +
-        `Se 'dia' também for informado, 'dia' tem precedência.`,
+        `Se 'dia' também for informado, o período começa em 'dia' e cobre ESTE número de dias.`,
     ),
   /**
    * A data civil é deliberadamente diferente de um ISO com offset. O modelo sabe
@@ -173,8 +174,8 @@ const horariosLivresShape = {
     .regex(/^\d{4}-\d{2}-\d{2}$/, "dia deve estar em YYYY-MM-DD")
     .optional()
     .describe(
-      "dia civil pedido pelo cliente, em YYYY-MM-DD. Use para uma data específica; o servidor aplica o fuso da agenda " +
-        "(tem precedência sobre dias_a_frente).",
+      "dia civil pedido pelo cliente, em YYYY-MM-DD. Use para uma data específica; o servidor aplica o fuso da agenda. " +
+        "Sozinho, recorta a resposta nesse dia; junto com 'dias_a_frente', é o PRIMEIRO dia do período.",
     ),
   owner_user_id: z.string().uuid().optional(),
   limite: z
@@ -295,6 +296,7 @@ export const crmFindFreeSlots: McpToolDefinition<typeof horariosLivresShape> = {
     "existem e `ha_mais` avisa que sobraram — lista cortada NÃO é agenda cheia. " +
     "QUANDO: informe `dias_a_frente` (a partir de agora — ex.: 7 para a próxima semana). " +
     "Para uma data que o cliente nomeou, use `dia` em YYYY-MM-DD; o servidor aplica o fuso da agenda. " +
+    "Se mandar os DOIS, o período começa em `dia` e anda `dias_a_frente` dias — `dia` recorta a um dia só quando vier sozinho. " +
     "NUNCA monte um intervalo UTC por conta própria. " +
     "Lista vazia NÃO é erro e NÃO significa que a agenda está cheia: leia `publicou_horarios`. " +
     "Se ele for false, o atendente ainda não publicou os horários dele — não invente horários e " +
@@ -307,8 +309,15 @@ export const crmFindFreeSlots: McpToolDefinition<typeof horariosLivresShape> = {
   requiresScope: "mcp:read",
   handler: async (input, ctx) => {
     const agora = new Date();
-    // Se o modelo enviar `dia` e `dias_a_frente` juntos, toleramos e priorizamos
-    // o mais específico (`dia`), evitando recusa silenciosa em produção (#1436).
+    // Toleramos os dois campos juntos sem recusa silenciosa (#1436). Com os dois,
+    // o período COMEÇA em `dia` e anda `dias_a_frente` dias (#2889).
+    //
+    // O caso da issue: modelos tipo GPT (OpenRouter) mandaram `dia = HOJE` junto
+    // com `dias_a_frente` (auditoria `mcp.tool_called`), e a precedência do dia
+    // colapsava a janela em HOJE só — resposta VAZIA, e o agente repetia a
+    // chamada até desistir. Ignorar o `dia` também não serve: "tem vaga dia 05?"
+    // com `dias_a_frente` pequeno não alcançaria o dia 05. `dia` SOZINHO segue
+    // recortando naquele dia civil — o caminho de "o cliente pediu dia 13".
 
     // A faixa larga contém o dia civil em QUALQUER fuso. Depois de a coleta
     // revelar o fuso da regra, filtramos pelo mesmo dia local. Assim a IA não
@@ -319,12 +328,23 @@ export const crmFindFreeSlots: McpToolDefinition<typeof horariosLivresShape> = {
     // agenda precisam perguntar a mesma coisa" e ficou com um chamador só,
     // enquanto esta cópia seguia inline — duas fontes para a mesma janela, que
     // divergem no primeiro ajuste.
+    const DIA_MS = 86_400_000;
+    const comPeriodo = input.dias_a_frente !== undefined;
     const janela = input.dia === undefined ? null : faixaAmplaDoDia(input.dia);
-    const de = janela === null ? agora : janela.de;
-    const ate =
-      janela === null
-        ? new Date(de.getTime() + (input.dias_a_frente ?? DIAS_PADRAO) * 86_400_000)
-        : janela.ate;
+    let de = agora;
+    let ate = new Date(agora.getTime() + (input.dias_a_frente ?? DIAS_PADRAO) * DIA_MS);
+    if (janela !== null && !comPeriodo) {
+      de = janela.de;
+      ate = janela.ate;
+    } else if (janela !== null && input.dias_a_frente !== undefined) {
+      // Começa no dia pedido (nunca antes de agora) e cobre `dias_a_frente` dias
+      // CIVIS inteiros a partir dele: o fim da faixa larga do dia mais N−1 dias.
+      // O `max` com `de + N` só pesa quando `dia` é hoje e `agora` já passou dele.
+      de = new Date(Math.max(janela.de.getTime(), agora.getTime()));
+      ate = new Date(
+        Math.max(de.getTime() + input.dias_a_frente * DIA_MS, janela.ate.getTime() + (input.dias_a_frente - 1) * DIA_MS),
+      );
+    }
 
     const consulta = await horariosLivresDaOrg(ctx.supabase, ctx.organizationId, {
       eventTypeSlug: input.event_type_slug,
@@ -350,10 +370,17 @@ export const crmFindFreeSlots: McpToolDefinition<typeof horariosLivresShape> = {
     // nele que os horários foram calculados, e é o que esta resposta já publica.
     // Rotular com outro faria `quando` discordar de `fuso_da_regra` na mesma
     // resposta.
+    // `dia` sozinho recorta naquele dia local; com `dias_a_frente`, recorta só o
+    // que vem ANTES dele (a faixa larga alcança a véspera em fusos a leste).
+    // YYYY-MM-DD compara como string na ordem do calendário.
+    const diaPedido = input.dia;
     const slotsDoPeriodo =
-      input.dia === undefined
+      diaPedido === undefined
         ? consulta.slots
-        : consulta.slots.filter((s) => diaLocalISO(s.inicio, consulta.fusoDaRegra) === input.dia);
+        : consulta.slots.filter((s) => {
+            const local = diaLocalISO(s.inicio, consulta.fusoDaRegra);
+            return comPeriodo ? local >= diaPedido : local === diaPedido;
+          });
     return payloadDeHorarios(consulta, slotsDoPeriodo, input.limite ?? HORARIOS_PADRAO);
   },
 };
@@ -444,15 +471,45 @@ export const crmListAppointments: McpToolDefinition<typeof listarShape> = {
     "decidimos voltar a falar, sem nada combinado com o cliente. Aqui é o que foi combinado " +
     "COM ele e ocupa o tempo de um atendente. O mesmo cliente pode ter os dois. " +
     "USE ANTES DE MARCAR e antes de cobrar: cliente que já tem consulta marcada não deve " +
-    "receber oferta de horário como se não tivesse, nem ser cobrado como se estivesse parado.",
+    "receber oferta de horário como se não tivesse, nem ser cobrado como se estivesse parado." +
+    " Em conversa de atendimento, lista apenas os compromissos do contato desta conversa.",
   inputSchema: listarShape,
   category: "read",
   requiresRole: "agent",
   requiresScope: "mcp:read",
   handler: async (input, ctx) => {
+    // ── A AGENDA, DURANTE UM TURNO, É A DO CONTATO DESTA CONVERSA ───────────
+    //
+    // Com `ctx.contatoDoTurno` (contexto de confiança do runtime), o contato é
+    // forçado na consulta — `dia`, `owner_user_id` e `de+ate` seguem valendo,
+    // mas só dentro dele. `contact_id` de outro e `lead_id` cujo dono não é o
+    // do turno (inexistente e sem contato inclusive) caem na MESMA recusa.
+    // `lead_id` igual ao contato do turno é a confusão contato × negócio que o
+    // runtime não conseguiu traduzir: o contato já cobre a pergunta. Sem
+    // contato do turno (integrador, pessoa), nada muda.
+    const doTurno = ctx.contatoDoTurno;
+    const leadId = doTurno && input.lead_id === doTurno ? undefined : input.lead_id;
+    if (doTurno) {
+      const foraDoTurno =
+        (input.contact_id !== undefined && input.contact_id !== doTurno) ||
+        (leadId !== undefined &&
+          (await contatoDoNegocio(
+            { supabase: ctx.supabase, organizationId: ctx.organizationId, actor: ctx.actor, requestId: ctx.requestId },
+            leadId,
+          )) !== doTurno);
+      if (foraDoTurno) {
+        return {
+          permitido: false,
+          motivo: "fora_da_conversa",
+          mensagem:
+            "esta conversa é com outra pessoa — os compromissos de quem não é este cliente não são " +
+            "seus para ver; siga a conversa com quem está falando.",
+        };
+      }
+    }
     const r = await listaAgendamentos(ctx.supabase, ctx.organizationId, {
-      contactId: input.contact_id ?? null,
-      leadId: input.lead_id ?? null,
+      contactId: doTurno ?? input.contact_id ?? null,
+      leadId: leadId ?? null,
       dia: input.dia ?? null,
       ownerUserId: input.owner_user_id ?? null,
       situacao: input.situacao ?? null,
@@ -489,6 +546,8 @@ export const crmListAppointments: McpToolDefinition<typeof listarShape> = {
         inicio: a.iniciaEm,
         fim: a.terminaEm,
         fuso: a.fuso,
+        quando: rotuloLocal(new Date(a.iniciaEm), a.fuso),
+        fim_quando: rotuloLocal(new Date(a.terminaEm), a.fuso),
         situacao: a.situacao,
         meet_state: a.meetingState,
         meeting_url: a.meetingState === "ready" ? a.meetingUrl : null,
@@ -568,6 +627,57 @@ async function semDerrubarOTurno<T>(
   }
 }
 
+/**
+ * Quem pode entrar no convite do Google pela mão do agente: só quem é USUÁRIO
+ * ATIVO desta organização (decisão do mantenedor no #2077, issue #2062).
+ *
+ * O agente escreve o que o cliente dita. Um e-mail de cliente ou de terceiro no
+ * convite faria o Google mandar, em nome do negócio, um convite a quem o
+ * negócio nunca escolheu. O caso que a issue pede — o consultor que conduz a
+ * reunião — é sempre alguém da equipe. (Convidado externo com confirmação
+ * humana ficou como pedido futuro.)
+ *
+ * A conferência é contra os membros da organização do TURNO
+ * (`ctx.organizationId`), nunca do input, e nunca olha outras organizações: a
+ * recusa é a mesma para e-mail desconhecido e para membro de outra empresa.
+ */
+const DESCRICAO_DO_CONVIDADO =
+  "e-mail de alguém DA EQUIPE (usuário desta empresa) que também participa do compromisso — por " +
+  "exemplo, o consultor que conduz a reunião. E-mail de cliente ou de terceiro é RECUSADO: o contato " +
+  "atendido já entra no convite pelo e-mail da ficha, quando ele existe.";
+
+async function convidadoEhDaEquipe(ctx: McpContext, email: string): Promise<boolean> {
+  const { data, error } = await ctx.supabase
+    .from("user_organizations")
+    .select("user_id")
+    .eq("organization_id", ctx.organizationId)
+    .is("revoked_at", null);
+  if (error) throw new ApiError(500, "internal_error", undefined, ctx.requestId, error.message);
+  const alvo = email.trim().toLowerCase();
+  // ponytail: uma leitura de auth por membro; equipe de self-host é pequena. Se
+  // crescer, troque por uma função que cruze `auth.users` no banco.
+  const emails = await Promise.all(
+    ((data ?? []) as Array<{ user_id: string }>).map(async (m) => {
+      const r = await ctx.supabase.auth.admin.getUserById(m.user_id);
+      if (r.error) throw new ApiError(500, "internal_error", undefined, ctx.requestId, r.error.message);
+      return r.data.user?.email?.trim().toLowerCase();
+    }),
+  );
+  return emails.includes(alvo);
+}
+
+/** A escrita conserva seus instantes; a IA recebe também a hora de parede. */
+function compromissoComHorarioLocal(r: Record<string, unknown>): Record<string, unknown> {
+  if (typeof r.starts_at !== "string" || typeof r.time_zone !== "string") return r;
+  return {
+    ...r,
+    quando: rotuloLocal(new Date(r.starts_at), r.time_zone),
+    ...(typeof r.ends_at === "string"
+      ? { fim_quando: rotuloLocal(new Date(r.ends_at), r.time_zone) }
+      : {}),
+  };
+}
+
 const marcarShape = {
   event_type_slug: z.string().min(1).describe("o identificador legível do tipo de atendimento"),
   starts_at: z.string().datetime({ offset: true }).describe("o instante exato do início, vindo de `crm_find_free_slots`"),
@@ -589,6 +699,12 @@ const marcarShape = {
     .max(300)
     .optional()
     .describe("endereço ou local DESTE compromisso. Vazio apaga o que o tipo sugeriu."),
+  guest_email: z
+    .string()
+    .email()
+    .max(320)
+    .optional()
+    .describe(DESCRICAO_DO_CONVIDADO),
 };
 
 export const crmBookAppointment: McpToolDefinition<typeof marcarShape> = {
@@ -619,6 +735,16 @@ export const crmBookAppointment: McpToolDefinition<typeof marcarShape> = {
           mensagem: `não existe atendimento chamado "${input.event_type_slug}". Pergunte que tipo de atendimento a pessoa quer.`,
         };
       }
+      if (input.guest_email !== undefined && !(await convidadoEhDaEquipe(ctx, input.guest_email))) {
+        return {
+          marcado: false,
+          motivo: "convidado_fora_da_equipe",
+          mensagem:
+            "NADA foi marcado: o convite só pode incluir e-mail de alguém da equipe desta empresa. " +
+            "Marque de novo SEM `guest_email` e, se a pessoa quer outro participante, diga que a " +
+            "equipe inclui no convite.",
+        };
+      }
       const r = await marcarAgendamentoHandler(
         ctx.supabase,
         {
@@ -640,6 +766,7 @@ export const crmBookAppointment: McpToolDefinition<typeof marcarShape> = {
           ...(input.location_details !== undefined
             ? { location_details: input.location_details }
             : {}),
+          ...(input.guest_email !== undefined ? { guest_email: input.guest_email } : {}),
         },
       );
       /**
@@ -676,7 +803,7 @@ export const crmBookAppointment: McpToolDefinition<typeof marcarShape> = {
 
       return {
         marcado: true,
-        compromisso: r,
+        compromisso: compromissoComHorarioLocal(r),
         // Campo próprio, além da mensagem: um booleano no topo é o que o modelo
         // enxerga sem precisar interpretar prosa.
         aguarda_confirmacao: aguardaConfirmacao,
@@ -705,6 +832,7 @@ async function marcarHorario(
     ownerUserId?: string;
     title?: string;
     notes?: string;
+    guestEmail?: string;
   },
 ): Promise<unknown> {
   return crmBookAppointment.handler(
@@ -715,6 +843,7 @@ async function marcarHorario(
       ...(args.ownerUserId !== undefined ? { owner_user_id: args.ownerUserId } : {}),
       ...(args.title !== undefined ? { title: args.title } : {}),
       ...(args.notes !== undefined ? { notes: args.notes } : {}),
+      ...(args.guestEmail !== undefined ? { guest_email: args.guestEmail } : {}),
     },
     ctx,
   );
@@ -740,6 +869,12 @@ const consultarEMarcarShape = {
   owner_user_id: z.string().uuid().optional(),
   title: z.string().min(1).max(200).optional(),
   notes: z.string().max(2000).optional(),
+  guest_email: z
+    .string()
+    .email()
+    .max(320)
+    .optional()
+    .describe(DESCRICAO_DO_CONVIDADO),
 };
 
 /**
@@ -841,6 +976,7 @@ export const crmFindAndBookAppointment: McpToolDefinition<typeof consultarEMarca
       ...(input.owner_user_id !== undefined ? { ownerUserId: input.owner_user_id } : {}),
       ...(input.title !== undefined ? { title: input.title } : {}),
       ...(input.notes !== undefined ? { notes: input.notes } : {}),
+      ...(input.guest_email !== undefined ? { guestEmail: input.guest_email } : {}),
     });
 
     const recusado =
@@ -855,10 +991,16 @@ export const crmFindAndBookAppointment: McpToolDefinition<typeof consultarEMarca
       // modelo precisa para não encerrar a conversa com o cliente na mão.
       //
       // ⚠️ A lista vai SEM o horário recusado: ele acabou de ser recusado, e
-      // oferecê-lo de volta ao cliente é o começo de um laço.
+      // oferecê-lo de volta ao cliente é o começo de um laço. Exceção: a recusa
+      // do CONVIDADO (#2077) não é do horário — ele segue livre, e a instrução é
+      // marcar de novo sem `guest_email`; tirá-lo da lista empurraria o agente a
+      // oferecer outro horário ao cliente.
+      const motivoDaRecusa = (resultado as { motivo?: unknown }).motivo;
       const payload = payloadDeHorarios(
         consulta,
-        slotsDoDia.filter((s) => s !== achado),
+        motivoDaRecusa === "convidado_fora_da_equipe"
+          ? slotsDoDia
+          : slotsDoDia.filter((s) => s !== achado),
         HORARIOS_PADRAO,
       );
       // ⚠️ E o ensino só é REESCRITO quando a recusa é o horário que ficou
@@ -871,7 +1013,6 @@ export const crmFindAndBookAppointment: McpToolDefinition<typeof consultarEMarca
       // ofereça horários", `agenda_tipo_desativado` diz "pergunte que outro
       // atendimento serve" — e as duas passavam a mandar oferecer um horário da
       // lista. E sem opção no dia, consultar outro dia é mesmo o próximo passo.
-      const motivoDaRecusa = (resultado as { motivo?: unknown }).motivo;
       const ofereceDaLista =
         motivoDaRecusa === "agenda_horario_indisponivel" && payload.horarios.length > 0;
       return {
@@ -937,7 +1078,7 @@ export const crmRescheduleAppointment: McpToolDefinition<typeof remarcarShape> =
           ...(input.notes ? { notes: input.notes } : {}),
         },
       );
-      return { remarcado: true, compromisso: r };
+      return { remarcado: true, compromisso: compromissoComHorarioLocal(r) };
     }),
 };
 
@@ -972,7 +1113,7 @@ export const crmCancelAppointment: McpToolDefinition<typeof cancelarShape> = {
         { organization_id: ctx.organizationId, actor: ctx.actor, requestId: ctx.requestId },
         { id: input.appointment_id, reason: input.reason },
       );
-      return { cancelado: true, compromisso: r };
+      return { cancelado: true, compromisso: compromissoComHorarioLocal(r) };
     }),
 };
 
@@ -1006,7 +1147,7 @@ export const crmConfirmAppointment: McpToolDefinition<typeof confirmarShape> = {
           ...(input.notes ? { notes: input.notes } : {}),
         },
       );
-      return { confirmado: true, compromisso: r };
+      return { confirmado: true, compromisso: compromissoComHorarioLocal(r) };
     }),
 };
 
@@ -1042,6 +1183,6 @@ export const crmSetAppointmentOutcome: McpToolDefinition<typeof desfechoShape> =
           ...(input.notes ? { notes: input.notes } : {}),
         },
       );
-      return { registrado: true, compromisso: r };
+      return { registrado: true, compromisso: compromissoComHorarioLocal(r) };
     }),
 };

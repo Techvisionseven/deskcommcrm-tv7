@@ -5,9 +5,16 @@
  * frequência e cópia de schema envelhece. Estes tipos descrevem só o que o
  * conector precisa — a conexão decifrada e o retrato do catálogo lido ao vivo.
  */
+import type { TipoDeIdentificador } from "./schemas";
 
 /** Modos de TLS aceitos, alinhados ao CHECK de `external_db_connections.ssl_mode`. */
 export type ModoTls = "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
+
+/** Modos das fontes liberadas, alinhados ao CHECK de `external_db_connections.source_mode`. */
+export type ModoDeFontes = "all" | "list";
+
+/** Motores aceitos, alinhados ao CHECK de `external_db_connections.db_type`. Mais motores que a API aceita hoje: ver `TIPOS_DE_BANCO_ACEITOS` em `schemas.ts`. */
+export type TipoBanco = "postgres" | "mysql";
 
 /**
  * Conexão já decifrada, pronta para abrir o pool.
@@ -20,6 +27,8 @@ export type ModoTls = "disable" | "prefer" | "require" | "verify-ca" | "verify-f
 export interface ConexaoExterna {
   id: string;
   organizationId: string;
+  /** Qual motor fala com este banco. Até a Fatia 4a (coluna `db_type`), todo cadastro é PostgreSQL. */
+  dbType: TipoBanco;
   label: string;
   host: string;
   port: number;
@@ -33,7 +42,22 @@ export interface ConexaoExterna {
   maxFilters: number;
   /** Teto de bytes da resposta devolvida ao modelo (`max_response_bytes`). */
   maxResponseBytes: number;
+  /**
+   * Qual coluna das tabelas externas guarda o telefone ou o e-mail do cliente.
+   * Durante a conversa, a consulta do agente é filtrada por ela com o dado do
+   * contato do turno; `null` = não configurada, e a consulta segue sem esse filtro.
+   */
+  chaveDoCliente: ChaveDoCliente | null;
+  /** `all` = vê tudo que o usuário do banco vê; `list` = só `fontes`. */
+  sourceMode: ModoDeFontes;
+  /** Fontes liberadas (só valem com `sourceMode = "list"`; em `all` vem vazio). */
+  fontes: Array<{ schema: string; tabela: string; colunas: string[] | null; descricao: string }>;
   versao: string;
+}
+
+export interface ChaveDoCliente {
+  coluna: string;
+  tipo: TipoDeIdentificador;
 }
 
 /** Uma coluna do catálogo externo, na ordem em que aparece na tabela. */
@@ -54,6 +78,8 @@ export interface TabelaExterna {
   chavePrimaria: string[];
   /** Estimativa do planner (`pg_class.reltuples`), não uma contagem exata. */
   estimativaLinhas: number;
+  /** Descrição escrita pelo administrador da conexão (só em modo `list`). */
+  descricao?: string;
 }
 
 /** Operadores aceitos no filtro da consulta — vocabulário FECHADO, de propósito. */

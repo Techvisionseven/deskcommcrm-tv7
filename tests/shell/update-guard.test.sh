@@ -191,7 +191,7 @@ export PATH="$WORK/bin:$PATH"
 # ── Instalação de mentira: repo git + kit + .env ─────────────────────────────
 PROJ="$WORK/deskcommcrm"
 mkdir -p "$PROJ/hostgator-setup-kit" "$PROJ/supabase"
-cp "$REPO_ROOT/hostgator-setup-kit/_common.sh" "$REPO_ROOT/hostgator-setup-kit/_i18n.sh" \
+cp "$REPO_ROOT/hostgator-setup-kit/_common.sh" "$REPO_ROOT/hostgator-setup-kit/_manifestos.sh" "$REPO_ROOT/hostgator-setup-kit/_i18n.sh" \
    "$REPO_ROOT/hostgator-setup-kit/update.sh" \
    "$REPO_ROOT/hostgator-setup-kit/agent.sh" "$REPO_ROOT/hostgator-setup-kit/manutencao.sh" \
    "$PROJ/hostgator-setup-kit/"
@@ -260,8 +260,16 @@ check "mesmo recusando, deixou o agente da tela instalado (com cd no diretório 
   grep -q "cd ${PROJ} && bash hostgator-setup-kit/agent.sh" "$FAKE_CRONTAB"
 
 echo "── 3. --force é a saída explícita de quem quer mesmo voltar"
+: > "$DOCKER_LOG"
 run_update --to v0.9.0 --force
 check "passou da guarda e rodou o backup" test -f "$BACKUP_MARK"
+# O pré-voo de PLATAFORMA (`preflight_plataforma_atualizacao`) é só do ARM64:
+# no AMD64 toda imagem publicada tem amd64. O preflight geral da #1955
+# (`preflight_atualizacao`) consulta o buildx em toda arquitetura, de propósito
+# e com motivo nomeado — por isso a régua aqui é a RECUSA do pré-voo ARM, não
+# o `imagetools` no log do docker. Se o AMD64 voltar a passar por ele, este
+# dublê (sem registro) faz o pré-voo recusar, e a mensagem aparece na saída.
+check "em AMD64 a atualização não passa pelo pré-voo de plataforma do ARM64" bash -c "! grep -q 'não está completa para' '$OUTFILE'"
 
 echo "── 4. Atualização de verdade grava a imagem no .env, sem duplicar a chave"
 # Estado de quem sofreu um rollback antes: o agente deixou a imagem apontando
@@ -359,9 +367,10 @@ check "  o FIM da tela repete que o banco NÃO terminou limpo" \
   grep -q "Atenção: o banco NÃO terminou limpo nesta atualização" "$OUTFILE"
 check "  e não diz Atualização concluída" test -z "$(grep 'Atualização concluída' "$OUTFILE" || true)"
 check "  a dica aparece no passo do banco E no fim" test "$(grep -cF 'update.sh --to v1.1.0 --force' "$OUTFILE")" -eq 2
-# Restaurar o backup desfaz também o que o CRM gravou desde ele: é o último recurso.
-check "  no passo do banco, repetir vem ANTES de restaurar" \
-  test "$(linha_de 'update.sh --to v1.1.0 --force')" -lt "$(linha_de 'Só em último caso, volte ao backup')"
+# O backup não volta por cima do banco em uso (#2120): o aviso disso vem depois do
+# que se pode fazer, que é repetir.
+check "  no passo do banco, repetir vem ANTES do aviso sobre o backup" \
+  test "$(linha_de 'update.sh --to v1.1.0 --force')" -lt "$(linha_de 'O backup feito antes desta atualização NÃO volta')"
 check "  e a orientação é a ÚLTIMA coisa da saída, depois do passo 7" \
   test -n "$(tail -n 8 "$OUTFILE" | grep -F 'update.sh --to v1.1.0 --force' || true)"
 
@@ -708,12 +717,15 @@ cd "$PROJ" || exit 1
 
 echo "── 12. VPS de outra arquitetura: atualizar se recupera sozinho (issue 1060)"
 # O defeito: o registro responde "no matching manifest for linux/arm64/v8", o
-# `pull` não traz imagem nenhuma e o `up -d` morre junto — o `app` não tem
-# `build:` ao lado do `image:`, então o Compose não tem o que subir. Antes da
-# guarda o script terminava como se tivesse dado certo: o CRM ficava na versão
-# velha e o dono não era avisado. Pelo botão "Atualizar" nem isso, porque o
-# agente roda sozinho no cron. O desfecho certo é construir aqui a MESMA versão
-# alvo e dizer, em português, o que aconteceu.
+# `pull` não traz imagem nenhuma e o `up -d` morre junto. Medido no Compose,
+# worker, scheduler e voz — que TÊM `build:` ao lado do `image:` — são
+# reconstruídos sozinhos em qualquer falha de pull; o `app` fica SEM `build:`
+# de propósito (#1060), e é a falta da imagem dele que faz o `up -d` falhar e
+# entrega a decisão à guarda, que é quem julga quando o registro não responde.
+# Antes da guarda o script terminava como se tivesse dado certo: o CRM ficava
+# na versão velha e o dono não era avisado. Pelo botão "Atualizar" nem isso,
+# porque o agente roda sozinho no cron. O desfecho certo é construir aqui a
+# MESMA versão alvo e dizer, em português, o que aconteceu.
 cd "$PROJ" || exit 1
 export DOCKER_BUILD_FEITO="$WORK/build-feito"
 rm -f "$DOCKER_BUILD_FEITO"
@@ -753,8 +765,104 @@ check "caminho feliz: a saída não fala em arquitetura nem em construção loca
 # dele também. A recuperação é a MESMA função de _common.sh, exercitada acima de
 # ponta a ponta pelo update.sh; aqui se prova que o install.sh a chama — e logo
 # depois do `up -d` que pode falhar, não em outro lugar qualquer.
-check "install.sh chama a recuperação depois de um up -d que pode falhar" \
-  bash -c "grep -A1 'if ! dc up -d; then' '$REPO_ROOT/hostgator-setup-kit/install.sh' | grep -q 'construir_aqui_e_subir'"
+#
+# A janela do grep era -A1 e virou -A6 na #2631: o portão `build_local_permitido`
+# entrou EXATAMENTE entre o `if ! dc up -d; then` e a chamada da recuperação, e
+# -A1 passou a apontar para o portão. A intenção da prova não mudou (a
+# recuperação fica no bloco do `up -d`); o que se ganhou é a segunda metade da
+# mesma régua: o portão vem ANTES de construir. O comportamento dos dois lados
+# — portão aberto e portão fechado — é provado de ponta a ponta em
+# tests/shell/install-portao-do-build.test.sh.
+check "install.sh consulta o portão build_local_permitido no mesmo bloco do up -d, antes de chamar a recuperação" \
+  bash -c "b=\"\$(grep -A6 'if ! dc up -d; then' '$REPO_ROOT/hostgator-setup-kit/install.sh')\"; printf '%s\n' \"\$b\" | grep -q build_local_permitido && printf '%s\n' \"\$b\" | grep -q construir_aqui_e_subir"
+
+echo "── 12b. Worker, scheduler e voz com image: + build:; o app SEM build:, de propósito (#1060)"
+# A parte boa medida no Compose fica: com `image:` + `build:` no mesmo bloco,
+# o `up -d` CONSTRÓI em QUALQUER falha de pull (tag inexistente, registro fora
+# por DNS, "no matching manifest", com `pull_policy` `always`, `missing` ou sem
+# a chave) — é o escape do `up -d` à mão que as mensagens do próprio kit
+# ensinam (`docker compose ... up -d`), e o build de worker, scheduler e voz é
+# barato (`pnpm install` e `apk add`).
+# O `app` fica SEM `build:` de propósito, e é o outro lado da mesma régua: ele
+# é o único build pesado, e com `build:` aqui o Compose construiria o Next
+# sozinho em QUALQUER falha de pull — o portão `build_local_permitido` do
+# update.sh, que recusa construir com o registro fora, só é consultado quando o
+# `up -d` FALHA (#1955). Quem quer construir o app usa o
+# docker-compose.build.yml, que passa APP_VERSION como argumento (por este
+# `build:` ele sairia com `APP_VERSION=dev`).
+# Serviço `build:`-only continua proibido (invariante 1 da doutrina de
+# packaging) — por isso a prova exige as DUAS chaves nos serviços que constroem.
+# Sabotagem: pôr `build:` de volta no `app` em docker-compose.prod.yml reprova
+# o teste de unit (packaging-artefato-do-cliente) E esta prova.
+bloco_do_servico() { # <nome> → bloco (4 espaços) do serviço no compose de produção
+  awk -v alvo="  $1:" '
+    $0 == alvo { dentro = 1; next }
+    dentro && /^  [A-Za-z0-9_-]+:$/ { exit }
+    dentro { print }
+  ' "$REPO_ROOT/docker-compose.prod.yml"
+}
+# `grep -q` dentro de `set -o pipefail` é cilada (o grep fecha o pipe cedo e o
+# awk sai por SIGPIPE), então a leitura é feita linha a linha em bash: menos
+# processos e nenhum falso vermelho por causa do próprio instrumento. A régua
+# de valor não vazio é do teste de unit (packaging-artefato-do-cliente), que
+# parseia o YAML inteiro — aqui o que se prende é a PRESENÇA da chave.
+tem_chave() { # <bloco> <prefixo da linha> → 0 quando alguma linha começa com ele
+  local bloco="$1" pref="$2" linha
+  while IFS= read -r linha; do
+    case "$linha" in
+      "$pref"*) return 0 ;;
+    esac
+  done <<< "$bloco"
+  return 1
+}
+imagem_e_build_juntos() { # <serviço> → 0 quando image: e build: convivem no bloco
+  local bloco
+  bloco="$(bloco_do_servico "$1")"
+  [ -n "$bloco" ] || return 1
+  tem_chave "$bloco" "    image:" || return 1
+  tem_chave "$bloco" "    build:" || return 1
+  return 0
+}
+for svc in worker scheduler voice-agent; do
+  check "o serviço '$svc' declara image: e build: no mesmo bloco" \
+    imagem_e_build_juntos "$svc"
+done
+
+# O outro lado da régua, invertido: o `app` declara `image:` (nunca build-only)
+# e NÃO declara `build:` — de propósito. É a falta da imagem dele que faz o
+# `up -d` falhar e entrega a decisão ao portão do update.sh; com `build:` aqui o
+# Compose construiria o Next sozinho em QUALQUER falha de pull e o portão nunca
+# seria consultado.
+app_sem_build() {
+  local bloco
+  bloco="$(bloco_do_servico app)"
+  [ -n "$bloco" ] || return 1
+  tem_chave "$bloco" "    image:" || return 1
+  if tem_chave "$bloco" "    build:"; then
+    echo "o serviço 'app' ganhou build: no compose de produção"
+    return 1
+  fi
+  return 0
+}
+check "o serviço 'app' declara image: e NÃO declara build: (o portão depende do up -d falhar)" \
+  app_sem_build
+
+# O outro lado da régua: `build:` é só das NOSSAS imagens. Ganhar build num
+# binário de terceiro seria construir na VPS do cliente algo que ninguém aqui
+# mantém — waha, redis, srh, caddy, asterisk e wacalls são upstream e continuam
+# só puxados do registro.
+nenhum_build_upstream() {
+  local svc
+  for svc in waha redis srh caddy asterisk wacalls; do
+    if tem_chave "$(bloco_do_servico "$svc")" "    build:"; then
+      echo "serviço upstream ganhou build: $svc"
+      return 1
+    fi
+  done
+  return 0
+}
+check "nenhum serviço upstream ganhou build: (worker, scheduler e voz são as únicas com build:)" \
+  nenhum_build_upstream
 
 echo "── 13. \"Nada a atualizar\" derruba o aviso de manutenção preso (PR #1524)"
 # Medido numa VPS real: a atualização morreu depois de subir o aviso, com a tag
@@ -762,8 +870,10 @@ echo "── 13. \"Nada a atualizar\" derruba o aviso de manutenção preso (PR 
 # que segura o apelido de rede `app` — seguia respondendo 503 por 6h30.
 cd "$PROJ" || exit 1
 : > "$DOCKER_LOG"
+rm -f "$FAKE_CRONTAB"
 IMAGEM_EM_DIA=1 AVISO_PRESO=1 run_update --to v1.1.0
 check "sai com sucesso pela saída \"nada a atualizar\"" test "$RC" -eq 0
+check "  no-op ainda instala o cron do agente" grep -q "cd ${PROJ} && bash hostgator-setup-kit/agent.sh" "$FAKE_CRONTAB"
 check "  e a saída é mesmo a antecipada" grep -q "Nada a atualizar" "$OUTFILE"
 check "  não rodou o backup (não virou atualização)" test ! -f "$BACKUP_MARK"
 check "  removeu o contêiner do aviso" grep -q "rm -f deskcomm-manutencao" "$DOCKER_LOG"

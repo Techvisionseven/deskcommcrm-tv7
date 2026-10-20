@@ -34,6 +34,7 @@ import { z } from "zod";
 
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import { openSharedContactConversation } from "@/lib/messaging/open-shared-contact-conversation";
+import { encontrarContatoPorTelefone } from "@/lib/channels/contato-por-telefone";
 import { sendMessageSchema } from "@/lib/schemas/messaging";
 import { depsDoRitmo, registrarEnvioPorToken, segurarEnvioPorToken } from "@/lib/messaging/ritmo-do-envio-por-token";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -92,6 +93,48 @@ export const crmStartConversationAndSend: McpToolDefinition<typeof inputShape> =
       throw new Error("Informe contact_id ou phone_number.");
     }
 
+    // A mensagem é validada ANTES de abrir: depois de aberta, um corpo
+    // inválido deixaria nascer uma conversa vazia. O id real só existe depois
+    // de abrir; o UUID nulo ocupa o lugar dele apenas nesta validação.
+    const mensagem = sendMessageSchema.parse({
+      conversation_id: "00000000-0000-0000-0000-000000000000",
+      type: input.type,
+      body: input.body,
+      media_url: input.media_url,
+      media_mime: input.media_mime,
+    });
+
+    // Abrir conversa com pessoal é escrita para fora da operação (spec 21,
+    // etapa 12): recusa ANTES de abrir — depois de aberta, o `send` recusaria
+    // mas a conversa vazia já teria nascido. Contato novo (telefone sem dono)
+    // nunca é pessoal, então só confere quem já existe.
+    let candidato: string | null = input.contact_id ?? null;
+    if (!candidato && input.phone_number?.trim()) {
+      const achado = await encontrarContatoPorTelefone(
+        ctx.supabase,
+        ctx.organizationId,
+        input.phone_number.trim(),
+      );
+      candidato = achado?.id ?? null;
+    }
+    if (candidato) {
+      const { data: alvo } = await ctx.supabase
+        .from("contacts")
+        .select("is_personal")
+        .eq("organization_id", ctx.organizationId)
+        .eq("id", candidato)
+        .maybeSingle();
+      if ((alvo as { is_personal?: boolean } | null)?.is_personal === true) {
+        return {
+          permitido: false,
+          motivo: "contato_pessoal",
+          mensagem:
+            "este contato foi marcado como pessoal — ele está fora da operação: não abra " +
+            "conversa nem envie nada para ele.",
+        };
+      }
+    }
+
     const requestHash = hashRequest({
       channel_session_id: input.channel_session_id,
       contact_id: input.contact_id,
@@ -136,13 +179,7 @@ export const crmStartConversationAndSend: McpToolDefinition<typeof inputShape> =
       name: input.name,
     });
 
-    const parsed = sendMessageSchema.parse({
-      conversation_id: opened.conversation_id,
-      type: input.type,
-      body: input.body,
-      media_url: input.media_url,
-      media_mime: input.media_mime,
-    });
+    const parsed = { ...mensagem, conversation_id: opened.conversation_id };
 
     const message = await sendMessageHandler(
       ctx.supabase,

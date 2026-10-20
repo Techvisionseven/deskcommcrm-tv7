@@ -15,14 +15,18 @@
 import { z } from 'zod';
 import type pg from 'pg';
 
+import { loadConversationAgentConfig } from '../../agent/agent-config';
 import { insertInboxItem } from '../../db/repository';
 import type { Logger } from '../../obs/logger';
 import { enqueueJob } from '../../queue/queue';
-import { decidirRajada } from './debounce';
+import { decidirRajada, debounceEfetivo } from './debounce';
 import { avisoDeEventoMorto, IA_QUE_NAO_RESPONDEU } from '@/lib/event-log/aviso-de-evento-morto';
+import { canalDesativado } from '@/lib/channels/desativado';
 import { TIPOS_DERIVAVEIS, DERIVACAO_TERMINADA } from '@/lib/messaging/media/derivable';
+import { haQuemAtendaASessao } from '@/lib/ai/agents/quem-atende-a-sessao';
 import { decidirElegibilidadeDaConversa } from '@/lib/ai/elegibilidade/consulta-pg';
 import { deveCederTurnoAoRetorno } from '@/lib/followup/ceder-turno-ao-retorno';
+import { ehOperante } from '@/lib/organizacao/operante';
 
 const DRAIN_CONSUMER = 'agent-engine';
 
@@ -64,7 +68,9 @@ const ALLOWLIST_TTL_MS_PADRAO = 21 * 24 * 60 * 60 * 1000;
 
 /** Um tick do drain: claima um lote de eventos e os transforma em jobs. */
 export async function drainTick(pool: pg.Pool, knobs: DrainKnobs, log: Logger): Promise<number> {
-  // Reaper de eventos órfãos — barato (update indexado), roda a cada tick.
+  // Reaper de eventos órfãos, a cada tick. Quem o serve é o parcial
+  // `event_log_processing_por_tipo_idx` (event_type where status='processing',
+  // migration 0585); o `= any(consumed_by)` é filtro e não usa o GIN.
   await pool.query(
     `update event_log set status = 'pending', updated_at = now()
      where event_type = 'ai_agent.dispatch_requested'
@@ -197,6 +203,45 @@ const TETO_ESPERA_DERIVACAO_MS = 120_000;
 
 type DesfechoEvento = 'processado' | 'adiar';
 
+/**
+ * Janela de rajada EFETIVA para o evento: a configurada na versão do agente
+ * desta conversa (#1856), com o `INBOUND_DEBOUNCE_MS` da instalação como
+ * default e clamp no teto de 60s (`debounceEfetivo`).
+ *
+ * A resolução é a de `loadConversationAgentConfig` — o `active_ai_agent_id` da
+ * conversa quando há dono explícito, senão o agente publicado da sessão. NÃO é
+ * a resolução completa do turno (`resolveTurnAgent`: router, classificador,
+ * campanha): numa conversa que o turno entregaria a outro agente sem torná-lo
+ * dono, vale a janela do agente da sessão (ou a env). Com o campo vazio
+ * (default de toda instalação) o valor vira o da env — regressão zero.
+ *
+ * Falha da consulta NÃO derruba o evento: degrada para a env, como a checagem
+ * de elegibilidade acima. A janela é afinação, não motivo para retry.
+ */
+async function debounceDoEvento(
+  pool: pg.Pool,
+  event: EventRow,
+  p: { conversation_id: string; channel_session_id: string },
+  padraoInstalacao: number,
+  log: Logger,
+): Promise<number> {
+  try {
+    const agentConfig = await loadConversationAgentConfig(
+      pool,
+      event.organization_id,
+      p.conversation_id,
+      p.channel_session_id,
+    );
+    return debounceEfetivo(agentConfig?.inboundDebounceMs ?? null, padraoInstalacao);
+  } catch (err) {
+    log.warn('drain: janela de rajada do agente não resolveu — usando a da instalação', {
+      event_id: event.id,
+      error: (err instanceof Error ? err.message : String(err)).slice(0, 160),
+    });
+    return padraoInstalacao;
+  }
+}
+
 async function processEvent(
   pool: pg.Pool,
   event: EventRow,
@@ -214,15 +259,37 @@ async function processEvent(
   }
   const p = parsed.data;
 
-  // Spec 14: org em modo 'external' tem agente EXTERNO como dono da conversa —
-  // o engine não responde por cima. Evento é consumido (done) sem job.
-  const { rows: modeRows } = await pool.query<{ mode: string | null }>(
-    `select settings->>'ai_dispatch_mode' as mode from organizations where id = $1`,
+  // Organização parada (suspensa, redigida, arquivada) não gera turno: o evento
+  // é consumido sem job. Vai na MESMA consulta do modo externo — uma ida ao banco
+  // por evento, não duas — e vem ANTES do `canAssist`, que desliga o gate.
+  const { rows: modeRows } = await pool.query<{ mode: string | null; status: string | null }>(
+    `select settings->>'ai_dispatch_mode' as mode, status from organizations where id = $1`,
     [event.organization_id],
   );
+  if (!ehOperante(modeRows[0]?.status)) {
+    log.info('drain: organização não operante — evento consumido sem job', { event_id: event.id });
+    return 'processado';
+  }
+  // Spec 14: org em modo 'external' tem agente EXTERNO como dono da conversa —
+  // o engine não responde por cima. Evento é consumido (done) sem job.
   if (modeRows[0]?.mode === 'external') {
     log.info('drain: org em modo external (spec 14) — evento pulado', { event_id: event.id });
     return 'processado';
+  }
+
+  // Canal desativado pelo operador: defesa em profundidade do `pedirDespachoDoAgente`
+  // (que já não emite para desativado). Evento antigo em voo ou emit direto cai
+  // aqui e é consumido sem job, antes de qualquer custo.
+  if (p.channel_session_id) {
+    const { rows: canalRows } = await pool.query<{ metadata: unknown }>(
+      'select metadata from channel_sessions where organization_id = $1 and id = $2',
+      [event.organization_id, p.channel_session_id],
+    );
+    const meta = canalRows[0]?.metadata;
+    if (canalDesativado(meta)) {
+      log.info('drain: canal desativado — evento consumido sem job', { event_id: event.id });
+      return 'processado';
+    }
   }
 
   // Grupos: skip, sem exceção (regra dura nº 12).
@@ -258,51 +325,12 @@ async function processEvent(
   // EXISTÊNCIA da linha deixava o portão aberto para um roteador cujos membros
   // foram todos pausados — exatamente o caso que o parágrafo acima diz estar
   // cobrindo, entrando pela outra porta.
-  const { rows: capacidade } = await pool.query<{
-    tem_agente: boolean;
-    tem_roteador: boolean;
-  }>(
-    `select
-       exists(
-         select 1 from ai_agents a
-         join ai_agent_versions v on v.id = a.published_version_id
-         where a.organization_id = $1 and a.archived_at is null
-           and v.status = 'published' and v.channel_session_id = $2
-       ) as tem_agente,
-       exists(
-         select 1 from ai_routers r
-         where r.organization_id = $1 and r.is_active
-           and r.channel_session_id = $2
-           and (
-             -- O fallback e os membros contam pelo que PODEM EXECUTAR, não por
-             -- existirem. A versão anterior media fallback_agent_id is not null
-             -- e a existência de LINHA em ai_router_members — e as duas
-             -- sobrevivem à pausa do agente, que só limpa published_version_id.
-             -- Um roteador cujos membros foram todos pausados continuava
-             -- abrindo o portão: a organização pagava o classificador e o turno
-             -- inteiro por mensagem recebida, para responder pelo genérico.
-             -- O predicado aqui é o MESMO que loadConversationAgentConfigById
-             -- aplica na hora de executar (agent-config.ts) — é o que garante
-             -- que o portão não promete um agente que o resolvedor vai recusar.
-             exists (
-               select 1 from ai_agents fa
-               join ai_agent_versions fv on fv.id = fa.published_version_id
-               where fa.id = r.fallback_agent_id and fa.organization_id = $1
-                 and fa.archived_at is null and fv.status = 'published'
-             )
-             or exists (
-               select 1 from ai_router_members m
-               join ai_agents ma on ma.id = m.agent_id
-               join ai_agent_versions mv on mv.id = ma.published_version_id
-               where m.router_id = r.id and ma.organization_id = $1
-                 and ma.archived_at is null and mv.status = 'published'
-             )
-           )
-       ) as tem_roteador`,
-    [event.organization_id, p.channel_session_id],
-  );
-  const cap = capacidade[0];
-  if (cap !== undefined && !cap.tem_agente && !cap.tem_roteador) {
+  //
+  // A pergunta mora em `haQuemAtendaASessao` porque o worker de clima faz a
+  // MESMA antes de perguntar ao Jev pelos pedidos do cliente: ele só conta um
+  // pedido que a regra de hoje deixou passar onde este turno rodaria.
+  const haQuem = await haQuemAtendaASessao(pool, event.organization_id, p.channel_session_id);
+  if (haQuem === false) {
     log.info('drain: nenhum agente publicado para a sessão — turno pulado (sem gasto)', {
       event_id: event.id,
       channel_session_id: p.channel_session_id,
@@ -480,12 +508,13 @@ async function processEvent(
   // Coalescência: já existe job PENDING futuro deste contato → esta mensagem
   // entra de carona (o turno lê o histórico completo). Evento vira done.
   //
-  // A janela e a exclusão do job em HOLD (`held_run_after` no payload — a lição
-  // do #830) moram em ./debounce.ts, com teste próprio.
+  // A janela e as exclusões — job em HOLD (`held_run_after` no payload, a lição
+  // do #830) e job que já tentou enviar (linha no `send_ledger`) — moram em
+  // ./debounce.ts, com teste próprio.
   const rajada = await decidirRajada(
     pool,
     { organizationId: event.organization_id, contactId: p.contact_id },
-    knobs.debounceMs,
+    await debounceDoEvento(pool, event, p, knobs.debounceMs, log),
   );
   if (rajada.tipo === 'coalescido') {
     log.info('drain: rajada coalescida em job pendente', {
@@ -513,6 +542,66 @@ async function processEvent(
   return 'processado';
 }
 
+/**
+ * Quantos ciclos OCIOSOS sem um tick CONCLUÍDO contam como "laço parado"
+ * (issue #2505).
+ *
+ * O default da instalação é `idle = 15s`, então 20 ciclos = **5 minutos**. A
+ * folga é dupla de propósito: o carimbo é do FIM do tick (um tick de lote cheio
+ * demora mais que o intervalo) e o custo de um falso positivo é um `/healthz`
+ * vermelho, que o operador investiga — contra o custo do falso negativo, que
+ * foi o do caso real: DOIS DIAS de laço travado com o worker dizendo `ok`
+ * (#2501), enquanto as mensagens se acumulavam com `attempts=0`.
+ */
+export const TICKS_PARA_PARADO = 20;
+
+/**
+ * O carimbo de vida do laço, lido de FORA dele (hoje: o `/healthz` do worker).
+ *
+ * `ultimoTickEm = null` significa "o laço ainda não começou" — não é parado,
+ * é um worker que acabou de subir; quem nunca deu a primeira volta não pode
+ * ser acusado de ter parado. `limiteMs` nasce do `idleIntervalMs` DA INSTALAÇÃO
+ * quando o laço começa, então um `.env` com intervalo maior ganha o mesmo
+ * número de ciclos de folga, não o mesmo relógio.
+ */
+interface VigilanciaDoDrain {
+  ultimoTickEm: number | null;
+  limiteMs: number | null;
+}
+const vigilancia: VigilanciaDoDrain = { ultimoTickEm: null, limiteMs: null };
+
+/** Resposta do `/healthz` sobre o laço do drain — nomes para a máquina. */
+export interface ProntidaoDoDrainDaIa {
+  /** Há quanto tempo o último tick concluiu; `null` = o laço não começou. */
+  ultimo_tick_ha_ms: number | null;
+  /** Limite em vigor (idle da instalação × `TICKS_PARA_PARADO`); `null` antes de começar. */
+  limite_ms: number | null;
+  /** `true` quando o carimbo passou do limite — o laço travou NO MEIO de um tick. */
+  parado: boolean;
+}
+
+/**
+ * Estado do laço para quem pergunta de fora. Nunca lança: o `/healthz` não pode
+ * ser o motivo de o worker cair — quem está degradado não ganha o direito de
+ * derrubar o resto.
+ *
+ * `agoraMs` é injetável para o teste medir o LIMITE sem esperar o relógio.
+ */
+export function prontidaoDoDrainDaIa(agoraMs: number = Date.now()): ProntidaoDoDrainDaIa {
+  const { ultimoTickEm, limiteMs } = vigilancia;
+  if (ultimoTickEm === null || limiteMs === null) {
+    return { ultimo_tick_ha_ms: null, limite_ms: limiteMs, parado: false };
+  }
+  const ha = Math.max(0, agoraMs - ultimoTickEm);
+  return { ultimo_tick_ha_ms: ha, limite_ms: limiteMs, parado: ha > limiteMs };
+}
+
+/** Só para teste: volta ao estado de "o laço ainda não começou". */
+export function _reiniciarVigilanciaDoDrain(): void {
+  vigilancia.ultimoTickEm = null;
+  vigilancia.limiteMs = null;
+}
+
 /** Loop do drain — polling com backoff adaptativo (ocioso = tick mais lento). */
 export async function runDrainLoop(
   pool: pg.Pool,
@@ -520,6 +609,11 @@ export async function runDrainLoop(
   log: Logger,
   signal: AbortSignal,
 ): Promise<void> {
+  // O carimbo de vida (#2505): o limite nasce do intervalo ocioso DA INSTALAÇÃO
+  // e o carimbo é gravado quando o laço começa e ao FIM de cada volta — um tick
+  // que travar deixa o carimbo envelhecer, e é isso que o `/healthz` lê.
+  vigilancia.limiteMs = knobs.idleIntervalMs * TICKS_PARA_PARADO;
+  vigilancia.ultimoTickEm = Date.now();
   while (!signal.aborted) {
     let drained = 0;
     try {
@@ -529,6 +623,8 @@ export async function runDrainLoop(
         error: (err instanceof Error ? err.message : String(err)).slice(0, 300),
       });
     }
+    // O laço DEU A VOLTA — sucesso e erro capturado são a mesma prova de vida.
+    vigilancia.ultimoTickEm = Date.now();
     if (signal.aborted) break;
     // Lote CHEIO é sinal de backlog: há mais evento esperando do que caberia no
     // lote, e pagar o intervalo antes de voltar só empurra a fila para frente.

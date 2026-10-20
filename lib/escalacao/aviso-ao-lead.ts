@@ -119,7 +119,7 @@ const ABERTURAS: Record<MotivoDoAviso, readonly string[]> = {
   ],
   pediu_humano: [
     "Claro! Já estou chamando alguém da equipe para falar com você.",
-    "Sem problema — acabei de acionar uma pessoa do time para continuar daqui.",
+    "Sem problema. Acabei de acionar uma pessoa do time para continuar daqui.",
     "Perfeito. Passei sua conversa para um atendente humano agora.",
   ],
   orcamento_de_ia: [
@@ -142,11 +142,20 @@ const FECHOS = {
     "Deixei tudo anotado; retornamos para você assim que der.",
     "Já registrei aqui, e alguém te responde na primeira oportunidade.",
   ],
-  /** Tem equipe, ninguém elegível agora: nada de prazo curto. */
+  /**
+   * Tem equipe, ninguém elegível agora: nada de prazo curto — e nada de
+   * ANUNCIAR a ausência. A versão anterior dizia "No momento ninguém está
+   * disponível", e foi o que uma cliente de vendas leu em produção
+   * (2026-10-16): verdade sobre a escala do time, recado errado para quem está
+   * decidindo uma compra. O fecho diz o que é verdade e serve: o pedido ficou
+   * registrado, com o contexto, para a equipe. Sem pronome de tratamento, para
+   * não contradizer o "a senhora" que o agente vinha usando, e sem repetir a
+   * "equipe" que a abertura quase sempre já nomeou.
+   */
   fora_de_expediente: [
-    "No momento ninguém está disponível, mas seu pedido ficou registrado.",
-    "Agora não tem ninguém livre; deixei sua solicitação anotada para o time.",
-    "Não há atendente disponível neste instante — sua conversa entrou na fila.",
+    "Deixei tudo anotado.",
+    "Quem assumir recebe o resumo do que conversamos.",
+    "O pedido ficou registrado, com o histórico da conversa.",
   ],
   /** Há gente elegível: pode convidar a aguardar. */
   com_equipe: [
@@ -195,10 +204,11 @@ const FECHOS_ES = {
     "Dejé todo anotado; te respondemos apenas podamos.",
     "Ya quedó registrado, y alguien te responde en la primera oportunidad.",
   ],
+  // Mesma regra do português: registra, não anuncia que falta gente.
   fora_de_expediente: [
-    "En este momento no hay nadie disponible, pero tu consulta quedó registrada.",
-    "Ahora no hay nadie libre; dejé tu consulta anotada para el equipo.",
-    "No hay una persona disponible en este instante: tu conversación quedó en la cola.",
+    "Dejé todo anotado.",
+    "Quien tome la conversación recibe el resumen de lo que hablamos.",
+    "La consulta quedó registrada, con el historial de la conversación.",
   ],
   com_equipe: [
     "Solo espera un momento aquí en la conversación.",

@@ -5,11 +5,13 @@ import { audit } from "@/lib/audit";
 import { createMcpAgentDraft } from "@/lib/ai/agents/create-draft";
 import { publishAgentVersion } from "@/lib/ai/agents/publish";
 import { escolherModeloDoProvedor } from "@/lib/ai/agents/escolher-modelo";
+import { listarModelosDaAssinaturaOuVazio } from "@/lib/ai/catalogo/modelos-da-assinatura";
 import { capacidadesPadraoDoOnboarding } from "@/lib/ai/agents/capacidades-padrao";
 import { versionCreateSchema } from "@/lib/ai/agents/validation";
 import { lockRouter, writeRouterMembers } from "@/lib/ai/agents/router-members";
 import { chaveDePlataforma } from "@/lib/ai/runtime/agent";
 import { PROVIDERS } from "@/lib/ai/agents/validation";
+import { provedorOferecido } from "@/lib/ai/pontos/provedores-oferecidos";
 import { capabilitiesOf } from "@/lib/channels/capabilities";
 import type { ChannelProvider } from "@/lib/channels/types";
 import { prospectingAgentSetupSchema, type ProspectingAgentSetupInput } from "./agent-setup-schema";
@@ -56,15 +58,31 @@ export interface ModelChoice {
   credential_id: string | null;
   label: string;
 }
+/**
+ * `oferece` é `provedorOferecido` (#2458): o modelo escolhido aqui vira o provedor
+ * GRAVADO na versão do agente de prospecção, então a assinatura do ChatGPT com o
+ * módulo `login_codex` desligado é PULADA e a escolha segue para o próximo
+ * provedor utilizável. Pular, e não recusar, porque aqui ninguém pediu aquele
+ * provedor: é uma escolha automática, e a próxima chave válida é a resposta que
+ * a pessoa esperaria.
+ */
 export async function resolveSetupModel(
   db: pg.PoolClient,
   orgId: string,
-  channelId: string | null = null,
+  channelId: string | null,
+  oferece: (provider: string) => boolean,
 ): Promise<ModelChoice> {
+  let modelosDaAssinatura:
+    | Awaited<ReturnType<typeof listarModelosDaAssinaturaOuVazio>>
+    | null = null;
+  const catalogoDaAssinatura = async () => {
+    modelosDaAssinatura ??= await listarModelosDaAssinaturaOuVazio(orgId);
+    return modelosDaAssinatura;
+  };
   const published = await db.query(
-    `select v.provider,v.model,v.credential_id,m.display_name from ai_agents a
+    `select v.provider,v.model,v.credential_id,m.display_name,m.supports_tools from ai_agents a
      join ai_agent_versions v on v.organization_id=a.organization_id and v.id=a.published_version_id
-     join ai_models m on m.provider=v.provider and m.model_id=v.model and m.supports_tools and m.deprecated_at is null
+     left join ai_models m on m.provider=v.provider and m.model_id=v.model and m.deprecated_at is null
      left join ai_provider_credentials c on c.organization_id=a.organization_id and c.id=v.credential_id and c.provider=v.provider
      where a.organization_id=$1 and a.archived_at is null and a.paused_at is null and v.status='published'
      and (v.credential_id is null or (c.is_active and c.validated_at is not null))
@@ -72,13 +90,29 @@ export async function resolveSetupModel(
     [orgId, channelId],
   );
   for (const row of published.rows) {
-    if (PROVIDERS.includes(row.provider) && (row.credential_id || chaveDePlataforma(row.provider)))
+    if (
+      !PROVIDERS.includes(row.provider) ||
+      !oferece(row.provider) ||
+      (!row.credential_id && !chaveDePlataforma(row.provider))
+    ) {
+      continue;
+    }
+    const modeloDaAssinatura =
+      row.provider === "openai-assinatura"
+        ? (await catalogoDaAssinatura()).find((m) => m.model_id === row.model)
+        : null;
+    const temFerramentas =
+      row.provider === "openai-assinatura"
+        ? modeloDaAssinatura?.supports_tools === true
+        : row.supports_tools === true;
+    if (temFerramentas) {
       return {
         provider: row.provider,
         model: row.model,
         credential_id: row.credential_id,
         label: `${row.provider} · ${row.display_name ?? row.model}`,
       };
+    }
   }
   const org = await db.query("select settings from organizations where id=$1", [orgId]);
   const credentials = await db.query(
@@ -90,9 +124,23 @@ export async function resolveSetupModel(
     ...new Set([preferred, ...credentials.rows.map((c) => c.provider), ...PROVIDERS]),
   ];
   for (const provider of providers) {
-    if (!PROVIDERS.includes(provider)) continue;
+    if (!PROVIDERS.includes(provider) || !oferece(provider)) continue;
     const credential = credentials.rows.find((c) => c.provider === provider);
     if (!credential && !chaveDePlataforma(provider)) continue;
+    if (provider === "openai-assinatura") {
+      const models = await catalogoDaAssinatura();
+      const selected = escolherModeloDoProvedor(models);
+      if (selected.escolhido) {
+        const model = models.find((m) => m.model_id === selected.modelId);
+        return {
+          provider,
+          model: selected.modelId,
+          credential_id: credential?.id ?? null,
+          label: `${provider} · ${model?.display_name ?? selected.modelId}`,
+        };
+      }
+      continue;
+    }
     const models = await db.query(
       "select model_id,display_name,is_default_for_provider,supports_tools,input_price_per_million_cents,output_price_per_million_cents from ai_models where provider=$1 and deprecated_at is null",
       [provider],
@@ -180,15 +228,21 @@ interface SetupMetadata {
   proposal_hash?: string;
   prepared_only?: boolean;
 }
+// Colunas em que `null` na linha do banco é o mesmo que ausente na versão montada: o hash
+// gravado na criação parte do objeto parseado (sem a chave), e a conferência parte da
+// linha lida (com `null`). Sem esta lista os dois hashes divergem e o setup recusa com
+// "O rascunho foi alterado" — o que a 0498 (inbound_debounce_ms) fez nas 5 specs de
+// tests/invariants/prospecting-agent-setup.test.ts.
+// ponytail: lista explícita; coluna nullable nova em ai_agent_versions entra aqui (#2004).
+const NULO_E_AUSENTE = new Set(["trigger_config", "inbound_debounce_ms"]);
+
 function versionHash(row: Record<string, unknown>) {
   const keys = Object.keys(versionCreateSchema.shape);
   return hash(
     versionCreateSchema.parse(
       Object.fromEntries(
         keys
-          .filter(
-            (key) => row[key] !== undefined && !(key === "trigger_config" && row[key] === null),
-          )
+          .filter((key) => row[key] !== undefined && !(NULO_E_AUSENTE.has(key) && row[key] === null))
           .map((key) => [key, row[key]]),
       ),
     ),
@@ -206,6 +260,9 @@ export async function setupProspectingAgent(
   const agentId = setupAgentId(context.orgId, input.campaign_id, input.request_id);
   const requestHash = hash(input);
   const db = await pool.connect();
+  // #2624 — mesma marcação do #2621: o finally só libera COM erro quem falhou
+  // dentro da transação (release(err) → _remove no pg-pool, cliente descartado).
+  let erroNaTransacao: Error | undefined;
   let saved = false;
   const locked: string[] = [];
   let createdNow = false;
@@ -297,7 +354,12 @@ export async function setupProspectingAgent(
       }
     } else {
       await preflight(db, context.orgId, input, agentId, options.prepareOnly);
-      const model = await resolveSetupModel(db, context.orgId, input.channel_session_id);
+      const model = await resolveSetupModel(
+        db,
+        context.orgId,
+        input.channel_session_id,
+        await provedorOferecido(admin),
+      );
       const version = versionCreateSchema.parse({
         system_prompt: prospectingAgentPrompt(input),
         provider: model.provider,
@@ -499,6 +561,9 @@ export async function setupProspectingAgent(
       model_label: metadata.model_label,
     };
   } catch (error) {
+    // Marcado ANTES do rollback: se o próprio rollback estourar, o cliente ainda
+    // sai com erro e o pg-pool o descarta (release(err) → _remove → client.end()).
+    erroNaTransacao = error instanceof Error ? error : new Error(String(error));
     await db.query("rollback").catch(() => undefined);
     if (error instanceof AgentSetupError) {
       if (saved) error.agentId = agentId;
@@ -521,6 +586,8 @@ export async function setupProspectingAgent(
         break;
       }
     }
-    db.release(destroy);
+    // #2624: quem falhou dentro da transação sai COM erro; quem só não conseguiu
+    // destravar o lock continua saindo com destroy explícito, como antes.
+    db.release(erroNaTransacao ?? destroy);
   }
 }

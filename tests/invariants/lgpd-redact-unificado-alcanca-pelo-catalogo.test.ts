@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { sql } from "./gov-helpers";
 
@@ -35,6 +35,15 @@ import { sql } from "./gov-helpers";
  *                        comando — o mesmo desenho da 0391: a virada de
  *                        `is_anonymized` é a porta por onde os DOIS caminhos e
  *                        qualquer um que venha passam;
+ *   redigir + secao    → a tabela está declarada em `modulo_secoes_lgpd` (D8,
+ *                        migration 0485) para o módulo que a criou, com o
+ *                        gatilho `trg_lgpd_secoes_de_modulo` de pé: SQL DINÂMICO
+ *                        que alcança onde o módulo está instalado e PULA, sem
+ *                        erro, onde não está — o que uma cascata nomeada não
+ *                        dá. É o caminho da comanda desde o #1907/0620: `sales`
+ *                        saiu do corpo da função única porque, sem o módulo, o
+ *                        passo nomeado abortava a ANONIMIZAÇÃO INTEIRA
+ *                        (`relation "sales" does not exist`, CI do #1907).
  *   manter             → razão escrita, e a tabela fica FORA da cascata (se
  *                        entrar, a decisão virou mentira e o teste reprova).
  *
@@ -79,6 +88,18 @@ function tabelasNaCascata(): string[] {
 }
 
 /**
+ * Tabelas declaradas em `modulo_secoes_lgpd` — o mecanismo da D8 (migration
+ * 0485): o registro que o módulo escreve na sua provisionadora/migration e que
+ * `trg_lgpd_secoes_de_modulo` consome com SQL dinâmico protegido por
+ * `to_regclass`. `sales` está aqui desde o #1907/0620.
+ */
+function tabelasDeclaradasEmSeccao(): string[] {
+  return lista(`
+    select tabela from public.modulo_secoes_lgpd order by tabela;
+  `);
+}
+
+/**
  * Tabelas alcançadas pela virada de `is_anonymized`: gatilho NÃO interno
  * instalado em `contacts`, cuja função tem o comando. Desativado não conta.
  */
@@ -115,7 +136,7 @@ function corpo(funcao: string): string {
 }
 
 type Decisao =
-  | { decidida: "redigir"; caminho: "cascata" | "gatilho"; razao: string }
+  | { decidida: "redigir"; caminho: "cascata" | "gatilho" | "secao"; razao: string }
   | { decidida: "manter"; razao: string };
 
 /**
@@ -158,8 +179,17 @@ const DECISOES: Record<string, Decisao> = {
   },
   sales: {
     decidida: "redigir",
-    caminho: "cascata",
-    razao: "Venda redigida no mesmo molde do pedido: o que é da pessoa sai, o que é do negócio (valor, data) fica pela mesma obrigação fiscal.",
+    caminho: "secao",
+    razao:
+      "PR #1907 (migration 0620): a comanda saiu do corpo da função única e passou para a " +
+      "SEÇÃO declarada `financeiro/sales` em `modulo_secoes_lgpd` (D8/0485) — o passo nomeado " +
+      "abortava a anonimização INTEIRA em instalação sem o módulo (`relation \"sales\" " +
+      "does not exist`, 68 ocorrências no CI). Na seção o efeito é o MESMO do passo 6c " +
+      "antigo: `notes` some (NULO), `cancel_reason` e `reverse_reason` viram '[redigido]' só " +
+      "onde havia texto (`colunas_redigidas`), `updated_at` = now(), e valor/status/datas e o vínculo com o " +
+      "contato FICAM (obrigação fiscal da venda); quem aplica é " +
+      "`trg_lgpd_secoes_de_modulo`, nos dois caminhos, com `to_regclass` pulando sem erro " +
+      "onde o módulo não existe.",
   },
   crm_proposals: {
     decidida: "redigir",
@@ -200,6 +230,11 @@ const DECISOES: Record<string, Decisao> = {
     decidida: "redigir",
     caminho: "cascata",
     razao: "0379: a cauda do número sai, mas a linha é o 'não me mande mais' — apagá-la faria a pessoa voltar a receber campanha.",
+  },
+  channel_session_groups: {
+    decidida: "redigir",
+    caminho: "cascata",
+    razao: "0482 (grupos na inbox, #1647): subject é o NOME do grupo e vira null; contact_id aponta para o placeholder do grupo (contacts.kind = 'whatsapp_group'), e número, conversa e liga/desliga ficam. O que o TITULAR escreveu em grupo é redigido pelo gatilho fn_redigir_conversas_ao_anonimizar, em messages.",
   },
   // ── redigir pela virada de is_anonymized (gatilho) ────────────────────────
   ai_reply_drafts: {
@@ -242,11 +277,22 @@ const DECISOES: Record<string, Decisao> = {
     caminho: "gatilho",
     razao: "0174: captured_name/captured_email/captured_phone (o payload cru de captação) zerados por gatilho — a entrada na dívida do invariante irmão é o aviso de que este instrumento não lia gatilho.",
   },
-  // ── manter: a linha e o conteúdo ficam, por decisão ───────────────────────
   ai_agent_runs: {
-    decidida: "manter",
-    razao: "Resultado da execução do agente: status, código de erro e ids das mensagens trocadas. Nenhum campo guarda nome, telefone ou corpo de mensagem — o texto da pessoa mora em messages/conversations, que a cascata redige.",
+    decidida: "redigir",
+    caminho: "gatilho",
+    razao: "0494 (#1964): a LINHA fica (status, erro, tokens, ids das mensagens: é a trilha do que o agente fez), mas tool_calls — texto do modelo, argumentos e resultados das ferramentas, com nome e trechos do que a pessoa escreveu — é redigido na virada de is_anonymized pelo gatilho fn_redigir_conversas_ao_anonimizar (fn_lgpd_redigir_tool_calls preserva o nome das ferramentas e apaga o resto, `redacted = true` em todo passo), a MESMA porta que o desenho da 0391 e que a app já usava em lib/lgpd/cascata.ts passo 6.",
   },
+  lead_notes: {
+    decidida: "redigir",
+    caminho: "gatilho",
+    razao: "DÍVIDA PARCIAL QUITADA na 0494 (#1964): headline/body são texto livre do agente SOBRE a pessoa (e embedding é derivado dele). A virada de is_anonymized redige os dois (→ `(anonimizado)`, `embedding` → null) pelo gatilho fn_redigir_conversas_ao_anonimizar — a mesma porta da 0391 e a mesma régua que a app usava em lib/lgpd/cascata.ts passo 5. O irmão (lgpd-cascata-alcanca-quem-guarda-pessoa) mantém a entrada na dívida porque o instrumento dele só lê fn_lgpd_cascade_redact_contact + trg_reply_redact, não este gatilho — a dívida lá sai no dia em que aquele instrumento derivar também os gatilhos de contacts, no desenho da 0391.",
+  },
+  lead_state: {
+    decidida: "redigir",
+    caminho: "gatilho",
+    razao: "0494 (#1964): a LINHA e o estágio ficam (é o estado do negócio), mas next_action (texto) e qualification (jsonb) — texto livre que cita a pessoa — são zerados na virada de is_anonymized pelo gatilho fn_redigir_conversas_ao_anonimizar (a porta da 0391 que a app já usava em lib/lgpd/cascata.ts passo 7).",
+  },
+  // ── manter: a linha e o conteúdo ficam, por decisão ───────────────────────
   before_send_traces: {
     decidida: "manter",
     razao: "Traço de decisão do gate de envio (vetoed_gate/vetoed_code) para auditoria de POR QUE a mensagem não saiu; é código de vocabulário, não o conteúdo enviado — o corpo mora em messages.",
@@ -262,14 +308,6 @@ const DECISOES: Record<string, Decisao> = {
   google_ads_click_refs: {
     decidida: "manter",
     razao: "gclid/token de clique da plataforma e a query de aterrissagem — identificador de campanha que existe para casar o clique ao contato. Sem nome, telefone ou e-mail; apagar desfaria a atribuição da conversão.",
-  },
-  lead_notes: {
-    decidida: "manter",
-    razao: "⚠️ DÍVIDA CONHECIDA, não conforto: headline/body são texto livre do agente SOBRE a pessoa e hoje NENHUM caminho os redige (mesma entrada em DIVIDA_LGPD_CONHECIDA do invariante irmão). Esta entrada vira `redigir`+`cascata` no MESMO commit que acrescentar o passo — e o irmão tira a dívida naquele commit.",
-  },
-  lead_state: {
-    decidida: "manter",
-    razao: "Estágio, qualificação e próxima ação do funil: vocabulário fechado do motor, sem texto escrito sobre a pessoa — redigir apagaria o estado do negócio sem proteger ninguém.",
   },
   lead_state_transitions: {
     decidida: "manter",
@@ -311,6 +349,20 @@ const DEZ_E_UM = [
   "passagens_de_atendimento",
   "entregas_de_aviso_de_caso",
 ];
+
+/**
+ * O módulo financeiro INSTALADO antes de medir — #1907, item 3.
+ *
+ * As cinco tabelas da comanda saíram do `baseline.sql` e nascem na
+ * provisionadora (ADR-0002 D2/D3): num banco sem o módulo elas não existem, o
+ * catálogo de FKs não as enxerga e as decisões escritas de `sales` e
+ * `loyalty_ledger` viram "dívida morta" — o teste reprovaria por o BANCO estar
+ * incompleto, não por a decisão estar errada. A D8 manda esta varredura rodar
+ * sobre um banco COM o módulo, e não perder cobertura.
+ */
+beforeAll(() => {
+  sql("select public.fn_financeiro_provisionar();");
+});
 
 describe("LGPD: redact unificado — catálogo de FKs com decisão escrita", () => {
   it("CONTROLE: o catálogo está vivo — `contacts` tem FK para si e há massa medida", () => {
@@ -379,6 +431,35 @@ describe("LGPD: redact unificado — catálogo de FKs com decisão escrita", () 
     ).toEqual([]);
   });
 
+  it("`redigir` por seção declarada: a D8 alcança a tabela e o gatilho está de pé", () => {
+    const emSeccao = new Set(tabelasDeclaradasEmSeccao());
+    const fora = Object.entries(DECISOES)
+      .filter(([, d]) => d.decidida === "redigir" && d.caminho === "secao")
+      .map(([t]) => t)
+      .filter((t) => !emSeccao.has(t));
+    expect(
+      fora,
+      "Decisão `redigir` por seção declarada, mas `modulo_secoes_lgpd` não tem a linha da " +
+        "tabela — a decisão prometeu o SQL dinâmico que o registro é quem dá. O registro " +
+        "se escreve na provisionadora do módulo (e no topo da migration dele, para a " +
+        "comanda que já existe).",
+    ).toEqual([]);
+    // E o gatilho da D8 que consome o registro tem de estar instalado em contacts:
+    // sem ele o registro é só uma linha e ninguém redige nada.
+    const gatilho = lista(`
+      select tgname
+        from pg_trigger t
+        join pg_class c on c.oid = t.tgrelid
+       where c.relname = 'contacts' and t.tgname = 'trg_lgpd_secoes_de_modulo'
+         and not t.tgisinternal;
+    `);
+    expect(
+      gatilho,
+      "O gatilho `trg_lgpd_secoes_de_modulo` não está em `contacts` — a seção declarada " +
+        "não tem quem a aplique, e a cobertura seria só papel.",
+    ).toEqual(["trg_lgpd_secoes_de_modulo"]);
+  });
+
   it("`manter`: razão escrita, e a tabela fica FORA da cascata", () => {
     const naCascata = new Set(tabelasNaCascata());
     const semRazao: string[] = [];
@@ -400,14 +481,22 @@ describe("LGPD: redact unificado — catálogo de FKs com decisão escrita", () 
     ).toEqual([]);
   });
 
-  it("as 11 tabelas da issue estão na função única", () => {
+  it("as 11 tabelas da issue estão alcançadas — pela função única ou pela seção declarada", () => {
     const naCascata = new Set(tabelasNaCascata());
-    const ausentes = DEZ_E_UM.filter((t) => !naCascata.has(t));
+    const emSeccao = new Set(tabelasDeclaradasEmSeccao());
+    const ausentes = DEZ_E_UM.filter((t) => !naCascata.has(t) && !emSeccao.has(t));
     expect(
       ausentes,
-      "Tabela da issue #1504 fora de `fn_lgpd_cascade_redact_contact`: os dois " +
-        "caminhos passaram a chamar a mesma função justamente para alcançá-las.",
+      "Tabela da issue #1504 fora da função única E fora de `modulo_secoes_lgpd`: os dois " +
+        "caminhos passaram a chamar a mesma função justamente para alcançá-las, e a D8 " +
+        "acrescentou o terceiro caminho (seção declarada) para a comanda, que sem o " +
+        "módulo não existe na instalação. Nenhum dos dois ⇒ nada é redigido.",
     ).toEqual([]);
+    // O controle que impede a exceção de virar esconderijo: `sales` só saiu da
+    // cascata porque ENTROU na seção — as duas provas juntas, nunca uma só.
+    expect(emSeccao, "`sales` saiu da cascata e não entrou em nenhuma seção declarada").toContain(
+      "sales",
+    );
   });
 
   it("contacts: consent, source_metadata e tags zerados NO PASSO 1", () => {

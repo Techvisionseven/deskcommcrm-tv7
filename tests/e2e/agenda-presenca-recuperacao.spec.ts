@@ -57,6 +57,20 @@ async function fixture() {
     status: "WORKING",
     webhook_secret_encrypted: "\\x00",
   });
+  // #2658 — o atalho inline de texto fixo obedece à janela de disparo do canal.
+  // Sem linha em `channel_knobs` vale o padrão (7h–22h de America/Sao_Paulo) e
+  // este fixture passaria a ser dependente do relógio: rodando de madrugada o
+  // envio seria ADIADO e os `expect(...).toBe(1)` deste arquivo cairiam. O
+  // fixture declara o que ele é — um número de teste que dispara a qualquer
+  // hora — e a suíte mede o que veio medir.
+  const knobs = await db.from("channel_knobs").insert({
+    organization_id: org,
+    channel_session_id: session,
+    window_start_hour: 0,
+    window_end_hour: 24,
+    allow_sunday: true,
+  });
+  if (knobs.error) throw knobs.error;
   const type = await insert("calendar_event_types", {
     organization_id: org,
     name: "Consulta de presença",
@@ -144,6 +158,17 @@ async function login(page: Page, email: string) {
   await page.getByLabel(/senha/i).fill(password);
   await page.getByRole("button", { name: "Entrar", exact: true }).click();
   await page.waitForURL(/\/app(?:\/|$)/, { timeout: 60000 });
+}
+// O radar só pinta as listas depois que a tela busca /api/v1/leads/at-risk, e
+// no CI essa resposta levou ~3,9 s nas duas falhas medidas (#1879), disputando o
+// servidor com os prefetches do menu. O `expect` de 5 s começava junto com a
+// busca e perdia a corrida por ~1 s. Espera-se o EVENTO (a resposta), não um prazo.
+async function abrirRadar(page: Page) {
+  const carregou = page.waitForResponse(
+    (r) => new URL(r.url()).pathname === "/api/v1/leads/at-risk" && r.request().method() === "GET",
+  );
+  await page.goto("/app/radar");
+  expect((await carregou).status()).toBe(200);
 }
 async function detail(page: Page, id: string, title: string) {
   await page.goto(`/app/agenda?compromisso=${id}`);
@@ -1069,7 +1094,7 @@ test("Radar recorta demandas pela RLS real, além do pool frio, e preserva gest�
   };
   await policy("own");
   await login(page, members.agent!.email);
-  await page.goto("/app/radar");
+  await abrirRadar(page);
   await expect(page.getByTestId("radar-sem-proximo-passo")).toContainText("Própria fora do pool");
   const own = await read();
   expect(own.sem_proximo_passo.map((d) => d.id).sort()).toEqual(
@@ -1088,7 +1113,7 @@ test("Radar recorta demandas pela RLS real, além do pool frio, e preserva gest�
   );
   expect(unassigned.total_sem_proximo_passo).toBe(3);
   await login(page, members.manager!.email);
-  await page.goto("/app/radar");
+  await abrirRadar(page);
   await expect(page.getByTestId("radar-sem-proximo-passo")).toContainText("Órfã de gestão");
   expect((await read()).total_sem_proximo_passo).toBe(6);
   await login(page, members.viewer!.email);
@@ -1108,7 +1133,7 @@ test("Radar recorta demandas pela RLS real, além do pool frio, e preserva gest�
   await page.getByRole("button", { name: /Acompanhar/ }).click();
   await page.getByRole("button", { name: "Confirmar e entrar" }).click();
   await page.waitForURL("**/app/inbox");
-  await page.goto("/app/radar");
+  await abrirRadar(page);
   await expect(page.getByTestId("radar-sem-proximo-passo")).toContainText("Órfã de gestão");
   expect((await read()).total_sem_proximo_passo).toBe(6);
   await page.getByRole("button", { name: "Sair do acompanhamento" }).click();

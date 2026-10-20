@@ -38,8 +38,10 @@ import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import type { ProvedorComChave } from "@/lib/ai/pontos/provedores";
 import { rotacionarCredencial } from "@/lib/ai/credenciais/guardar";
+import { PROVEDOR_POR_ASSINATURA } from "@/lib/ai/pontos/provedores";
 import { gravarConfigDoJev, lerConfigDoJev } from "@/lib/ai/decisao/config";
-import { credencialEmUsoPeloJev, PROVEDOR_DO_JEV } from "@/lib/ai/decisao/credencial";
+import { credencialEmUsoPeloJev } from "@/lib/ai/decisao/credencial";
+import { ORIGENS_DO_JEV, provedorDaCredencial } from "@/lib/ai/decisao/origem";
 import { logger } from "@/lib/logger";
 import {
   versoesCongeladas,
@@ -172,6 +174,21 @@ export async function PATCH(
   }
   if (!cred || cred.organization_id !== activeOrg.orgId) {
     return fail("not_found", t("Credential não encontrada."), 404, { requestId });
+  }
+
+  // O RAMO DO LOGIN POR ASSINATURA (#1672, item 3): esta linha guarda o par
+  // de tokens da conta da empresa, e o lugar de trocá-lo é o painel de
+  // conexão (conectar de novo / desconectar) — girar "chave" aqui mandaria um
+  // JSON de tokens para o provedor como se fosse chave de API.
+  if (cred.provider === PROVEDOR_POR_ASSINATURA && input.api_key !== undefined) {
+    return fail(
+      "validation_failed",
+      t(
+        "Esta credencial guarda o login por assinatura da empresa, não uma chave de API. Use Conectar ou Desconectar na tela de Credenciais.",
+      ),
+      422,
+      { requestId },
+    );
   }
 
   const resultado = await rotacionarCredencial({
@@ -310,9 +327,10 @@ export async function DELETE(
   });
 
   const jevDesligado =
-    cred.provider === PROVEDOR_DO_JEV
+    ORIGENS_DO_JEV.some((o) => provedorDaCredencial(o) === cred.provider)
       ? await desligarOJevSeFicouSemChave({
           admin,
+          provedorExcluido: cred.provider,
           orgId: activeOrg.orgId,
           actorUserId: authUser.id,
           requestId,
@@ -336,6 +354,7 @@ export async function DELETE(
  */
 async function desligarOJevSeFicouSemChave(p: {
   admin: ReturnType<typeof createAdminClient>;
+  provedorExcluido: string;
   orgId: string;
   actorUserId: string;
   requestId: string;
@@ -346,7 +365,7 @@ async function desligarOJevSeFicouSemChave(p: {
       .from("ai_provider_credentials")
       .select("provider, is_active, validated_at, created_at")
       .eq("organization_id", p.orgId)
-      .eq("provider", PROVEDOR_DO_JEV)
+      .eq("provider", p.provedorExcluido)
       .eq("is_active", true),
   ]);
   if (orgRes.error || credsRes.error) {
@@ -356,8 +375,12 @@ async function desligarOJevSeFicouSemChave(p: {
     });
     return false;
   }
-  if (!lerConfigDoJev(orgRes.data?.settings).ligado) return false;
-  if (credencialEmUsoPeloJev(credsRes.data ?? []) !== null) return false;
+  const config = lerConfigDoJev(orgRes.data?.settings);
+  if (!config.ligado) return false;
+  // A chave excluída só pesa se é do provedor que a ORIGEM do Jev consome: a
+  // TypeSafe velha de quem responde pela OpenRouter não desliga nada.
+  if (provedorDaCredencial(config.origem) !== p.provedorExcluido) return false;
+  if (credencialEmUsoPeloJev(credsRes.data ?? [], config.origem) !== null) return false;
 
   const gravado = await gravarConfigDoJev({
     admin: p.admin,

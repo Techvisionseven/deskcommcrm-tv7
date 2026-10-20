@@ -2,6 +2,8 @@ import { redirect } from "next/navigation";
 
 import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import { ROLE_RANK } from "@/lib/auth/types";
+import { moduloLigado } from "@/lib/instalacao/modulos";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { PipelinesClient, type EtapaDoFunil, type PipelineRow } from "./_client";
 import { traduzir } from "@/lib/i18n/dicionario";
@@ -34,7 +36,7 @@ export default async function PipelinesSettingsPage() {
   const supabase = await createClient();
   const { data } = await supabase
     .from("crm_pipelines")
-    .select("id, name, slug, vocabulary, settings")
+    .select("id, name, slug, vocabulary, settings, is_default")
     .eq("organization_id", activeOrg.orgId)
     .eq("is_archived", false)
     .order("position");
@@ -55,6 +57,8 @@ export default async function PipelinesSettingsPage() {
     (etapasPorFunil[e.pipeline_id] ??= []).push(e);
   }
   const idioma = user.idioma;
+  // #1907: sem o módulo `financeiro` não há comanda, e o interruptor do ganho some.
+  const comandaDisponivel = podeEditarConfig && (await moduloLigado(createAdminClient(), "financeiro"));
 
   return (
     <div className="flex h-full flex-col gap-6 p-6">
@@ -74,6 +78,7 @@ export default async function PipelinesSettingsPage() {
         pipelines={pipelines}
         etapas={etapasPorFunil}
         podeEditarConfig={podeEditarConfig}
+        comandaDisponivel={comandaDisponivel}
       />
     </div>
   );

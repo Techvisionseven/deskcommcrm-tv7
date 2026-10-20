@@ -92,7 +92,13 @@ function recusa(
 
 export async function enviarAvisoDeTeste(
   deps: DepsDoAvisoDeTeste,
-  entrada: { organizationId: string; channelSessionId: string; telefone: string },
+  entrada: {
+    organizationId: string;
+    channelSessionId: string;
+    telefone: string;
+    /** A opção de responder casos por este número, como está SALVA. */
+    respostaWhatsappHabilitada?: boolean;
+  },
 ): Promise<ResultadoDoAvisoDeTeste> {
   const agora = deps.clock();
   const { organizationId: orgId, channelSessionId, telefone } = entrada;
@@ -107,6 +113,7 @@ export async function enviarAvisoDeTeste(
     return recusa("indeterminado");
   }
   if (!canal || canal.archived_at) return recusa("canal_arquivado");
+  if (canal.desativado) return recusa("canal_desativado");
   if (!canal.aceitaMensagemLivre) return recusa("canal_nao_aceita_aviso_livre");
   // No motor, canal parado vira `retry` por até ~30 min. Aqui não: há alguém
   // esperando a resposta na tela, e "vou tentar de novo em 5 minutos" não é
@@ -149,6 +156,7 @@ export async function enviarAvisoDeTeste(
     marca: marca.nome,
     idioma: marca.idioma,
     link: `${deps.urlPublica.replace(/\/+$/, "")}/app/ai/cases`,
+    respostaWhatsappHabilitada: entrada.respostaWhatsappHabilitada === true,
   });
 
   // ── 14. O transporte ─────────────────────────────────────────────────────

@@ -178,7 +178,7 @@ const DETERMINANTES_DE_OBJETO =
  * chamado; "lista de presentes" é compra; "lista de desejos" é vitrine.
  */
 const LISTAS_DE_ENVIO =
-  "contatos?|transmissao|envios?|mensagens|disparos?|divulgacao|promocoes|" +
+  "contatos?|contactos?|transmissao|envios?|mensagens|disparos?|divulgacao|promocoes|" +
   "ofertas|whatsapp|zap|voces|vcs";
 
 /**
@@ -382,7 +382,53 @@ const FRASES_DE_OPT_OUT: readonly RegExp[] = [
   // As duas leem hoje a MESMA constante (`LISTAS_DE_ENVIO`), que é o que torna
   // impossível uma voltar a divergir da outra.
   new RegExp(`\\bsair\\s+d(?:a|essa|esta)\\s+lista\\b${FREIO_DE_LISTA_QUALIFICADA}`, "u"),
-  /\bcancelar?\s+(?:a\s+)?(?:inscricao|assinatura)\b/u,
+  // "cancelar a inscrição" — e NÃO "cancelar a assinatura" (#2886). A palavra
+  // `assinatura` saiu daqui para as ambíguas, abaixo, pelo mesmo motivo que a
+  // `subscricao` de Portugal saiu no #2343: ela serve às DUAS coisas, sair das
+  // mensagens e cancelar o plano do produto, e bloqueava quem só perguntava
+  // "posso cancelar a assinatura e voltar depois?" (medido: `is_blocked` gravado
+  // e nenhuma resposta depois).
+  //
+  // `inscricao` FICA, e não por esquecimento: medida na #2886, ela tem o mesmo
+  // formato de defeito ("posso cancelar a inscrição e voltar depois?" grava
+  // `is_blocked`), mas movê-la obriga a reverter uma guarda de INGESTÃO que hoje
+  // a fixa bloqueando (`tests/unit/pos-entrada-efeitos-do-canal.test.ts`), e o
+  // recorte desta fatia é `assinatura`/`suscripcion`. A medição dela está na
+  // evidência da issue como medida-e-não-movida, com o número.
+  /\bcancelar?\s+(?:a\s+)?inscricao\b/u,
+  // ...mas "cancelar a assinatura DAS MENSAGENS" nomeia o objeto de
+  // comunicação, e aí bloqueia na hora — a regra do cabeçalho. A ambígua lá
+  // embaixo só cobre a frase SEM objeto. Vale também para a `subscricao` de
+  // Portugal (#2872), que tinha o mesmo buraco. "do whatsapp" e "de vocês"
+  // ficam DE FORA de propósito: também podem ser o plano, então seguem só
+  // escalando para uma pessoa.
+  /\bcancelar?\s+(?:a\s+)?(?:minha\s+)?(?:assinatura|subscricao)\s+(?:d(?:as|essas|estas)\s+(?:mensagens|notificacoes|promocoes|ofertas|novidades)|d(?:os|esses|estes)\s+(?:avisos|disparos|envios)|d(?:a|essa|esta)\s+newsletter)\b/u,
+  // ── PORTUGUÊS DE PORTUGAL: o pronome vem PRESO ao verbo, DEPOIS dele ──────
+  //
+  // Em pt-PT o pronome átono é ENCLÍTICO ("remova-me da lista"), enquanto o
+  // pt-BR o põe ANTES do verbo ("me remova da lista"). O padrão de cima já
+  // cobria a forma brasileira; a forma de cá não casava padrão NENHUM, embora
+  // seja a construção normal de quem escreve de Portugal — a mesma assimetria
+  // que o espanhol tinha com o pronome preso ao infinitivo ("escribirme").
+  //
+  // O verbo sozinho não basta (a lição do cabeçalho): o pedido só existe com o
+  // objeto de ENVIO depois do pronome — "remova-me da lista de contactos",
+  // "excluam-me da lista de envios". "remova-me a dúvida sobre o prazo" e
+  // "removam-me da lista de espera" continuam fora, pelo mesmo freio de lista
+  // qualificada e pela mesma régua do #1607 — ver os controles negativos em
+  // `tests/unit/opt-out-deteccao.test.ts`. `contacto(s)` é a grafia de Portugal
+  // de contato(s): sem ela, "retirem-me da lista de contactos" não passaria o
+  // freio (a lista só tinha a palavra brasileira). E "contactos" sozinho, sem
+  // "lista", NÃO entra: a forma brasileira também exige "lista", e "remova-me
+  // dos contatos do fornecedor" bloqueava aqui o que "me remova dos contatos do
+  // fornecedor" não bloqueia lá.
+  new RegExp(
+    "\\b(?:tira|tire|tirem|tirar|remove|remova|removam|remover|retira|retire|retirem|retiram|retirar|" +
+      "exclui|exclua|excluam|excluir|apaga|apague|apaguem|apagar|elimina|elimine|eliminem|eliminar)" +
+      "-(?:me|nos)\\s+(?:d[ao]s?|dessa|desta|de\\s+sua|da\\s+sua)\\s+" +
+      `lista\\b${FREIO_DE_LISTA_QUALIFICADA}`,
+    "u",
+  ),
   /\b(?:me\s+)?descadastr\w*\b/u,
   /\bdescadastro\b/u,
   // ── espanhol ──────────────────────────────────────────────────────────────
@@ -451,7 +497,14 @@ const FRASES_DE_OPT_OUT: readonly RegExp[] = [
   // quer continuar sendo atendido.
   /\b(?:sacame|sacar|quitame|quitar|borrame|borrar|elimina|eliminame)\s+de\s+(?:la\s+)?lista\b(?!\s+de\s+(?:espera|precios|invitados))/u,
   /\bsalir\s+de\s+(?:la\s+)?lista\b(?!\s+de\s+(?:espera|precios|invitados))/u,
-  /\bcancelar\s+(?:la\s+)?(?:suscripcion|inscripcion)\b/u,
+  // Espelho exato do português acima: `suscripcion` saiu para as ambíguas
+  // (#2886) porque em espanhol também serve às duas coisas — "cancelar la
+  // suscripcion" é o plano, e bloqueava quem só perguntava. `inscripcion` fica
+  // pelo mesmo motivo de `inscricao` lá em cima.
+  /\bcancelar\s+(?:la\s+)?inscripcion\b/u,
+  // E o espelho da forma com objeto: "cancelar la suscripción a los mensajes"
+  // bloqueia na hora; "cancelar la suscripción" sozinha só escala.
+  /\bcancelar\s+(?:la\s+|mi\s+)?suscripcion\s+(?:a|de)\s+(?:los|estos|tus|sus)\s+(?:mensajes|promociones|ofertas)\b/u,
 ];
 
 /**
@@ -463,6 +516,23 @@ const FRASES_AMBIGUAS_DE_OPT_OUT: readonly RegExp[] = [
   /\bja\s+(?:disse|falei)\s+que\s+nao\s+(?:quero|tenho\s+interesse)\b/u,
   /\bnao\s+(?:me\s+)?interessa\s+mais\b/u,
   /\bpara\s+com\s+isso\b/u,
+  // "cancelar a subscrição" (pt-PT, #2343) escala e NÃO bloqueia. Em Portugal
+  // a palavra serve às duas coisas: sair das mensagens E cancelar o plano do
+  // ginásio ou da revista — "posso cancelar a subscrição e voltar depois?" é
+  // cliente a perguntar sobre o produto, e `is_blocked` o deixaria sem
+  // resposta. Sem o objeto de comunicação, o humano decide.
+  /\bcancelar?\s+(?:a\s+)?(?:minha\s+)?subscric(?:ao|oes)\b/u,
+  // "cancelar a assinatura" (pt-BR, #2886) — a MESMA decisão da subscrição de
+  // Portugal acima, e pela mesma razão: a palavra serve às duas coisas. "quero
+  // cancelar a assinatura da revista" é cliente a falar do PLANO dele, e o
+  // bloqueio o deixaria sem resposta — a academia, a revista ou o SaaS perde o
+  // cliente que só queria saber como pausar. Medido com as funções da main:
+  //   "posso cancelar a assinatura e voltar depois?"  bloqueia=true
+  //   "quero cancelar a assinatura da revista"        bloqueia=true
+  //   "cancelar la suscripcion" (espanhol, abaixo)    bloqueia=true
+  // Aqui escala para um humano, que decide o bloqueio de verdade — o custo
+  // aceito (campanhas seguem até alguém decidir) está na #2886.
+  /\bcancelar?\s+(?:a\s+)?(?:minha\s+)?assinatura\b/u,
   // ── espanhol ──────────────────────────────────────────────────────────────
   //
   // Esta lista tinha ZERO entradas em espanhol. Não por decisão: o ambíguo é
@@ -490,6 +560,12 @@ const FRASES_AMBIGUAS_DE_OPT_OUT: readonly RegExp[] = [
   // `/\bnao\s+(?:me\s+)?interessa\s+mais\b/` — a assimetria era o defeito.
   /\b(?:ya\s+no\s+me\s+interesa|no\s+me\s+interesa\s+mas)\b/u,
   /\b(?:ya\s+basta|basta\s+ya)\b/u,
+  // "cancelar la suscripcion" — o espelho espanhol de "cancelar a assinatura"
+  // (#2886). Mesma palavra para o plano do produto e para as mensagens: quem
+  // pergunta "puedo cancelar la suscripcion?" quer resposta, não `is_blocked`.
+  // A forma com OBJETO segue bloqueando na hora — "dar de baja la suscripcion"
+  // e "quiero dar de baja la suscripcion" continuam em `FRASES_DE_OPT_OUT`.
+  /\bcancelar\s+(?:la\s+|mi\s+)?suscripcion\b/u,
   /\bno\s+me\s+molest(?:e|en|es)\b/u,
 ];
 
@@ -521,4 +597,42 @@ export function ehOptOutProvavel(texto: string | null | undefined): boolean {
   if (ehPedidoDeOptOut(texto)) return true;
   const normalizado = normalizarTexto(texto.trim());
   return FRASES_AMBIGUAS_DE_OPT_OUT.some((re) => re.test(normalizado));
+}
+
+/**
+ * As palavras de saída que o rodapé das abordagens OFERECE ao cliente ("Responda
+ * PARAR" e suas versões). Subconjunto de `PALAVRAS_DE_OPT_OUT` — o vocabulário
+ * continua num lugar só; aqui só se escolhe quais dessas palavras, no INÍCIO da
+ * mensagem, já dizem a que ela veio.
+ */
+const PALAVRAS_DE_SAIDA_DO_RODAPE: ReadonlySet<string> = new Set(["parar", "pare", "stop", "baja"]);
+
+/**
+ * A mensagem COMEÇA com a palavra de saída? ("Parar não é daqui", "Pare de me
+ * mandar", "STOP!")
+ *
+ * NÃO autoriza bloqueio — para isso só há `ehPedidoDeOptOut`, e ele exige a
+ * palavra sozinha ou uma frase inteira: "Parar não é daqui" não passa nele, e é
+ * por isso que este contato ficou sem bloqueio e recebeu o texto de "passei seu
+ * pedido para um atendente humano". Serve a UMA decisão: qual frase o cliente lê
+ * quando a IA sai de campo por outro motivo (clima ruim) logo depois de uma
+ * mensagem assim — quem começa a resposta com "parar" não quer ouvir sobre
+ * atendente, quer ouvir que o pedido foi entendido.
+ *
+ * Só o INÍCIO conta: "tem como parar a dor?" é uma pergunta de paciente, não um
+ * pedido de saída (o mesmo cuidado de `FRASES_DE_OPT_OUT`).
+ */
+export function comecaComPalavraDeSaida(texto: string | null | undefined): boolean {
+  if (!texto) return false;
+  const normalizado = normalizarTexto(texto.trim());
+  const primeira = normalizado.match(/[a-z]+/u)?.[0];
+  if (primeira === undefined) return false;
+  if (!PALAVRAS_DE_SAIDA_DO_RODAPE.has(primeira) || !PALAVRAS_DE_OPT_OUT.has(primeira)) return false;
+  // "Pare de mandar o pedido nesse endereço", "Parar de tomar o remédio faz mal?":
+  // "<palavra> de …" e pergunta já têm dono — a regra de cessação com objeto
+  // de comunicação. Delega a ela em vez de decidir pela primeira palavra.
+  if (/^[^a-z]*[a-z]+\s+de\b/u.test(normalizado) || normalizado.includes("?")) {
+    return ehOptOutProvavel(texto);
+  }
+  return true;
 }

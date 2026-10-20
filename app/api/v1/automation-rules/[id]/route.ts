@@ -9,8 +9,13 @@ import type { NextRequest } from "next/server";
 import { ok, fail, noContent } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
+import {
+  MENSAGEM_CAMPO_DE_DATA_DO_CONTATO,
+  campoDoGatilhoDeDataEhDoContato,
+} from "@/lib/automation/campo-do-gatilho-de-data";
 import { autoriaDaMudanca } from "@/lib/operacao/autoria";
 import { updateAutomationRuleSchema } from "@/lib/schemas";
+import { acoesQueFechamLaco, MENSAGEM_DO_LACO_DE_LEAD } from "@/lib/schemas/webhooks";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { encryptRuleActionSecrets } from "@/lib/webhooks/secrets";
@@ -50,12 +55,60 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
   const supabase = await createClient();
   const { data: existing, error: fetchErr } = await supabase
     .from("automation_rules")
-    .select("id")
+    .select("id, trigger_event, trigger_config, actions")
     .eq("id", id)
     .eq("organization_id", activeOrg.orgId)
     .maybeSingle();
   if (fetchErr) return fail("internal_error", fetchErr.message, 500, { requestId });
   if (!existing) return fail("not_found", t("Regra não encontrada."), 404, { requestId });
+
+  // O PATCH parcial (só o gatilho, ou só as ações) monta o laço de #1528 pela
+  // porta do lado: o schema só o vê quando os dois vêm juntos. Desligar a regra
+  // (só `is_active`) nunca é barrado.
+  const gravada = existing as { trigger_event: string; actions: { type: string }[] | null };
+  if (
+    (parsed.data.trigger_event !== undefined || parsed.data.actions !== undefined) &&
+    acoesQueFechamLaco(
+      parsed.data.trigger_event ?? gravada.trigger_event,
+      parsed.data.actions ?? gravada.actions ?? [],
+    ).length
+  ) {
+    return fail("invalid_request", t(MENSAGEM_DO_LACO_DE_LEAD), 400, { requestId });
+  }
+
+  const webhookSourceId = parsed.data.trigger_config?.webhook_source_id;
+  if (typeof webhookSourceId === "string") {
+    const { data: source, error: sourceError } = await supabase
+      .from("webhook_sources")
+      .select("id")
+      .eq("id", webhookSourceId)
+      .eq("organization_id", activeOrg.orgId)
+      .maybeSingle();
+    if (sourceError) return fail("internal_error", sourceError.message, 500, { requestId });
+    if (!source) {
+      return fail("invalid_request", t("A fonte escolhida não pertence a esta empresa."), 422, { requestId });
+    }
+  }
+
+  // Gatilho por data num campo do contato (#2791) nunca dispara: a regra que
+  // chega assim — pela API, ou antiga sendo regravada ou religada — é recusada.
+  // Desligar e renomear não passam por aqui.
+  if (
+    parsed.data.trigger_event !== undefined ||
+    parsed.data.trigger_config !== undefined ||
+    parsed.data.is_active === true
+  ) {
+    const campoDeData = await campoDoGatilhoDeDataEhDoContato(
+      supabase,
+      activeOrg.orgId,
+      parsed.data.trigger_event ?? gravada.trigger_event,
+      parsed.data.trigger_config ?? (existing as { trigger_config: unknown }).trigger_config,
+    );
+    if ("erro" in campoDeData) return fail("internal_error", campoDeData.erro, 500, { requestId });
+    if (campoDeData.doContato) {
+      return fail("invalid_request", t(MENSAGEM_CAMPO_DE_DATA_DO_CONTATO), 422, { requestId });
+    }
+  }
 
   // Secrets de call_webhook nunca ficam em claro no jsonb (migration 0041);
   // secret_enc existente (round-trip do editor) passa intacto.

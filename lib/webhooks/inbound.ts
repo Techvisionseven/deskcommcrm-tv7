@@ -4,7 +4,7 @@
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-import { canonicalPhoneBR } from "@/lib/channels/phone-variants";
+import { normalizePhoneBR } from "@/lib/channels/phone-variants";
 
 export interface FieldMap {
   name?: string[];
@@ -18,6 +18,31 @@ const DEFAULT_FIELD_MAP: Required<FieldMap> = {
   email: ["email", "e-mail", "mail"],
 };
 
+/**
+ * Chaves que a PLATAFORMA do formulário põe no envio e que não são resposta de
+ * ninguém. O JetFormBuilder manda `__refer`, `__form_id` e `__is_ajax` junto com
+ * os campos do formulário (medido num envio real, 2026-09-30); o WordPress
+ * acrescenta nonce e referer. Entrando em `custom_fields`, apareciam no card do
+ * lead como se a pessoa as tivesse preenchido.
+ *
+ * Lista NOMEADA, e não "tudo que começa com `_`": um formulário próprio pode ter
+ * um campo legítimo chamado `_origem`, e descartá-lo em silêncio seria perder
+ * dado de cliente. Só cai o que é conhecidamente da plataforma.
+ */
+export const CHAVES_DE_PLATAFORMA = new Set([
+  "__refer",
+  "__form_id",
+  "__is_ajax",
+  "__queried_post_id",
+  "_wpnonce",
+  "_wp_http_referer",
+  "_jet_engine_refer",
+  "_jet_engine_booking_form_id",
+  "jfb_preview_nonce",
+  "_jfb_current_render_states",
+  "_jfb_current_render_states[]",
+]);
+
 export interface MappedLead {
   name: string | null;
   phone: string | null;
@@ -26,20 +51,9 @@ export interface MappedLead {
   source_metadata: Record<string, string>;
 }
 
-/** Normaliza telefone BR para E.164 com o nono dígito no celular. */
-export function normalizePhoneBR(raw: unknown): string | null {
-  if (typeof raw !== "string" || !raw.trim()) return null;
-  const digits = raw.replace(/\D/g, "");
-  let e164: string | null = null;
-  if (raw.trim().startsWith("+")) {
-    e164 = /^\d{8,15}$/.test(digits) ? `+${digits}` : null;
-  } else if (digits.length === 12 || digits.length === 13) {
-    e164 = digits.startsWith("55") ? `+${digits}` : null;
-  } else if (digits.length === 10 || digits.length === 11) {
-    e164 = `+55${digits}`;
-  }
-  return e164 ? canonicalPhoneBR(e164) : null;
-}
+// A regra mora em `lib/channels/phone-variants.ts`, que o componente de cliente
+// também importa (este módulo carrega `node:crypto`).
+export { normalizePhoneBR };
 
 function firstMatch(payload: Record<string, unknown>, aliases: string[]): { key: string; value: string } | null {
   const lowered = new Map(Object.keys(payload).map((k) => [k.toLowerCase(), k]));
@@ -71,7 +85,7 @@ export function mapInboundPayload(
   const custom_fields: Record<string, string> = {};
   const source_metadata: Record<string, string> = {};
   for (const [key, value] of Object.entries(payload)) {
-    if (consumed.has(key)) continue;
+    if (consumed.has(key) || CHAVES_DE_PLATAFORMA.has(key)) continue;
     const str =
       typeof value === "string" ? value : typeof value === "number" || typeof value === "boolean" ? String(value) : null;
     if (str === null) continue; // objetos/arrays aninhados: descartados no v1

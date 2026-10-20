@@ -16,26 +16,29 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
  * o resultado cairia no fallback/genérico em produção.
  *
  * Com a tarefa do roteador do Jev rodando, o Jev responde a mesma frase ao mesmo
- * tempo, e a tela mostra as duas escolhas lado a lado (`jev`). Nada disso vira
+ * tempo no modo comparação. Sob demanda, só consulta a IA de sempre se o
+ * Jev não tiver intenção confiável. A tela distingue reserva não consultada
+ * de falha de resposta. Nada disso vira
  * observação (R5): uma frase digitada por quem configura não é concordância de
  * atendimento. O custo dele entra em `llm_calls`, como o do classificador de
- * sempre neste mesmo clique (R8). Decidindo, a escolha dele é a que valeria em
- * produção — com a IA de sempre respondendo; sem ela, vale a regra de hoje (R2).
+ * sempre quando consultado neste clique (R8). A prévia segue o modo salvo, e
+ * o sob demanda só vale onde a empresa tem a IA de sempre; sem ela, vale a
+ * regra de hoje (R2).
  */
 import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 import { z } from "zod";
 
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { ok, fail } from "@/lib/api/wrappers";
-import { requireRole } from "@/lib/auth/require-role";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getSkillsPool } from "@/lib/ai/skills/db";
 import { env } from "@/lib/env";
-import { llmEdgeConfigFromEnv } from "@/lib/agent-engine/edge/llm/credentials";
+import { llmEdgeConfigFromEnv, temIaDeSempre } from "@/lib/agent-engine/edge/llm/credentials";
 import { createLogger } from "@/lib/agent-engine/obs/logger";
 import { loadActiveRouter } from "@/lib/agent-engine/agent/router-config";
 import { classifyIntent, type IntentVerdict } from "@/lib/agent-engine/agent/intent-classifier";
-import { destinoDoVeredito } from "@/lib/agent-engine/agent/resolve-turn-agent";
+import { destinoDoVeredito, vereditoConfiavelDoRoteador } from "@/lib/agent-engine/agent/resolve-turn-agent";
 import { consultarJevNoRoteador, registrarRoteadorDoJev } from "@/lib/ai/decisao/roteador";
 import { traduzir } from "@/lib/i18n/dicionario";
 
@@ -59,10 +62,20 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
     return fail("invalid_request", "id inválido.", 400, { requestId });
   }
 
-  const authz = await requireRole("manager", { requestId, resource: "ai_routers" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "ai_routers",
+    role: "manager",
+    // A prévia persiste custo em llm_calls e pode registrar a execução do Jev.
+    scope: "config:write",
+    tokenRole: "admin",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
-  const { org } = authz;
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
+  const { organizationId } = authz;
+
+  const teto = await tetoDeEscritaDoToken(authz, "ai_routers_test", requestId);
+  if (teto) return teto;
 
   let rawBody: unknown;
   try {
@@ -84,7 +97,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
     .from("ai_routers")
     .select("id, channel_session_id")
     .eq("id", id)
-    .eq("organization_id", org.orgId)
+    .eq("organization_id", organizationId)
     .maybeSingle();
   if (routerErr) {
     return fail("internal_error", "Erro ao carregar router.", 500, { requestId });
@@ -94,7 +107,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   }
 
   const pool = getSkillsPool();
-  const loaded = await loadActiveRouter(pool, org.orgId, router.channel_session_id);
+  const loaded = await loadActiveRouter(pool, organizationId, router.channel_session_id);
   if (!loaded || loaded.id !== id) {
     return fail(
       "state_conflict",
@@ -108,25 +121,34 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   const log = createLogger();
 
   const jev = consultarJevNoRoteador(pool, {
-    organizationId: org.orgId,
+    organizationId,
     mensagem: parsed.data.message,
     membros: loaded.members,
     contactId: null,
     jobId: null,
   });
-  const [verdict, estadoDoJev, escolhaDoJev] = await Promise.all([
-    classifyIntent(
-      pool,
-      llmCfg,
-      { tenantId: org.orgId, leadId: null, jobId: null, router: loaded, signal: parsed.data.message },
-      { log },
-    ),
-    jev.estado,
-    jev.escolha,
+  const [modo, estadoDoJev] = await Promise.all([
+    jev.modo ?? Promise.resolve("comparacao"), jev.estado,
   ]);
+  // A mesma regra do turno (decisão B, doc 89): sem a IA de sempre, o Jev não
+  // decide sozinho nem na prévia — vale a comparação, e a R2.
+  const independente = modo === "sob_demanda" && estadoDoJev === "decidindo" &&
+    await temIaDeSempre(pool, llmCfg, organizationId, loaded.classifierProvider);
+  const classificar = () => classifyIntent(
+    pool, llmCfg,
+    { tenantId: organizationId, leadId: null, jobId: null, router: loaded, signal: parsed.data.message },
+    { log },
+  );
+  // Na comparação, as duas consultas seguem em paralelo. Na decisão independente,
+  // a mesma régua do turno real determina se a reserva precisa ser chamada.
+  const comparacao = independente ? null : classificar();
+  const escolhaDoJev = await jev.escolha;
+  const jevConfiavel = vereditoConfiavelDoRoteador(loaded, escolhaDoJev?.veredito ?? null);
+  const iaConsultada = !independente || !jevConfiavel;
+  const verdict = comparacao !== null ? await comparacao : iaConsultada ? await classificar() : null;
   if (escolhaDoJev !== null) {
     await registrarRoteadorDoJev(pool, {
-      organizationId: org.orgId,
+      organizationId,
       contactId: null,
       jobId: null,
       jev: escolhaDoJev,
@@ -145,7 +167,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
       .from("ai_agents")
       .select("name")
       .eq("id", agentId)
-      .eq("organization_id", org.orgId)
+      .eq("organization_id", organizationId)
       .maybeSingle();
     return agentRow?.name ?? null;
   };
@@ -160,6 +182,8 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
 
   return ok(
     {
+      ia_consultada: iaConsultada,
+      modo_roteador: modo,
       intent_name: iaRespondeu ? verdict.intentName : null,
       // `?? null`, nunca `?? 0`: sem veredito não houve medição, e zero é uma
       // AFIRMAÇÃO ("o classificador tem certeza de que não é nada"). A tela local
@@ -184,7 +208,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
               agent_name: agenteDoJev === agentId ? agentName : await nomeDoAgente(agenteDoJev),
               // Em produção vale a escolha dele: decidindo, respondendo, e com a
               // IA de sempre respondendo também (R2).
-              decide: estadoDoJev === "decidindo" && escolhaDoJev !== null && iaRespondeu,
+              decide: independente ? jevConfiavel : estadoDoJev === "decidindo" && escolhaDoJev !== null && iaRespondeu,
             },
     },
     { requestId },

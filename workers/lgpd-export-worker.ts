@@ -2,6 +2,8 @@
  * lgpd-export-worker — consumes `lgpd.data_request_received` events.
  *
  * Pipeline (S-08.04):
+ *   0. Only events from the approval route (`manually_approved` + `approved_by`)
+ *      export — the Nuvemshop request waits for the admin's click (doc 134).
  *   1. Load lgpd_requests row (programmatic org filter).
  *   2. Move status received -> processing, attempts++ (cap at 3).
  *   3. collectExportData → varredura das tabelas que a anonimização alcança (PII-safe).
@@ -23,6 +25,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
 import { valorDaInstalacao } from "@/lib/instalacao/config";
 
 import type { EventRow, HandlerResult } from "@/lib/event-log/dispatcher";
@@ -57,9 +60,19 @@ import {
 } from "@/lib/lgpd/email-delivery";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { marcaDaSaida } from "@/lib/branding/saida";
+import { perfilDaOrganizacao } from "@/lib/legal/perfil-do-pais";
+import { partesDoArquivoDoTitular } from "@/lib/lgpd/copia-do-titular";
 
 const MAX_ATTEMPTS = 3;
 const BUCKET = "lgpd-exports";
+
+/**
+ * Depois disto, uma reivindicação de exportação é considerada ÓRFÃ e o próximo
+ * evento pode retomá-la — a mesma janela do reaper do `event_log`
+ * (`PROCESSING_STALE_MS`, `lib/event-log/drain.ts`). Processo derrubado no meio
+ * do export não pode deixar o pedido preso para sempre (issue #2751).
+ */
+const EXPORT_CLAIM_STALE_MS = 10 * 60 * 1000;
 
 function expiresHours(): number {
   const raw = process.env.LGPD_EXPORT_EXPIRES_HOURS ?? env.LGPD_EXPORT_EXPIRES_HOURS;
@@ -88,6 +101,25 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
       consumer_key: "lgpd-export-worker.v1",
       status: "skipped",
       detail: "missing_request_id",
+    };
+  }
+
+  // 0. Só exporta o pedido que alguém da equipe APROVOU (doc 134, opção A).
+  //
+  // O dado sai da empresa para um e-mail que o CRM não confere: quem decide o
+  // envio é uma pessoa, na tela do pedido, vendo o nome do titular. O único
+  // emissor com essa marca é a rota de aprovação
+  // (`app/api/v1/lgpd/requests/[id]/approve/route.ts`), e o tipo do evento só
+  // nasce pelo servidor (migration 0672). Evento sem a marca — o que o webhook
+  // da Nuvemshop emitia antes desta versão e ainda pode estar na fila de quem
+  // atualiza — é consumido sem efeito: o pedido continua `received`, esperando
+  // o clique, e o aviso de prazo segue cobrando a equipe.
+  const aprovadoPor = event.payload?.["approved_by"];
+  if (event.payload?.["manually_approved"] !== true || typeof aprovadoPor !== "string" || !aprovadoPor) {
+    return {
+      consumer_key: "lgpd-export-worker.v1",
+      status: "skipped",
+      detail: "awaiting_approval",
     };
   }
 
@@ -152,15 +184,68 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
     };
   }
 
-  await admin
+  // ─── REIVINDICAÇÃO ATÔMICA (issue #2751) ───────────────────────────────────
+  //
+  // O webhook da Nuvemshop e a aprovação emitiam `lgpd.data_request_received`
+  // cada um; com dois drenos (o laço do worker e o cron) os dois eventos rodam
+  // em paralelo, os dois leem o pedido fora de `completed` — e, antes desta
+  // reivindicação, os dois exportavam (`attempts=2`, dois
+  // `lgpd.export_generated`). Hoje só a aprovação dispara a exportação, mas
+  // dois cliques (ou o retry do dreno junto de um clique novo) ainda produzem
+  // dois eventos do mesmo pedido. Quem exporta é quem CONSEGUE gravar
+  // `export_claimed_at`: o UPDATE é a trava, e o predicado é reavaliado contra a
+  // linha já comitada por quem chegou primeiro.
+  //
+  // O marcador é do WORKER, não do fluxo: a aprovação também grava
+  // `processing` (é o estado que a tela mostra), e `status` sozinho não
+  // distingue "aprovado, ainda na fila" de "exportando agora". Reivindicação
+  // vencida é órfã (processo derrubado) e o próximo evento retoma — o
+  // invariante 4 do Sistema Vivo aplicado ao pedido, como o reaper do
+  // `event_log` faz com a fila.
+  const limiteDaReivindicacao = new Date(Date.now() - EXPORT_CLAIM_STALE_MS).toISOString();
+  const { data: reivindicado, error: erroDaReivindicacao } = await admin
     .from("lgpd_requests")
-    .update({ status: "processing", attempts: nextAttempts })
+    .update({
+      status: "processing",
+      attempts: nextAttempts,
+      export_claimed_at: new Date().toISOString(),
+    })
     .eq("organization_id", orgId)
-    .eq("id", requestId);
+    .eq("id", requestId)
+    .neq("status", "completed")
+    .or(`export_claimed_at.is.null,export_claimed_at.lt.${limiteDaReivindicacao}`)
+    .select("id");
+
+  if (erroDaReivindicacao) {
+    // O banco não respondeu à trava: não sabemos se reivindicou. Lido como
+    // "outro está exportando", o dreno consumiria o evento e o pedido ficaria
+    // sem exportação nem nova tentativa. `error` faz o dreno contar a tentativa
+    // e reagendar. Só o código: a mensagem do Postgres pode trazer a linha.
+    return {
+      consumer_key: "lgpd-export-worker.v1",
+      status: "error",
+      detail: `claim_failed: ${erroDaReivindicacao.code}`,
+    };
+  }
+
+  if (!reivindicado?.length) {
+    // Não reivindicou: outro evento está exportando agora — ou concluiu entre a
+    // leitura e a reivindicação. O motivo fica no `detail` (o dreno o grava em
+    // `last_error`) e o evento é consumido como sucesso: o trabalho não é dele.
+    const atual = await findLgpdRequest(orgId, requestId).catch(() => null);
+    return {
+      consumer_key: "lgpd-export-worker.v1",
+      status: "skipped",
+      detail: atual?.status === "completed" ? "already_completed" : "already_in_flight",
+    };
+  }
 
   try {
-    // 3. Collect data.
+    // 3. Collect data. O país é lido UMA vez e vale para o PDF e para o e-mail:
+    // duas leituras, se só uma falhasse, dariam ao titular duas leis (doc 88).
+    const perfil = await perfilDaOrganizacao(admin, orgId);
     const data = await collectExportData({
+      pais: perfil.codigo,
       // O piso do encarregado é resolvido AQUI e injetado: o coletor de LGPD
       // não consulta configuração, para a coleta sem identificador continuar
       // visitando só `organizations` (tests/invariants/agenda-meet-export).
@@ -183,11 +268,27 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
     const jsonPath = `${orgId}/${requestId}/data.json`;
     const pdfPath = `${orgId}/${requestId}/report.pdf`;
 
-    const jsonBytes = Buffer.from(JSON.stringify(data, null, 2), "utf-8");
+    // O arquivo é o que o titular RECEBE (doc 103): o payload sem o que é da
+    // equipe. O PDF acima foi desenhado do payload inteiro e não muda.
+    //
+    // #2576: ele sai em STREAM — seção a seção e linha a linha, direto no
+    // upload. O que existia antes (a cópia do país serializada INTEIRA e jogada
+    // num `Buffer`) mantinha payload, cópia profunda, string e buffer QUATRO
+    // vezes o arquivo na memória no mesmo instante; agora é o payload (que o
+    // PDF e os fixtures travam) e, no máximo, UMA linha. O storage-js passa o
+    // Readable direto ao fetch com `duplex: half` — o corpo vai em chunked,
+    // sem Buffer do arquivo inteiro em parte alguma.
+    const corpoDoJson = Readable.from(
+      (async function* () {
+        for await (const pedaco of partesDoArquivoDoTitular(data, perfil.codigo)) {
+          yield Buffer.from(pedaco, "utf-8");
+        }
+      })(),
+    );
 
     const { error: jsonUploadErr } = await admin.storage
       .from(BUCKET)
-      .upload(jsonPath, jsonBytes, {
+      .upload(jsonPath, corpoDoJson, {
         contentType: "application/json",
         upsert: true,
       });
@@ -216,6 +317,18 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
       throw new Error(`signed_url_failed: ${signedErr?.message ?? "no_url"}`);
     }
 
+    // A cópia dos dados: o `data.json` subia no mesmo diretório, mas só o PDF
+    // tinha link. Portugal passou a recebê-lo pelo art. 15.º, n.º 3 (#2340); o
+    // Brasil, pela declaração completa da LGPD (art. 19, II — doc 103, A).
+    // Mesma validade do PDF.
+    const { data: signedDados, error: signedDadosErr } = await admin.storage
+      .from(BUCKET)
+      .createSignedUrl(jsonPath, expiresInSec);
+    if (signedDadosErr || !signedDados) {
+      throw new Error(`signed_url_json_failed: ${signedDadosErr?.message ?? "no_url"}`);
+    }
+    const signedUrlDados = signedDados.signedUrl;
+
     // 8. Resolve delivery email.
     const deliveryFromPayload = (req.request_payload as Record<string, unknown>)?.delivery as
       | Record<string, unknown>
@@ -227,7 +340,10 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
 
     if (!deliveryEmail) {
       // Mark as pending_review — operator must contact manually.
-      await admin
+      // O erro é lido: até a 0651 o CHECK recusava este estado (23514) e o pedido
+      // ficava em `processing` para sempre, auditado como exportado. Lançar leva ao
+      // catch do handler (pedido volta à fila com o código em error_message).
+      const { error: semEnderecoErr } = await admin
         .from("lgpd_requests")
         .update({
           status: "pending_review",
@@ -242,6 +358,8 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
         })
         .eq("organization_id", orgId)
         .eq("id", requestId);
+      // Só o código: o detalhe do Postgres traz a linha, e a linha traz o e-mail.
+      if (semEnderecoErr) throw new Error(`pending_review_update_failed: ${semEnderecoErr.code}`);
       await audit({
         action: "lgpd.export_generated",
         organizationId: orgId,
@@ -274,14 +392,19 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
         to: deliveryEmail,
         requestId,
         signedUrl: signed.signedUrl,
+        signedUrlDados,
         expiresAt,
         marca: await marcaDaSaida(orgId),
+        // O país decide a lei e o idioma do e-mail — o MESMO perfil que o coletor
+        // usou; o fuso vem do coletor, que só o põe no payload fora do Brasil.
+        perfil,
+        fuso: data.fuso,
       });
       messageId = sent.messageId;
     } catch (err) {
       if (err instanceof EmailNotConfigured) {
-        // Operator gap — mark pending_review (no retry helps).
-        await admin
+        // Operator gap — mark pending_review (no retry helps). Erro lido, como acima.
+        const { error: semTransporteErr } = await admin
           .from("lgpd_requests")
           .update({
             status: "pending_review",
@@ -297,6 +420,7 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
           })
           .eq("organization_id", orgId)
           .eq("id", requestId);
+        if (semTransporteErr) throw new Error(`pending_review_update_failed: ${semTransporteErr.code}`);
         await audit({
           action: "lgpd.export_generated",
           organizationId: orgId,
@@ -327,6 +451,9 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
         .update({
           status: "received",
           error_message: "email_send_failed",
+          // A falha devolve o pedido à fila: limpa a reivindicação para o retry
+          // imediato não esperar a janela de órfã (issue #2751).
+          export_claimed_at: null,
         })
         .eq("organization_id", orgId)
         .eq("id", requestId);
@@ -446,6 +573,9 @@ export async function processLgpdExport(event: EventRow): Promise<HandlerResult>
       .update({
         status: nextAttempts >= MAX_ATTEMPTS ? "failed" : "received",
         error_message: detail.slice(0, 500),
+        // Sem reivindicação pendurada: o retry (received) reclama na hora, e o
+        // desistido (failed) não deixa marcador para trás (issue #2751).
+        export_claimed_at: null,
       })
       .eq("organization_id", orgId)
       .eq("id", requestId);

@@ -48,7 +48,7 @@ Playwright 1 · Sentry 11 · WAHA 2026.7.2 (engine NOWEB) · Upstash Redis · Ve
   `lib/auth/politica-mfa.ts`.
 - **Filas** — event sourcing leve: `event_log` + workers drenados por cron. Trigger Postgres
   **nunca** faz HTTP.
-- **IA** — Vercel AI Gateway (Anthropic primário, OpenAI para embeddings), RAG por tenant,
+- **IA** — Vercel AI Gateway (Anthropic primário; embeddings pela OpenAI ou pelo Google, escolha da organização), RAG por tenant,
   guardrails before-send.
 - **Tempo real** — Supabase Realtime (`postgres_changes` para inbox/kanban, `broadcast` para
   sinais leves). **Storage** — bucket privado `whatsapp-media`, URL assinada.
@@ -67,8 +67,8 @@ flowchart LR
 ```
 
 Superfícies **não-cookie** (cada uma com guard próprio, nunca o cookie de sessão):
-`app/api/v1/cron/` (Bearer `INTERNAL_CRON_SECRET`, fail-closed), `app/api/internal/`
-(`x-internal-secret`), `app/api/mcp/` (Bearer `dsk_...` contra `api_tokens`), `app/api/v1/webhooks/`
+`app/api/v1/cron/` (Bearer `INTERNAL_CRON_SECRET`, fail-closed),
+`app/api/mcp/` (Bearer `dsk_...` contra `api_tokens`), `app/api/v1/webhooks/`
 (HMAC + path token), e **parte de `app/api/v1/`** — rotas que aceitam cookie OU bearer pelo helper
 `lib/api/auth-dual.ts`. Esta última cresce rota por rota (decisão do dono em 17/09/2026: converter
 o que cada integração precisar), então o inventário é um comando e não uma lista:
@@ -83,7 +83,7 @@ disparar. Entrada do turno em `lib/agent-engine/agent/inbound-turn.ts`; diagrama
 | Path | O quê |
 |---|---|
 | `app/api/v1/` | Route handlers REST (versionado por path) — **reconte, não cite**: `git ls-files 'app/api/v1/**/route.ts' \| wc -l` (e `git ls-files 'app/api/**/route.ts' \| wc -l` para o total de `app/api/**`) |
-| `app/api/internal/`, `app/api/mcp/`, `app/api/v1/cron/` | superfícies não-cookie (secret/bearer próprio) |
+| `app/api/mcp/`, `app/api/v1/cron/` | superfícies não-cookie (secret/bearer próprio) |
 | `app/app/` | UI autenticada do tenant · `app/admin/` UI de plataforma |
 | `app/actions/` | Server Actions (auth, onboarding, team, settings) |
 | `lib/agent-engine/`, `lib/ai/` | runtime do agente, guardrails, RAG, dispatcher |
@@ -113,7 +113,7 @@ Contrato completo em [`docs/specs/07-spec-events-workers.md`](docs/specs/07-spec
 | `lib/branding/`         | Marca própria (white-label) — resolve do banco, nunca do .env                                                   |
 | `workers/`              | Workers de `event_log` + crons                                                                                  |
 | `components/`, `hooks/` | React compartilhado; convenções nos README de cada pasta                                                        |
-| `supabase/migrations/`  | Schema versionado + `MANIFEST.md`; `supabase/baseline.sql` é o que o self-host aplica                           |
+| `supabase/migrations/`  | Schema versionado (`MANIFEST.md` = histórico); `supabase/baseline.sql` é o que o self-host aplica              |
 | `hostgator-setup-kit/`  | Kit de instalação/atualização da VPS (`install.sh`, `update.sh`, `diagnostico.sh`, `healthcheck.sh`)            |
 | `scripts/`              | CLIs de operação e QA — ver `scripts/README.md`                                                                 |
 | `tests/`                | `unit/`, `invariants/`, `e2e/`, `shell/`, `journeys/`, `fixtures/`                                              |
@@ -198,7 +198,9 @@ cite cada um:
 | Situação                                                                            | Guia                    |
 | ----------------------------------------------------------------------------------- | ----------------------- |
 | Instalar, atualizar ou consertar a instalação numa VPS; domínio, Supabase, WhatsApp | `deskcomm-instalar`     |
+| Usar o CRM no dia a dia; encontrar telas, fluxos e configurações pela interface     | `deskcomm-operacao`     |
 | Configurar o CRM para um cliente ou nicho: agentes, roteadores, follow-ups, base    | `deskcomm-cliente-novo` |
+| Revender como SaaS: planos, cobrança pela Stripe ou Asaas, régua, contrato          | `deskcomm-saas`         |
 | Desempenho, conversão, custo de IA, funil, relatório                                | `deskcomm-metricas`     |
 | O agente responde errado, passa tudo para humano, não usa a agenda; afinar o prompt | `deskcomm-prompt`       |
 | Contribuir: corrigir bug, abrir ou atualizar PR, migration, conflito com a `main`   | `deskcomm-contribuir`   |
@@ -244,8 +246,10 @@ em toda tabela tenant-aware. `lib/supabase/admin.ts` **bypassa RLS**: toda query
 filtra `organization_id` manualmente. Sem gate automático para isso — a responsabilidade é sua.
 
 **Migrations** — mudança de schema sai **sempre** como tripla: migration versionada em
-`supabase/migrations/`, apêndice idempotente em `supabase/baseline.sql` e linha em
-`supabase/migrations/MANIFEST.md`. Nunca edite migration já aplicada; corrija com uma nova.
+`supabase/migrations/` com uma linha `-- manifest: <o quê e por quê>` no cabeçalho, e apêndice
+idempotente em `supabase/baseline.sql`. **Não** acrescente linha no `MANIFEST.md`: ele é histórico,
+e era o arquivo que fazia todo PR com migration conflitar no GitHub. Nunca edite migration já
+aplicada; corrija com uma nova.
 Função nova em `public` precisa de `revoke execute ... from public, anon` **e** `grant` — são
 duas origens de `EXECUTE`.
 ⚠️ E **não leia o baseline com `grep` no arquivo inteiro**: ele é dump + apêndice, a mesma
@@ -301,6 +305,7 @@ server; segredo em query string; `throw` cru na borda da API.
 | `workers/agent-worker/main.ts`             | Entry point do worker de agente                                              |
 | `docker-compose.prod.yml`                  | Topologia de produção (imagens publicadas)                                   |
 | `docker-compose.traefik.yml`               | Labels de roteamento para VPS que já tem proxy próprio                       |
+| `docker-compose.cloudflared.yml`           | Cloudflare Tunnel (VPS atrás de NAT): sobe `cloudflared`, desliga o Caddy    |
 | `instrumentation.ts`, `sentry.*.config.ts` | Boot de observabilidade                                                      |
 
 ## Runtime/Tooling Preferences
@@ -328,6 +333,12 @@ server; segredo em query string; `throw` cru na borda da API.
   Esquecer o segundo `-f` recria o contêiner sem labels: o domínio inteiro responde `404` com o
   contêiner `healthy` (o healthcheck é um probe TCP interno). Runbook:
   [`docs/runbooks/deploy.md`](docs/runbooks/deploy.md).
+- **VPS atrás de NAT** — `REVERSE_PROXY=cloudflared` entra o
+  `docker-compose.cloudflared.yml`: desliga o Caddy e sobe o `cloudflared` (túnel
+  *remotely-managed*, só `CLOUDFLARE_TUNNEL_TOKEN` no `.env`; rotas no painel da Cloudflare).
+  Sem porta publicada. O webhook global do WAHA perde o 403 do Caddy; quem recusa o que chega
+  pela borda é o próprio app (`chegouPelaBorda`). Não é suportado no single-server (o instalador recusa). Ver
+  `docs/runbooks/deploy.md` §5.
 - **Env vars** — nova variável entra em `.env.example` **e** em `lib/env.ts`. Nunca leia nem logue
   valor de `.env*`; só `.env.example` é template. Segredo/token só em header, nunca em query string.
 - **Gerados — não edite** — `lib/database.types.ts`, `graphify-out/`, `pnpm-lock.yaml`, `.next/`.
@@ -405,7 +416,7 @@ sed -n '/^## Definition of Done/,/^Um staff engineer/p' CLAUDE.md | grep -cE '^[
 
 Em resumo: typecheck/lint zerados, testes relevantes verdes, RLS testada se tocou tabela
 tenant-aware, `audit()` se houve mutação, Zod em todo input externo, migration + baseline +
-MANIFEST de tripla se mudou schema, prova visual se mudou UI, `pnpm test:shell` se tocou packaging,
+`-- manifest:` da tripla se mudou schema, prova visual se mudou UI, `pnpm test:shell` se tocou packaging,
 Living System Checklist respondido (lei em `docs/doctrine/sistema-vivo.md`) e mapa vivo em
 `docs/architecture/` atualizado para peça nova.
 
@@ -432,7 +443,7 @@ itens envelhecem em ritmos diferentes, e o cabeçalho passava a mentir por todos
   inclusive. O número e a contagem que ficavam aqui eram de uma fotografia de agosto.
 - Rate limit HTTP: `lib/auth/rate-limit.ts` cobre **login, signup, recuperação de senha e
   aceite de convite** (contando por IP **e** por identificador hasheado); `checkRateLimit` cobre
-  o webhook de captação e o dispatcher de IA. **Crons seguem sem.** O MCP conta em dois pontos:
+  o webhook de captação e outros pontos de `app/` e `lib/` (a régua abaixo lista). **Crons seguem sem.** O MCP conta em dois pontos:
   a recusa de token, antes da autenticação (`lib/mcp/auth.ts`, #1449), e o teto de chamadas de
   token válido — por token, por organização e de escrita, Spec 11 §7 (`lib/mcp/rate-limit.ts`,
   #1446). Meça antes de agir:
@@ -474,6 +485,10 @@ itens envelhecem em ritmos diferentes, e o cabeçalho passava a mentir por todos
 - Nunca logue segredo, token, CPF, telefone ou e-mail. Sentry tem `beforeSend` que
   higieniza — não confie nele como única camada.
 - Não commite screenshot/dump com dado real de cliente.
+- Descadastro (STOP): quem bloqueia é só a regra de `lib/opt-out/deteccao.ts`, quando o próprio cliente
+  manda o STOP (não há bloqueio à mão no produto — `lib/channels/pos-entrada.ts` é o único escritor); o Jev
+  (`lib/ai/decisao/pedidos.ts`) só é perguntado onde ela disse não, e nunca bloqueia ninguém — no
+  máximo abre um aviso na Central ("Avisar a equipe").
 
 ## Packaging — se você tocou `Dockerfile*`, `docker-compose*.yml` ou `hostgator-setup-kit/`
 
@@ -483,7 +498,7 @@ Lei completa em [`docs/doctrine/packaging.md`](docs/doctrine/packaging.md). O n�
   declara `image:` de uma imagem publicada; `build:` só existe **ao lado**, como escape.
   Serviço `build:`-only é pulado por `docker compose pull` e imune a `up -d` sem `--build` —
   ele não é só caro de instalar, ele **nunca é atualizado**.
-- **Publicação é ato do CI**, nunca da sua máquina: build ARM local não roda na VPS amd64.
+- **Publicação é ato do CI**, nunca da sua máquina: as imagens publicadas atendem linux/amd64 e linux/arm64.
 - **Instalação de cliente aponta para número de versão**, nunca para tag móvel. Aqui `latest`
   significa **topo da `main`**, não última release — quem quer a última release usa `stable`.
 - **Dependência upstream é referenciada com tag fixa, nunca republicada** (WAHA é licenciado).
@@ -515,7 +530,7 @@ isto, a operação comum continua inteira?** O não-negociável:
 
 Vale a **Definition of Done em [`CLAUDE.md`](CLAUDE.md)** — conte lá em vez de confiar num número aqui (`sed -n '/^## Definition of Done/,/^Um staff engineer/p' CLAUDE.md | grep -cE '^[0-9]+\. '`; esta linha já disse 15 quando o DoD tinha 16). A régua tem que DELIMITAR a seção: a primeira versão desta linha oferecia `grep -c '^[0-9]\+\. \*\*' CLAUDE.md`, que devolve **25** — casa toda linha numerada em negrito do arquivo (anti-patterns, packaging, higiene de branches, migrations) e perde os itens 1–10 do próprio DoD, que não são negrito. Trocar o número pelo comando só ajuda se o comando responder à pergunta. Não declare pronto
 sem: typecheck/lint zerados, testes relevantes verdes, RLS testada se tocou tabela
-tenant-aware, migration + baseline + MANIFEST se mudou schema, prova visual se mudou UI, e a
+tenant-aware, migration (com `-- manifest:`) + baseline se mudou schema, prova visual se mudou UI, e a
 regra de packaging acima se mudou o artefato que o self-hoster instala.
 
 ## Guias do assistente (skills embutidas)
@@ -530,6 +545,7 @@ casar, mesmo que a pessoa não saiba que ele existe. Fora de um clone (ou num cl
 |---|---|
 | instalar, atualizar ou consertar a instalação numa VPS; domínio, Supabase, WhatsApp que não conecta | `deskcomm-instalar` |
 | configurar o CRM para um cliente ou nicho: agentes, roteadores, follow-ups, base de conhecimento | `deskcomm-cliente-novo` |
+| revender como SaaS: painel do dono, planos, cobrança pela Stripe ou pelo Asaas, régua, contrato com o cliente final | `deskcomm-saas` |
 | desempenho, conversão, custo de IA, funil, relatório | `deskcomm-metricas` |
 | o agente responde errado, passa tudo para humano, não usa a agenda; melhorar o prompt | `deskcomm-prompt` |
 | contribuir: corrigir bug, abrir ou atualizar PR, migration, conflito com a `main` | `deskcomm-contribuir` — que fica quieto quando `bash .agents/skills/deskcomm-contribuir/scripts/quem-sou.sh` responde `mantenedor` |

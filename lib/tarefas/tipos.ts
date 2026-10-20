@@ -27,6 +27,12 @@ export type PrioridadeDaTarefa = (typeof PRIORIDADES_DA_TAREFA)[number];
 export const SITUACOES_DA_TAREFA = ["pending", "in_progress", "done", "cancelled"] as const;
 export type SituacaoDaTarefa = (typeof SITUACOES_DA_TAREFA)[number];
 
+/** O negócio a que a tarefa está presa, como a lista o mostra. */
+export interface NegocioDaTarefa {
+  id: string;
+  title: string;
+}
+
 /** Uma linha de `crm_tasks`, como a API a devolve. */
 export interface Tarefa {
   id: string;
@@ -39,10 +45,22 @@ export interface Tarefa {
   status: SituacaoDaTarefa;
   lead_id: string | null;
   contact_id: string | null;
+  /**
+   * A demanda de atendimento que originou o combinado (#2818). Nula = tarefa
+   * avulsa ou presa só a negócio/contato. É o vínculo que faz a tarefa criada de
+   * dentro do inbox voltar para a tela de quem precisa cumpri-la.
+   */
+  demanda_id: string | null;
   assigned_to: string | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  /**
+   * Derivado (não é coluna): o negócio de `lead_id`, embutido pela rota para a
+   * lista de Tarefas dizer DE QUEM é a tarefa sem uma consulta por linha. Nulo
+   * quando a tarefa é avulsa — ou quando o negócio não está mais visível.
+   */
+  lead?: NegocioDaTarefa | null;
 }
 
 export interface NovaTarefa {
@@ -53,6 +71,8 @@ export interface NovaTarefa {
   status?: SituacaoDaTarefa;
   lead_id?: string | null;
   contact_id?: string | null;
+  /** A demanda do atendimento a que a tarefa fica presa (#2818). */
+  demanda_id?: string | null;
   assigned_to?: string | null;
 }
 
@@ -61,6 +81,26 @@ export type EdicaoDaTarefa = Partial<NovaTarefa>;
 /** Encerrada de qualquer das duas formas: feita ou desistida. */
 export function estaEncerrada(tarefa: Pick<Tarefa, "status">): boolean {
   return tarefa.status === "done" || tarefa.status === "cancelled";
+}
+
+/**
+ * O que a caixa da lista deve gravar quando alguém pede para concluir ou
+ * reabrir (#2549).
+ *
+ * A TELA decide "encerrada" com `estaEncerrada` — vale para `done` **e**
+ * `cancelled`, e por isso a tarefa cancelada mostra caixa marcada com o rótulo
+ * "Reabrir a tarefa". O hook antigo decidia olhando só `done`; no `cancelled`
+ * a condição era falsa e o clique gravava `done`, ou seja, a tarefa cancelada
+ * era reaberta para CONCLUÍDA e a rota de edição registrava "Tarefa concluída"
+ * na linha do tempo de um trabalho que ninguém fez.
+ *
+ * Aqui a decisão fica numa função pura ao lado de `estaEncerrada`, para que a
+ * tela e o cliente partilhem a MESMA regra e para que o teste prenda o caso
+ * sem montar hook, provider nem fetch: encerrada (`done` **ou** `cancelled`)
+ * volta para `pending`; o que ainda pede ação vira `done`.
+ */
+export function proximoEstadoAoAlternar(atual: SituacaoDaTarefa): SituacaoDaTarefa {
+  return estaEncerrada({ status: atual }) ? "pending" : "done";
 }
 
 /**
@@ -77,6 +117,34 @@ export function estaAtrasada(
   if (!tarefa.due_date) return false;
   if (estaEncerrada(tarefa)) return false;
   return new Date(tarefa.due_date).getTime() < agora.getTime();
+}
+
+/** O que o selo do card conta: o que ainda pede ação, e quanto disso já venceu. */
+export interface ResumoDasTarefas {
+  abertas: number;
+  atrasadas: number;
+}
+
+/**
+ * Conta as tarefas que ainda pedem ação e as que já passaram do prazo.
+ *
+ * A MESMA régua da lista (`estaEncerrada` e `estaAtrasada`), e não uma segunda:
+ * o selo do card e a faixa "Atrasadas" do dossiê olham a mesma tarefa, e se as
+ * duas contassem de jeitos diferentes o card diria "1 atrasada" sobre um
+ * negócio cuja lista não mostra nenhuma.
+ */
+export function resumoDasTarefas(
+  tarefas: readonly Pick<Tarefa, "due_date" | "status">[],
+  agora: Date = new Date(),
+): ResumoDasTarefas {
+  let abertas = 0;
+  let atrasadas = 0;
+  for (const tarefa of tarefas) {
+    if (estaEncerrada(tarefa)) continue;
+    abertas += 1;
+    if (estaAtrasada(tarefa, agora)) atrasadas += 1;
+  }
+  return { abertas, atrasadas };
 }
 
 /**

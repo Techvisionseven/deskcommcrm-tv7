@@ -88,10 +88,10 @@ describe("a paleta de etiquetas", () => {
   });
 
   it("⭐ a tela não pode ganhar um tom sem nome (nem perder um)", () => {
-    // A fileira renderiza a paleta da lib e rotula com o mapa do painel: um tom
-    // novo sem entrada no mapa deixa um botão sem rótulo acessível.
-    const painel = readFileSync(join(raiz, "app/app/settings/tags/_painel.tsx"), "utf8");
-    const bloco = painel.slice(painel.indexOf("const NOME_DO_TOM"));
+    // O mapa mora junto da paleta (lib) desde a #2718: um tom novo sem entrada
+    // em NOME_DO_TOM deixa um botão sem rótulo acessível na fileira.
+    const lib = readFileSync(join(raiz, "lib/tags/cor-da-etiqueta.ts"), "utf8");
+    const bloco = lib.slice(lib.indexOf("export const NOME_DO_TOM"));
     const mapa = bloco.slice(0, bloco.indexOf("};"));
     const tonsNoMapa = [...mapa.matchAll(/"?(#[0-9a-f]{6})"?:/g)].map((m) => m[1]!);
     expect(tonsNoMapa.sort()).toEqual([...PALETA_DE_ETIQUETAS].sort());
@@ -124,7 +124,7 @@ describe("etiquetasComCor / coresDoVocabulario", () => {
     tags: [
       "semente-antiga", // string: a forma da lista antes da 0264
       { tag: "vip", cor: "#0091ff" },
-      { tag: "  Obra  ", cor: "#E54D2E" }, // nome com espaço + caixa alta
+      { tag: "  Obra  ", cor: "#E35537" }, // nome com espaço + caixa alta
       { tag: "sem-cor" },
       { tag: "cor-torta", cor: "verde" },
       { cor: "#12a594" }, // sem nome
@@ -136,14 +136,14 @@ describe("etiquetasComCor / coresDoVocabulario", () => {
   it("devolve só o que TEM cor válida, com o nome aparado e a cor normalizada", () => {
     expect(etiquetasComCor(SETTINGS)).toEqual([
       { tag: "vip", cor: "#0091ff" },
-      { tag: "Obra", cor: "#e54d2e" },
+      { tag: "Obra", cor: "#e35537" },
     ]);
   });
 
   it("o mapa usa a MESMA chave canônica do filtro (minúscula, sem espaço)", () => {
     // "Obra" na conversa e "obra" no vocabulário são a mesma etiqueta: sem a
     // chave canônica uma delas sairia cinza.
-    expect(coresDoVocabulario(SETTINGS)).toEqual({ vip: "#0091ff", obra: "#e54d2e" });
+    expect(coresDoVocabulario(SETTINGS)).toEqual({ vip: "#0091ff", obra: "#e35537" });
     expect(chaveDaEtiqueta("  VIP  ")).toBe("vip");
   });
 

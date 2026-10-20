@@ -28,6 +28,10 @@ const ORG = "22222222-2222-4222-8222-222222222222";
 const XISTAO: PerfilDoPais = {
   codigo: "XI",
   nome: "Xistão",
+  // País sintético declara os SEUS rótulos de organização (#1946, item 4).
+  empresa: { rotuloNomeLegal: "Razão do Xistão", rotuloNumero: "Registro do Xistão" },
+  // País sintético declara os SEUS papéis legais (#2344).
+  papel: { controlador: "Controlador do Xistão", encarregado: "Encarregado do Xistão" },
   documento: {
     rotulo: "Bilhete",
     exemplo: "123456789XI000",
@@ -38,6 +42,9 @@ const XISTAO: PerfilDoPais = {
     valida: (valor) => /^\d{9}[A-Z]{2}\d{3}$/.test(valor),
     normaliza: (valor) => valor.toUpperCase().replace(/[^0-9A-Z]/g, ""),
   },
+  telefoneExemplo: "+999000000000",
+  idioma: "xi-XI",
+  fusoDoSugerido: "UTC",
   lei: { nome: "Lei do Xistão", numero: "Lei nº 1/2020", artigo: "Art. 5º", revisada: false },
   calendario: { feriados: [], rotulo: "feriados do Xistão" },
   padroesDePii: [
@@ -53,6 +60,10 @@ const XISTAO: PerfilDoPais = {
 const REVISADOLANDIA: PerfilDoPais = {
   codigo: "RV",
   nome: "Revisadolândia",
+  // País sintético declara os SEUS rótulos de organização (#1946, item 4).
+  empresa: { rotuloNomeLegal: "Razão de Revisadolândia", rotuloNumero: "Registro de Revisadolândia" },
+  // País sintético declara os SEUS papéis legais (#2344).
+  papel: { controlador: "Controlador de Revisadolândia", encarregado: "Encarregado de Revisadolândia" },
   documento: {
     rotulo: "Documento",
     exemplo: "000000000",
@@ -63,6 +74,9 @@ const REVISADOLANDIA: PerfilDoPais = {
     valida: (valor) => /^\d{9}$/.test(valor),
     normaliza: (valor) => valor.replace(/\D/g, ""),
   },
+  telefoneExemplo: "+999000000000",
+  idioma: "rv-RV",
+  fusoDoSugerido: "UTC",
   lei: { nome: "Lei de Revisadolândia", numero: "Lei nº 2/2021", artigo: "Art. 9º", revisada: true },
   calendario: { feriados: [], rotulo: "feriados de Revisadolândia" },
   padroesDePii: [],

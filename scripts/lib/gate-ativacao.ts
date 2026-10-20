@@ -23,6 +23,7 @@ import {
   type DecisaoDeElegibilidade,
 } from "../../lib/ai/elegibilidade/gate";
 import { lerModoDeAcessoDaIa } from "../../lib/ai/elegibilidade/pre-go-live";
+import { STATUS_OPERANTE } from "../../lib/organizacao/operante";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tipos
@@ -147,9 +148,13 @@ function estado(
   agora: Date,
 ) {
   return montarEstadoDeElegibilidade({
+    // O preflight simula as regras do canal e do contato; a organização não é a variável aqui.
+    orgStatus: STATUS_OPERANTE,
     aiGate: par.ai_gate,
     aiGateMode: par.ai_gate_mode,
     forceHuman: r.force_human,
+    // Linha sintética do preflight (issue 2379): sem contato real não há marca permanente.
+    aiOptOut: r.ai_opt_out === true,
     assigneeKind: (r.assignee_kind as string | null) ?? null,
     botSilencedUntil: r.bot_silenced_until as string | null,
     aiAuthorizedAt: r.ai_authorized_at as string | null,
@@ -174,6 +179,7 @@ function parDepoisDoApply(ctx: CtxAtivacao): { ai_gate: unknown; ai_gate_mode: u
 function linhaSimulada(aiAuthorizedAt: string | null): Record<string, unknown> {
   return {
     force_human: false,
+    ai_opt_out: false,
     assignee_kind: "ai",
     bot_silenced_until: null,
     ai_authorized_at: aiAuthorizedAt,

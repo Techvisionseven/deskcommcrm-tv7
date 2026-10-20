@@ -8,11 +8,29 @@
 import { z } from "zod";
 
 import { LIMITE_FILTROS, LIMITE_LINHAS, LIMITE_PADRAO_DA_GRADE, LIMITE_RESPOSTA_BYTES } from "./limites";
+import { fontesSchema, MODOS_DE_FONTES } from "./fontes";
 
 /** Espelha o CHECK de `external_db_connections.ssl_mode` e `ModoTls`. */
 export const MODOS_TLS = ["disable", "prefer", "require", "verify-ca", "verify-full"] as const;
 
 const modoTls = z.enum(MODOS_TLS);
+
+/**
+ * Qual dado do contato identifica o cliente numa tabela do banco externo.
+ * Espelha o CHECK de `external_db_connections.customer_key_kind`.
+ */
+export const TIPOS_DE_IDENTIFICADOR = ["phone", "email"] as const;
+export type TipoDeIdentificador = (typeof TIPOS_DE_IDENTIFICADOR)[number];
+
+/** Espelha o CHECK de `external_db_connections.db_type` e `TipoBanco`. */
+export const TIPOS_DE_BANCO = ["postgres", "mysql"] as const;
+/** O que a API aceita CRIAR hoje: só os motores com driver instalado. O MySQL entra aqui na Fatia 4a-2. */
+export const TIPOS_DE_BANCO_ACEITOS = ["postgres"] as const;
+
+/** Porta padrão de cada motor. */
+export function portaPadraoDoMotor(tipo: (typeof TIPOS_DE_BANCO)[number]): number {
+  return tipo === "mysql" ? 3306 : 5432;
+}
 
 const camposDeConexao = {
   label: z.string().trim().min(1).max(80),
@@ -31,6 +49,28 @@ const camposDeConexao = {
     .int()
     .min(LIMITE_RESPOSTA_BYTES.minimo)
     .max(LIMITE_RESPOSTA_BYTES.maximo),
+  /**
+   * A coluna que identifica o cliente e o dado do contato que ela guarda. Os
+   * dois juntos ou nenhum (o CHECK do banco diz o mesmo): sem eles, a consulta
+   * do agente durante a conversa segue sem o filtro do cliente.
+   */
+  customer_key_column: z.string().trim().min(1).max(128).nullable(),
+  customer_key_kind: z.enum(TIPOS_DE_IDENTIFICADOR).nullable(),
+};
+
+/** Coluna e tipo andam juntos: um sem o outro não identifica ninguém. */
+function chaveDoClienteCompleta(v: {
+  customer_key_column?: string | null;
+  customer_key_kind?: string | null;
+}): boolean {
+  const coluna = v.customer_key_column;
+  const tipo = v.customer_key_kind;
+  return (coluna === undefined) === (tipo === undefined) && (coluna == null) === (tipo == null);
+}
+
+const CHAVE_INCOMPLETA = {
+  path: ["customer_key_column"],
+  message: "customer_key_column e customer_key_kind vêm juntos, ou nenhum dos dois",
 };
 
 /** Criação: exige os campos essenciais; porta, TLS e `enabled` têm default. */
@@ -38,7 +78,8 @@ export const criarConexaoSchema = z
   .object({
     label: camposDeConexao.label,
     host: camposDeConexao.host,
-    port: camposDeConexao.port.default(5432),
+    port: camposDeConexao.port.optional(),
+    db_type: z.enum(TIPOS_DE_BANCO_ACEITOS).default("postgres"),
     database_name: camposDeConexao.database_name,
     username: camposDeConexao.username,
     password: camposDeConexao.password,
@@ -47,8 +88,12 @@ export const criarConexaoSchema = z
     max_rows: camposDeConexao.max_rows.default(LIMITE_LINHAS.padrao),
     max_filters: camposDeConexao.max_filters.default(LIMITE_FILTROS.padrao),
     max_response_bytes: camposDeConexao.max_response_bytes.default(LIMITE_RESPOSTA_BYTES.padrao),
+    customer_key_column: camposDeConexao.customer_key_column.default(null),
+    customer_key_kind: camposDeConexao.customer_key_kind.default(null),
   })
-  .strict();
+  .strict()
+  .refine(chaveDoClienteCompleta, CHAVE_INCOMPLETA)
+  .transform((v) => ({ ...v, port: v.port ?? portaPadraoDoMotor(v.db_type) }));
 
 /**
  * Atualização parcial. `password` é opcional: ausente = não mexer na senha
@@ -67,8 +112,11 @@ export const atualizarConexaoSchema = z
     max_rows: camposDeConexao.max_rows.optional(),
     max_filters: camposDeConexao.max_filters.optional(),
     max_response_bytes: camposDeConexao.max_response_bytes.optional(),
+    customer_key_column: camposDeConexao.customer_key_column.optional(),
+    customer_key_kind: camposDeConexao.customer_key_kind.optional(),
   })
-  .strict();
+  .strict()
+  .refine(chaveDoClienteCompleta, CHAVE_INCOMPLETA);
 
 /**
  * Leitura paginada. Sem FILTRO de propósito: filtro carrega VALOR, valor carrega
@@ -84,5 +132,17 @@ export const leituraQuerySchema = z
     order_desc: z.enum(["true", "false", "1", "0"]).optional(),
     /** Projeção separada por vírgula. Vazio = todas as colunas. */
     colunas: z.string().max(4000).optional(),
+  })
+  .strict();
+
+/**
+ * Troca das fontes liberadas: o modo E a lista inteira de uma vez (um UPDATE
+ * atômico, sem estado pela metade). `strict` porque uma chave desconhecida aqui
+ * é um cliente falando de um contrato que não existe.
+ */
+export const atualizarFontesSchema = z
+  .object({
+    source_mode: z.enum(MODOS_DE_FONTES),
+    sources: fontesSchema,
   })
   .strict();
