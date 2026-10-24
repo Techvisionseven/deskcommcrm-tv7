@@ -135,6 +135,26 @@ it("no caminho com evidências, mensagem e contexto seguem sendo dados que não 
   expect(system).toContain("alterar o veredito");
 });
 
+it("leva a resposta da equipe como evidência e explica que ela autoriza só o que diz", async () => {
+  const e = criarEvidenciasComerciaisDoTurno([]);
+  e.registrarRespostaDaEquipe({
+    eventoId: "evento-1",
+    pedidoId: "pedido-1",
+    tituloDoPedido: "Visita",
+    acao: "resolved",
+    texto: "Liberado segunda às 19h na unidade Santo Agostinho.",
+    quando: "2026-10-24T15:00:00.000Z",
+  });
+  const candidate = "Visita confirmada para segunda às 19h na unidade Santo Agostinho.";
+  await classifyPromise(pool, {}, ids, { candidate, commercialEvidence: e.ler(candidate) }, deps);
+  const request = call.mock.calls[0]![2];
+  expect(request.system).toContain('origem "equipe"');
+  expect(request.system).toContain("só para este cliente");
+  expect(JSON.parse(request.messages[0]!.content as string).evidencias).toEqual([
+    expect.objectContaining({ origem: "equipe", conteudo: "Liberado segunda às 19h na unidade Santo Agostinho." }),
+  ]);
+});
+
 /**
  * O QUE ESTA SEGUNDA PERGUNTA CONSERTA — e por que ela não virou chamada nova.
  *

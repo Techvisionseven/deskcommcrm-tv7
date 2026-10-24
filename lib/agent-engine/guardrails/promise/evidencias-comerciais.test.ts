@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   carregarFontesQueProvamOferta,
+  carregarRespostasDaEquipe,
   criarEvidenciasComerciaisDoTurno,
   fontesQueProvamOferta,
+  type RespostaDaEquipe,
 } from "./evidencias-comerciais";
 
 const produto = {
@@ -190,5 +192,102 @@ describe("qual material do agente pode provar uma oferta", () => {
       await carregarFontesQueProvamOferta(db, "org-1", ["fonte-faq", "fonte-conversas"]),
     ).toEqual(["fonte-faq"]);
     expect(chamadas).toEqual([["org-1", ["fonte-faq", "fonte-conversas"]]]);
+  });
+});
+
+describe("resposta da equipe a um pedido da conversa", () => {
+  const resposta: RespostaDaEquipe = {
+    eventoId: "evento-1",
+    pedidoId: "pedido-1",
+    tituloDoPedido: "Visita: Dr. Emerson, segunda à noite",
+    acao: "resolved",
+    texto: "Liberado segunda às 19h na unidade Santo Agostinho.",
+    quando: "2026-10-24T15:00:00.000Z",
+  };
+
+  it("vira evidência da equipe com o texto inteiro, o pedido e quando", () => {
+    const e = criarEvidenciasComerciaisDoTurno([]);
+    e.registrarRespostaDaEquipe(resposta);
+    expect(e.ler()).toEqual([
+      {
+        origem: "equipe",
+        referencia: "pedido-1:evento-1",
+        titulo:
+          'Resposta da equipe no pedido "Visita: Dr. Emerson, segunda à noite" (2026-10-24T15:00:00.000Z)',
+        conteudo: "Liberado segunda às 19h na unidade Santo Agostinho.",
+      },
+    ]);
+  });
+
+  it("diz quando o texto é um pedido ao cliente e ignora resposta vazia", () => {
+    const e = criarEvidenciasComerciaisDoTurno([]);
+    e.registrarRespostaDaEquipe({ ...resposta, eventoId: "vazio", texto: "   " });
+    e.registrarRespostaDaEquipe({
+      ...resposta,
+      eventoId: "evento-2",
+      acao: "need_lead_info",
+      texto: "Pergunte o nome completo para a visita de segunda às 19h.",
+    });
+    expect(e.ler()).toHaveLength(1);
+    expect(e.ler()[0]!.titulo).toMatch(/^Pedido da equipe ao cliente no pedido/);
+  });
+
+  it("não é expulsa por um catálogo ou material amplo", () => {
+    const e = criarEvidenciasComerciaisDoTurno(["fonte-a"]);
+    e.registrarRespostaDaEquipe(resposta);
+    e.registrarConhecimento({
+      results: Array.from({ length: 30 }, (_, i) => ({
+        chunk_id: `politica-${i}`,
+        knowledge_source_id: "fonte-a",
+        content: "Visita às unidades com a equipe. " + "x".repeat(900),
+      })),
+    });
+    e.registrarCatalogo({
+      produtos: Array.from({ length: 40 }, (_, i) => ({
+        ...produto,
+        codigo: `P-${i}`,
+        descricao: "x".repeat(900),
+      })),
+    });
+    const pacote = e.ler("Visita confirmada para segunda às 19h na unidade Santo Agostinho.");
+    expect(pacote[0]).toMatchObject({ origem: "equipe", conteudo: resposta.texto });
+    expect(JSON.stringify(pacote).length).toBeLessThanOrEqual(16_000);
+  });
+
+  it("lê só a organização e a conversa do turno, com as ações que voltam ao cliente", async () => {
+    const chamadas: { sql: string; valores: unknown[] }[] = [];
+    const db = {
+      query: async (sql: string, valores?: unknown[]) => {
+        chamadas.push({ sql, valores: valores ?? [] });
+        return {
+          rows: [
+            {
+              evento_id: "evento-1",
+              pedido_id: "pedido-1",
+              titulo: "Visita",
+              acao: "resolved",
+              texto: "Liberado segunda às 19h.",
+              quando: new Date("2026-10-24T15:00:00.000Z"),
+            },
+          ],
+        };
+      },
+    } as unknown as Parameters<typeof carregarRespostasDaEquipe>[0];
+    expect(await carregarRespostasDaEquipe(db, "org-1", "conversa-1")).toEqual([
+      {
+        eventoId: "evento-1",
+        pedidoId: "pedido-1",
+        tituloDoPedido: "Visita",
+        acao: "resolved",
+        texto: "Liberado segunda às 19h.",
+        quando: "2026-10-24T15:00:00.000Z",
+      },
+    ]);
+    expect(chamadas).toHaveLength(1);
+    expect(chamadas[0]!.valores.slice(0, 2)).toEqual(["org-1", "conversa-1"]);
+    expect(chamadas[0]!.sql).toContain("e.organization_id = $1");
+    expect(chamadas[0]!.sql).toContain("c.organization_id = e.organization_id");
+    expect(chamadas[0]!.sql).toContain("e.actor_kind = 'human'");
+    expect(chamadas[0]!.sql).toContain("('resolved', 'need_lead_info')");
   });
 });

@@ -2,9 +2,14 @@
  * Evidências já consultadas pelo servidor NESTE turno. Não são uma lista de
  * exceções: o classificador continua lendo a candidata inteira e suas condições.
  * Não recebe histórico, notas do contato, prompt do agente ou argumentos de tool.
+ *
+ * `equipe` é a resposta que uma PESSOA da empresa deu a um pedido aberto NESTA
+ * conversa (`agent_case_events`, `human_replied`). Sem ela, a equipe liberava o
+ * horário da visita e o agente era vetado ao repassá-lo, porque nenhum material
+ * diz "segunda às 19h para este cliente". Só a pessoa autoriza isso.
  */
 export interface EvidenciaComercial {
-  origem: "catalogo" | "conhecimento";
+  origem: "catalogo" | "conhecimento" | "equipe";
   referencia: string;
   titulo: string;
   conteudo: string;
@@ -47,6 +52,63 @@ export async function carregarFontesQueProvamOferta(
     [tenantId, fontesDoAgente],
   );
   return fontesQueProvamOferta(rows);
+}
+
+/** Uma resposta da equipe a um pedido desta conversa, como o banco a guardou. */
+export interface RespostaDaEquipe {
+  eventoId: string;
+  pedidoId: string;
+  tituloDoPedido: string;
+  /** `resolved` (concluiu) ou `need_lead_info` (pediu algo ao cliente). */
+  acao: string;
+  texto: string;
+  quando: string;
+}
+
+const MAX_RESPOSTAS_DA_EQUIPE = 5;
+const JANELA_DAS_RESPOSTAS_DA_EQUIPE_DIAS = 30;
+
+/**
+ * As últimas respostas da equipe aos pedidos DESTA conversa. Org e conversa vêm
+ * da linha do job, nunca do modelo. `escalate` fica de fora: ali a conversa
+ * passou para uma pessoa, e o texto é para ela, não para o cliente.
+ */
+export async function carregarRespostasDaEquipe(
+  db: Queryable,
+  tenantId: string,
+  conversationId: string,
+): Promise<RespostaDaEquipe[]> {
+  const { rows } = await db.query<{
+    evento_id: string;
+    pedido_id: string;
+    titulo: string;
+    acao: string;
+    texto: string;
+    quando: Date | string;
+  }>(
+    `select e.id::text as evento_id, c.id::text as pedido_id, c.title as titulo,
+            e.human_action as acao, e.body as texto, e.created_at as quando
+       from agent_case_events e
+       join agent_cases c on c.id = e.case_id and c.organization_id = e.organization_id
+      where e.organization_id = $1
+        and c.conversation_id = $2
+        and e.kind = 'human_replied'
+        and e.actor_kind = 'human'
+        and e.human_action in ('resolved', 'need_lead_info')
+        and btrim(coalesce(e.body, '')) <> ''
+        and e.created_at > now() - make_interval(days => $3)
+      order by e.created_at desc
+      limit $4`,
+    [tenantId, conversationId, JANELA_DAS_RESPOSTAS_DA_EQUIPE_DIAS, MAX_RESPOSTAS_DA_EQUIPE],
+  );
+  return rows.map((r) => ({
+    eventoId: r.evento_id,
+    pedidoId: r.pedido_id,
+    tituloDoPedido: r.titulo,
+    acao: r.acao,
+    texto: r.texto,
+    quando: new Date(r.quando).toISOString(),
+  }));
 }
 
 const MAX_EVIDENCIAS = 20;
@@ -147,9 +209,28 @@ export function criarEvidenciasComerciaisDoTurno(fontesHabilitadas: readonly str
     }
   }
 
+  /**
+   * A resposta da equipe vale como evidência só com o texto que a pessoa
+   * escreveu, o pedido a que respondeu e quando. O título diz o que ela é,
+   * para o classificador não a confundir com política geral.
+   */
+  function registrarRespostaDaEquipe(resposta: RespostaDaEquipe) {
+    const corpo = texto(resposta.texto);
+    if (!corpo) return;
+    const tipo =
+      resposta.acao === "need_lead_info" ? "Pedido da equipe ao cliente" : "Resposta da equipe";
+    guardar({
+      origem: "equipe",
+      referencia: `${resposta.pedidoId}:${resposta.eventoId}`,
+      titulo: `${tipo} no pedido "${resposta.tituloDoPedido}" (${resposta.quando})`,
+      conteudo: corpo,
+    });
+  }
+
   return {
     registrarConhecimento,
     registrarCatalogo,
+    registrarRespostaDaEquipe,
     // Relevância escolhe o CONTEXTO, nunca concede autorização. O classificador
     // recebe os trechos completos, inclusive condições/negações, e decide.
     ler: (candidata = ""): EvidenciaComercial[] => {
@@ -182,8 +263,9 @@ export function criarEvidenciasComerciaisDoTurno(fontesHabilitadas: readonly str
       }
       // Reserva mínima para cada origem: política e produto complementam-se.
       // O restante segue a relevância global, sem duplicar ou truncar itens.
+      // A equipe vem primeiro: é a única que decide algo para ESTE cliente.
       for (let i = 0; i < 3; i++)
-        for (const origem of ["conhecimento", "catalogo"] as const) {
+        for (const origem of ["equipe", "conhecimento", "catalogo"] as const) {
           const item = ordenadas.filter(({ e }) => e.origem === origem)[i];
           if (item) adicionar(item.e);
         }
