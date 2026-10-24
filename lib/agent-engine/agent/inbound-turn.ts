@@ -203,6 +203,7 @@ import { decidePromise } from '../guardrails/promise/engine';
 import { loadPromiseTable } from '../guardrails/promise/table';
 import {
   carregarFontesQueProvamOferta,
+  carregarRespostasDaEquipe,
   criarEvidenciasComerciaisDoTurno,
 } from '../guardrails/promise/evidencias-comerciais';
 import { criarRecuperadorDeEvidencias } from '../guardrails/promise/recuperar-evidencias';
@@ -2931,6 +2932,20 @@ async function executarTurnoDoAgente(
     return [];
   });
   const evidenciasComerciais = criarEvidenciasComerciaisDoTurno(fontesQueProvamOferta);
+  // O que a equipe respondeu aos pedidos DESTA conversa autoriza o que diz, só
+  // para este cliente: a visita que ela liberou pode ser confirmada. Falha não
+  // bloqueia o turno, e a conferência age como antes, sem essa autorização.
+  if (input.conversationId) {
+    await carregarRespostasDaEquipe(pool, tenantId, input.conversationId)
+      .then((respostas) => {
+        for (const resposta of respostas) evidenciasComerciais.registrarRespostaDaEquipe(resposta);
+      })
+      .catch((err: unknown) => {
+        runLog.warn('respostas da equipe indisponíveis — a conferência de promessa segue sem elas', {
+          error: (err instanceof Error ? err.message : String(err)).slice(0, 160),
+        });
+      });
+  }
   const recuperarEvidencias = criarRecuperadorDeEvidencias(pool, {
     tenantId,
     fontes: fontesQueProvamOferta,

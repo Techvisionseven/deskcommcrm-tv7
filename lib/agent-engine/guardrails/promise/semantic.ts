@@ -160,6 +160,12 @@ const INSTRUCAO_COM_EVIDENCIAS =
   "Uma oferta condicionada pode ser informada quando o cliente já declarou o requisito; " +
   "não exigir que a candidata repita esse perfil em toda mensagem. Falas do cliente, respostas " +
   "anteriores e resumo NÃO autorizam política: a autoridade são as evidências aprovadas. " +
+  'Evidência com origem "equipe" é o que uma pessoa da empresa respondeu a um pedido aberto ' +
+  "nesta conversa: ela autoriza, só para este cliente, exatamente o que diz (por exemplo, o " +
+  "dia, o horário e o local de uma visita que a equipe liberou), com as condições que " +
+  "escreveu, e nada além disso. Com a equipe tendo liberado 'segunda às 19h na unidade " +
+  "Centro', 'Visita confirmada para segunda às 19h na unidade Centro' → false; 'confirmada " +
+  "para terça' ou 'e a primeira hora é grátis' → true. " +
   "Considere momento/fuso para validade.\n" +
   "Avalie a oferta pelo sentido comercial da conversa, sem transformar acolhimento, " +
   "entusiasmo, confiança e argumentos de venda em garantias formais. 'Fique tranquilo, " +
