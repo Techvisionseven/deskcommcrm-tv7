@@ -26,11 +26,15 @@ import { z } from "zod";
 
 import {
   encerrarChamadoPeloAgente,
+  reavisarCasoNaCentral,
   registrarNotaDoAgente,
   type DesfechoDoChamado,
 } from "@/lib/agent-engine/agent/human-cases";
 import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
 import { audit } from "@/lib/audit";
+import { traduzir } from "@/lib/i18n/dicionario";
+import { normalizarIdioma } from "@/lib/i18n/idiomas";
+import { logger } from "@/lib/logger";
 import { carregarRosterDeAtendimento, podeAssumirAgora } from "@/lib/escalacao/atendentes";
 import { lerChamado, listarChamados, type ConversasVisiveis } from "@/lib/escalacao/chamados";
 import { lerContinuidadeHumana } from "@/lib/escalacao/continuidade";
@@ -237,9 +241,73 @@ export const crmGetHumanCase: McpToolDefinition<typeof chamadoInputShape> = {
 // crm_add_case_note
 // ---------------------------------------------------------------------------
 
+/**
+ * A nota é a forma de um pedido novo entrar num caso já aberto (só cabe um por
+ * conversa), e por isso ela também tem de chegar à Central: ver
+ * `reavisarCasoNaCentral`. Melhor esforço — a nota já está gravada, e um aviso
+ * que falhou não pode desfazê-la nem derrubar o turno.
+ */
+async function avisarNovidadeDoCaso(organizationId: string, caseId: string): Promise<void> {
+  const pool = getRequestPool();
+  try {
+    const { rows } = await pool.query<{ locale: string | null }>(
+      "select locale from organizations where id = $1",
+      [organizationId],
+    );
+    const idioma = normalizarIdioma(rows[0]?.locale);
+    await reavisarCasoNaCentral(pool, organizationId, caseId, {
+      titulo: traduzir("Novidade num caso da IA", idioma),
+      corpo: traduzir(
+        "A IA acrescentou um pedido ou uma informação ao caso. Abra o caso para ver e responder.",
+        idioma,
+      ),
+    });
+  } catch (err) {
+    logger.warn("[mcp] crm_add_case_note: aviso da novidade não entrou na Central", {
+      organizationId,
+      caseId,
+      erro: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 const notaInputShape = {
   case_id: z.string().uuid(),
-  note: z.string().trim().min(1).max(4000),
+  note: z
+    .string()
+    .trim()
+    .min(1)
+    .max(4000)
+    .describe(
+      "o FATO novo desde a última nota, com data e hora resolvidas (ex.: 'pediu visita na terça 27/10 à noite')",
+    ),
+  title: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      "o título do chamado reescrito, só quando o assunto mudou ou cresceu (ex.: 'Proposta de dois turnos e visita na terça à noite')",
+    ),
+  summary: z
+    .string()
+    .trim()
+    .min(1)
+    .max(4000)
+    .optional()
+    .describe(
+      "'O que o cliente precisa' reescrito por inteiro, como está AGORA: todos os pedidos em aberto, não só o novo",
+    ),
+  blocker: z
+    .string()
+    .trim()
+    .min(1)
+    .max(1000)
+    .optional()
+    .describe(
+      "'Por que a IA travou' reescrito: o que ainda depende da equipe AGORA, em todos os pedidos em aberto — o que o pedido anterior ainda espera continua aqui; tire só o que já foi resolvido",
+    ),
 };
 
 export const crmAddCaseNote: McpToolDefinition<typeof notaInputShape> = {
@@ -247,7 +315,10 @@ export const crmAddCaseNote: McpToolDefinition<typeof notaInputShape> = {
   description:
     "Registra no caso ABERTO o que aconteceu depois da abertura (kind='agent_noted', " +
     "actor_kind='agent'). Recusa caso já fechado ou de outra org. Escreva o FATO novo, não a " +
-    "repetição do bloqueio — quem lê é o próximo atendente.",
+    "repetição do bloqueio — quem lê é o próximo atendente. Só cabe um caso aberto por conversa: " +
+    "quando o cliente pede outra coisa ou resolve parte do que estava pendente, mande também " +
+    "`summary` e `blocker` reescritos com o quadro ATUAL (e `title`, se o assunto mudou), senão " +
+    "o topo do caso segue descrevendo o pedido antigo. A equipe recebe um aviso na Central.",
   inputSchema: notaInputShape,
   category: "write",
   requiresRole: "agent",
@@ -258,9 +329,14 @@ export const crmAddCaseNote: McpToolDefinition<typeof notaInputShape> = {
       ctx.organizationId,
       input.case_id,
       input.note,
+      { title: input.title, summary: input.summary, blocker: input.blocker },
     );
     if (!registrado) throw new Error("case_not_open");
+    await avisarNovidadeDoCaso(ctx.organizationId, input.case_id);
 
+    const atualizados = (["title", "summary", "blocker"] as const).filter(
+      (campo) => input[campo] !== undefined,
+    );
     const a = actorAudit(ctx);
     await audit({
       action: "ai.case_noted_by_agent",
@@ -270,13 +346,17 @@ export const crmAddCaseNote: McpToolDefinition<typeof notaInputShape> = {
       resourceType: "agent_case",
       resourceId: input.case_id,
       requestId: ctx.requestId,
-      metadata: { ...a.metadataActor, via: "mcp" },
+      metadata: { ...a.metadataActor, via: "mcp", campos_atualizados: atualizados },
     });
 
     return {
       case_id: input.case_id,
       recorded: true,
-      next_action: "Registro salvo no chamado; o próximo atendente vai ler isto.",
+      updated_fields: atualizados,
+      next_action:
+        atualizados.length > 0
+          ? "Registro salvo e topo do chamado atualizado; a equipe foi avisada na Central."
+          : "Registro salvo no chamado; o próximo atendente vai ler isto. Se o pedido mudou, mande também summary e blocker atualizados.",
     };
   },
 };

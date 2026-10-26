@@ -153,3 +153,29 @@ export function caseEventLabel(
   }
   return EVENT_LABEL[event.kind] ?? "Atualização do caso";
 }
+
+/**
+ * O que a IA registrou no caso DEPOIS da última palavra da equipe — a novidade
+ * que o topo do caso tem de mostrar.
+ *
+ * Título, "O que o cliente precisa" e "Por que a IA travou" são escritos uma vez,
+ * na abertura. Como só cabe um caso aberto por conversa, o pedido novo do cliente
+ * (a visita pedida depois da proposta, por exemplo) entra como nota, e a nota
+ * ficava só no pé da linha do tempo, abaixo de um resumo que já não era verdade.
+ *
+ * `null` quando não há nota da IA ou quando a equipe já respondeu depois dela:
+ * aí não é mais novidade para quem abre o caso. Os eventos chegam em ordem de
+ * criação (`lerChamado`).
+ */
+export function novidadeDaIA(
+  events: ReadonlyArray<Pick<CaseEvent, "kind" | "actor_kind" | "body" | "created_at">>,
+): { body: string; created_at: string } | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i]!;
+    if (ev.kind === "human_replied") return null;
+    if (ev.kind === "agent_noted" && ev.actor_kind === "agent" && ev.body?.trim()) {
+      return { body: ev.body.trim(), created_at: ev.created_at };
+    }
+  }
+  return null;
+}

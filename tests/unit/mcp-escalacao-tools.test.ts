@@ -27,10 +27,12 @@ vi.mock("@/lib/audit", () => ({ audit: vi.fn().mockResolvedValue(undefined) }));
 
 const consultasNoPool: Array<{ sql: string; params: unknown[] }> = [];
 let linhasAfetadas = 1;
+let consultaQueFalha: ((sql: string) => boolean) | null = null;
 vi.mock("@/lib/agent-engine/db/request-pool", () => ({
   getRequestPool: () => ({
     query: (sql: string, params: unknown[]) => {
       consultasNoPool.push({ sql, params });
+      if (consultaQueFalha?.(sql)) return Promise.reject(new Error("banco fora"));
       return Promise.resolve({ rows: [], rowCount: linhasAfetadas });
     },
   }),
@@ -397,11 +399,74 @@ describe("crm_add_case_note", () => {
     )) as { recorded: boolean };
 
     expect(res.recorded).toBe(true);
-    const sql = consultasNoPool.at(-1)!.sql;
-    expect(sql).toContain("'agent_noted'");
-    expect(sql).toContain("'agent'");
-    expect(sql).not.toContain("human_replied");
-    expect(consultasNoPool.at(-1)!.params).toContain("O cliente respondeu que aceita 12%.");
+    // A nota é a PRIMEIRA consulta; depois dela vêm o idioma e o aviso na Central.
+    const nota = consultasNoPool.find((q) => q.sql.includes("insert into agent_case_events"))!;
+    expect(nota.sql).toContain("'agent_noted'");
+    expect(nota.sql).toContain("'agent'");
+    expect(nota.sql).not.toContain("human_replied");
+    expect(nota.params).toContain("O cliente respondeu que aceita 12%.");
+  });
+
+  it("nota sem resumo nem bloqueio não reescreve o topo do chamado", async () => {
+    consultasNoPool.length = 0;
+    linhasAfetadas = 1;
+    const res = (await crmAddCaseNote.handler(
+      { case_id: CHAMADO, note: "Pediu para ver as fotos de novo." },
+      fazerCtx(() => ({ data: null })),
+    )) as { updated_fields: string[] };
+
+    expect(res.updated_fields).toEqual([]);
+    const nota = consultasNoPool.find((q) => q.sql.includes("insert into agent_case_events"))!;
+    // title, summary e blocker vão nulos: o `coalesce` do statement mantém o que já estava.
+    expect(nota.params.slice(4)).toEqual([null, null, null]);
+  });
+
+  it("pedido novo com o chamado aberto reescreve resumo e bloqueio, e avisa a Central", async () => {
+    // Medido numa conversa real: a visita pedida com o caso da proposta aberto
+    // ficou só na linha do tempo, abaixo de um resumo que já não era verdade, e
+    // a Central seguiu com o aviso de duas horas antes.
+    consultasNoPool.length = 0;
+    linhasAfetadas = 1;
+    const res = (await crmAddCaseNote.handler(
+      {
+        case_id: CHAMADO,
+        note: "Pediu visita na terça 27/10 à noite.",
+        summary: "Quer dois turnos fixos e visitar a unidade na terça à noite.",
+        blocker: "Valor dos dois turnos e horário da visita.",
+      },
+      fazerCtx(() => ({ data: null })),
+    )) as { updated_fields: string[] };
+
+    expect(res.updated_fields).toEqual(["summary", "blocker"]);
+    const nota = consultasNoPool.find((q) => q.sql.includes("insert into agent_case_events"))!;
+    expect(nota.sql).toContain("update agent_cases");
+    expect(nota.sql).toContain("'anterior'");
+    expect(nota.params.slice(4)).toEqual([
+      null,
+      "Quer dois turnos fixos e visitar a unidade na terça à noite.",
+      "Valor dos dois turnos e horário da visita.",
+    ]);
+    const aviso = consultasNoPool.find((q) => q.sql.includes("insert into agent_inbox_items"));
+    expect(aviso, "a novidade tem de chegar à Central").toBeDefined();
+    // Texto genérico: o que a IA escreveu sobre o cliente não vai para o aviso (LGPD).
+    expect(aviso!.params).not.toContain("Pediu visita na terça 27/10 à noite.");
+    expect(aviso!.params).toContain("Novidade num caso da IA");
+  });
+
+  it("aviso na Central que falha não desfaz a nota nem derruba a ferramenta", async () => {
+    consultasNoPool.length = 0;
+    linhasAfetadas = 1;
+    consultaQueFalha = (sql) => sql.includes("agent_inbox_items");
+    try {
+      const res = (await crmAddCaseNote.handler(
+        { case_id: CHAMADO, note: "Mandou o documento." },
+        fazerCtx(() => ({ data: null })),
+      )) as { recorded: boolean };
+      expect(res.recorded).toBe(true);
+      expect(consultasNoPool.some((q) => q.sql.includes("agent_inbox_items"))).toBe(true);
+    } finally {
+      consultaQueFalha = null;
+    }
   });
 
   it("chamado já fechado recusa em vez de fingir que registrou", async () => {
@@ -417,6 +482,13 @@ describe("crm_add_case_note", () => {
 
   it("nota vazia é recusada pelo schema", () => {
     expect(crmAddCaseNote.inputSchema.note.safeParse("   ").success).toBe(false);
+  });
+
+  it("resumo, bloqueio e título são opcionais, mas nunca vazios", () => {
+    expect(crmAddCaseNote.inputSchema.summary.safeParse(undefined).success).toBe(true);
+    expect(crmAddCaseNote.inputSchema.summary.safeParse("  ").success).toBe(false);
+    expect(crmAddCaseNote.inputSchema.blocker.safeParse("  ").success).toBe(false);
+    expect(crmAddCaseNote.inputSchema.title.safeParse("x".repeat(201)).success).toBe(false);
   });
 });
 

@@ -216,11 +216,33 @@ export async function openCase(
 
   const caseId = rows[0]?.case_id;
   if (caseId === undefined) {
+    // Só cabe um caso aberto por conversa. "Aguarde a resposta" era o que esta
+    // mensagem dizia, e o pedido NOVO do cliente (a visita pedida com o caso da
+    // proposta aberto) ficava sem ninguém saber dele. O caminho é acrescentar ao
+    // caso que existe — e para isso o modelo precisa do id dele E do texto atual:
+    // sem o texto, o resumo reescrito descrevia só o pedido novo e apagava do
+    // topo o que o anterior ainda esperava da equipe (medido com o Haiku na
+    // conversa de 26/10: 5 de 7 reescritas perderam a proposta pendente).
+    const { rows: abertos } = await db.query<{ id: string; title: string; summary: string; blocker: string }>(
+      `select id, title, summary, blocker from agent_cases
+        where organization_id = $1 and conversation_id = $2 and status = any($3::text[])
+        order by created_at desc
+        limit 1`,
+      [ids.tenantId, ids.conversationId, OPEN_STATUSES],
+    );
+    const aberto = abertos[0];
     return {
       ok: false,
       error: {
         code: 'case_already_open',
-        message: 'já existe um caso humano aberto para esta conversa; aguarde a resposta do atendente antes de abrir outro.',
+        message:
+          (aberto
+            ? `já existe um caso aberto nesta conversa (case_id: ${aberto.id}) e só cabe um. Hoje ele diz — ` +
+              `título: "${aberto.title}"; o que o cliente precisa: "${aberto.summary}"; por que a IA travou: "${aberto.blocker}". `
+            : 'já existe um caso aberto nesta conversa e só cabe um. ') +
+          'Não abra outro: para um pedido novo ou uma mudança, chame crm_add_case_note com esse case_id, ' +
+          'a nota do que é novo e `summary`/`blocker` reescritos com o quadro atual — o pedido novo JUNTO com o que ' +
+          'continua pendente do anterior (a equipe é avisada). Sem essa ferramenta, aguarde a resposta do atendente.',
       },
     };
   }
@@ -367,17 +389,36 @@ export async function escalateCase(
 }
 
 /**
- * O AGENTE registrando o que aconteceu num chamado ABERTO.
+ * O que a nota pode reescrever no topo do chamado. Campo ausente fica como está.
+ */
+export interface AtualizacaoDoChamado {
+  title?: string;
+  summary?: string;
+  blocker?: string;
+}
+
+/**
+ * O AGENTE registrando o que aconteceu num chamado ABERTO — e, quando o pedido
+ * mudou, reescrevendo o topo dele.
  *
  * Ator `agent` e kind `agent_noted` (0100) porque a alternativa seria reusar
  * 'lead_provided'/'human_replied' — e aí a linha do tempo do chamado diria que
  * quem falou foi o lead ou a pessoa. Timeline que mente sobre o autor é pior que
  * timeline curta: ela é OBEDECIDA.
  *
- * A guarda de estado mora no `where exists` do próprio INSERT (mesma disciplina
- * do `openCase`): registrar em chamado já fechado seria escrever história depois
- * do fato, e checar antes num statement separado abriria corrida entre a
- * checagem e a escrita.
+ * Título, resumo e bloqueio eram escritos uma vez, na abertura. Como só cabe um
+ * chamado aberto por conversa (`openCase`), o pedido novo do cliente entrava como
+ * nota e o topo seguia descrevendo o pedido antigo — medido numa conversa real: a
+ * visita pedida às 12:28 ficou abaixo de um resumo das 10:43 que ainda dizia
+ * "falta decidir entre visita ou contratação". Agora a nota pode trazer a versão
+ * atual de cada campo. O que ela substitui não se perde: vai para o `metadata`
+ * do próprio evento (`anterior`), que a anonimização da LGPD zera junto com o
+ * corpo (0280).
+ *
+ * A guarda de estado mora no `where` do próprio statement (mesma disciplina do
+ * `openCase`): registrar em chamado já fechado seria escrever história depois do
+ * fato, e checar antes num statement separado abriria corrida entre a checagem e
+ * a escrita.
  *
  * @returns false quando o chamado não existe, é de outra organização ou já fechou.
  */
@@ -386,15 +427,106 @@ export async function registrarNotaDoAgente(
   tenantId: string,
   caseId: string,
   body: string,
+  atualizacao: AtualizacaoDoChamado = {},
 ): Promise<boolean> {
+  const title = atualizacao.title?.trim() || null;
+  const summary = atualizacao.summary?.trim() || null;
+  const blocker = atualizacao.blocker?.trim() || null;
   const { rowCount } = await db.query(
-    `insert into agent_case_events (organization_id, case_id, kind, actor_kind, body)
-     select $1::uuid, c.id, 'agent_noted', 'agent', $3::text
-       from agent_cases c
-      where c.organization_id = $1 and c.id = $2 and c.status = any($4::text[])`,
-    [tenantId, caseId, body, OPEN_STATUSES],
+    `with antes as (
+       select c.id, c.title, c.summary, c.blocker
+         from agent_cases c
+        where c.organization_id = $1 and c.id = $2 and c.status = any($4::text[])
+        for update
+     ), topo as (
+       update agent_cases c
+          set title = coalesce($5::text, c.title),
+              summary = coalesce($6::text, c.summary),
+              blocker = coalesce($7::text, c.blocker),
+              updated_at = now()
+         from antes a
+        where c.id = a.id
+          and ($5::text is not null or $6::text is not null or $7::text is not null)
+       returning c.id
+     )
+     insert into agent_case_events (organization_id, case_id, kind, actor_kind, body, metadata)
+     select $1::uuid, a.id, 'agent_noted', 'agent', $3::text,
+            case when $5::text is null and $6::text is null and $7::text is null then '{}'::jsonb
+                 else jsonb_build_object('anterior', jsonb_strip_nulls(jsonb_build_object(
+                   'title', case when $5::text is not null then a.title end,
+                   'summary', case when $6::text is not null then a.summary end,
+                   'blocker', case when $7::text is not null then a.blocker end)))
+            end
+       from antes a`,
+    [tenantId, caseId, body, OPEN_STATUSES, title, summary, blocker],
   );
   return transitioned(rowCount);
+}
+
+/**
+ * Quanto tempo um aviso da Central que a equipe AINDA NÃO VIU segura a próxima
+ * novidade do mesmo caso. O Operador registra nota a cada turno; sem esta janela,
+ * uma conversa movimentada mandaria um push por mensagem do cliente.
+ */
+export const JANELA_DO_REAVISO_SEGUNDOS = 30 * 60;
+
+export type ResultadoDoReaviso = 'reavisado' | 'aviso_recente' | 'caso_nao_espera_pessoa';
+
+/**
+ * O caso ganhou novidade (uma nota do agente) e a Central tem de saber.
+ *
+ * Só existe UM caso aberto por conversa (`openCase`). Quando o cliente pede outra
+ * coisa com o caso aberto, o pedido novo entra como nota — e a nota, sozinha, não
+ * avisa ninguém: o aviso da Central nasce com o caso (`caso-na-central.handler`) e
+ * fica parado ali. Medido numa conversa real: a visita pedida às 12:28 ficou só na
+ * linha do tempo de um caso cujo aviso era das 10:44.
+ *
+ * Aviso aberto e recente (a equipe ainda não viu) já cobre a novidade: nada muda.
+ * Fora disso, o aviso anterior do caso sai e entra um novo — INSERT, e não UPDATE,
+ * porque é o INSERT que dispara `central.aviso_criado` e o push no celular. O
+ * texto vem pronto de quem chama e é GENÉRICO pelo mesmo motivo do aviso de
+ * abertura: o que a IA escreve sobre o cliente fica fora da anonimização da LGPD.
+ *
+ * Só para caso `awaiting_human`; tudo num statement, como o resto deste arquivo.
+ */
+export async function reavisarCasoNaCentral(
+  db: Queryable,
+  tenantId: string,
+  caseId: string,
+  texto: { titulo: string; corpo: string },
+): Promise<ResultadoDoReaviso> {
+  const { rows } = await db.query<{ caso: number; recente: number }>(
+    `with caso as (
+       select c.id from agent_cases c
+        where c.organization_id = $1 and c.id = $2 and c.status = 'awaiting_human'
+     ), recente as (
+       select 1 from agent_inbox_items i
+        where i.organization_id = $1 and i.kind = 'other' and i.ref_kind = 'agent_case'
+          and i.ref_id = $2 and i.status = 'open'
+          and i.created_at > now() - make_interval(secs => $5)
+     ), anteriores as (
+       update agent_inbox_items i
+          set status = 'resolved', resolved_at = now()
+        where i.organization_id = $1 and i.kind = 'other' and i.ref_kind = 'agent_case'
+          and i.ref_id = $2 and i.status in ('open', 'ack')
+          and exists (select 1 from caso) and not exists (select 1 from recente)
+        returning i.id
+     ), novo as (
+       insert into agent_inbox_items (organization_id, kind, severity, title, body, ref_kind, ref_id)
+       select $1, 'other', 'warn', $3, $4, 'agent_case', c.id
+         from caso c
+        where not exists (select 1 from recente)
+       returning id
+     )
+     select (select count(*) from caso)::int as caso,
+            (select count(*) from recente)::int as recente,
+            (select count(*) from anteriores)::int as anteriores,
+            (select count(*) from novo)::int as novo`,
+    [tenantId, caseId, texto.titulo, texto.corpo, JANELA_DO_REAVISO_SEGUNDOS],
+  );
+  const r = rows[0];
+  if (!r || r.caso === 0) return 'caso_nao_espera_pessoa';
+  return r.recente > 0 ? 'aviso_recente' : 'reavisado';
 }
 
 /** Como um chamado pode terminar pela mão do agente. */

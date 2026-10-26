@@ -25,6 +25,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   encerrarChamadoPeloAgente,
   openCase,
+  reavisarCasoNaCentral,
   registrarNotaDoAgente,
   resolveCaseFromHuman,
 } from "@/lib/agent-engine/agent/human-cases";
@@ -277,6 +278,79 @@ describe("o agente registrando e encerrando um chamado", () => {
     expect(nota?.body).toBe("o cliente aceitou 12%");
     // A afirmação que importa: nada foi gravado como decisão humana.
     expect(eventos.filter((e) => e.actor_kind === "human")).toEqual([]);
+  });
+
+  it("a nota reescreve o topo do chamado e guarda o texto substituído no próprio evento", async () => {
+    const caseId = await abrirChamadoLimpo("Proposta de dois turnos");
+    expect(
+      await registrarNotaDoAgente(pool, GOV_ORG, caseId, "pediu visita na terça 27/10 à noite", {
+        summary: "proposta de dois turnos e visita na terça à noite",
+        blocker: "valor dos dois turnos e horário da visita",
+      }),
+    ).toBe(true);
+
+    const { rows } = await pool.query<{ title: string; summary: string; blocker: string }>(
+      `select title, summary, blocker from agent_cases where id = $1`,
+      [caseId],
+    );
+    expect(rows[0]).toEqual({
+      title: "Proposta de dois turnos",
+      summary: "proposta de dois turnos e visita na terça à noite",
+      blocker: "valor dos dois turnos e horário da visita",
+    });
+    const { rows: notas } = await pool.query<{ metadata: unknown }>(
+      `select metadata from agent_case_events where case_id = $1 and kind = 'agent_noted'`,
+      [caseId],
+    );
+    expect(notas).toEqual([{ metadata: { anterior: { summary: "resumo", blocker: "bloqueio" } } }]);
+  });
+
+  it("chamado FECHADO não aceita o topo reescrito", async () => {
+    const caseId = await abrirChamadoLimpo("Topo no fechado");
+    expect(await resolveCaseFromHuman(pool, GOV_ORG, caseId, GOV_AGENT_A, "resolvido")).toBe(true);
+    expect(
+      await registrarNotaDoAgente(pool, GOV_ORG, caseId, "tarde demais", { summary: "não pode" }),
+    ).toBe(false);
+    const { rows } = await pool.query<{ summary: string }>(
+      `select summary from agent_cases where id = $1`,
+      [caseId],
+    );
+    expect(rows[0]?.summary).toBe("resumo");
+  });
+
+  it("novidade no chamado avisa a Central de novo — uma vez, e não para caso de outra org", async () => {
+    const caseId = await abrirChamadoLimpo("Reaviso na Central");
+    const texto = { titulo: "Novidade num caso da IA", corpo: "Abra o caso para ver." };
+    // O aviso da abertura, já velho: a equipe não está olhando para ele.
+    await pool.query(
+      `insert into agent_inbox_items (organization_id, kind, severity, title, body, ref_kind, ref_id, created_at)
+       values ($1, 'other', 'warn', 'A IA pediu ajuda à equipe', 'x', 'agent_case', $2, now() - interval '2 hours')`,
+      [GOV_ORG, caseId],
+    );
+    try {
+      expect(await reavisarCasoNaCentral(pool, OUTRA_ORG, caseId, texto)).toBe(
+        "caso_nao_espera_pessoa",
+      );
+      expect(await reavisarCasoNaCentral(pool, GOV_ORG, caseId, texto)).toBe("reavisado");
+      // Logo em seguida: o aviso novo ainda não foi visto e já cobre a novidade.
+      expect(await reavisarCasoNaCentral(pool, GOV_ORG, caseId, texto)).toBe("aviso_recente");
+
+      const { rows } = await pool.query<{ status: string; title: string }>(
+        `select status, title from agent_inbox_items
+          where organization_id = $1 and ref_kind = 'agent_case' and ref_id = $2
+          order by created_at`,
+        [GOV_ORG, caseId],
+      );
+      expect(rows).toEqual([
+        { status: "resolved", title: "A IA pediu ajuda à equipe" },
+        { status: "open", title: texto.titulo },
+      ]);
+    } finally {
+      await pool.query(
+        `delete from agent_inbox_items where ref_kind = 'agent_case' and ref_id = $1`,
+        [caseId],
+      );
+    }
   });
 
   it("chamado FECHADO recusa o registro em vez de aceitar em silêncio", async () => {
