@@ -5243,7 +5243,7 @@
   "Cria uma sugestão de retomar o contato com um cliente que esfriou, para uma pessoa aprovar antes de qualquer envio.": "创建重新联系已冷却客户的建议，供人工在任何发送前审批。",
   "Criar etapa no funil": "在销售漏斗中创建阶段",
   "Criar uma entrada automática de contatos": "创建自动联系人入口",
-  "Deixa escrito no chamado o que mudou desde que ele foi aberto, para a pessoa que for atender não precisar começar do zero.": "在工单中记录自打开以来的变更，让接手接待的人无需从零开始。",
+  "Deixa escrito no chamado o que mudou desde que ele foi aberto e, quando o pedido do cliente muda, atualiza o resumo e o bloqueio do chamado, para a pessoa que for atender não precisar começar do zero.": "在工单中记录自打开以来的变更，并在客户的需求变化时更新工单的摘要和阻碍，让接手接待的人无需从零开始。",
   "Desmarca um horário combinado e devolve esse horário para outra pessoa poder pegar, o que não dá para desfazer.": "取消已约定的时间，并将该时段释放给其他人领取，此操作无法撤销。",
   "Desmarca um retorno que ainda não aconteceu, para o agente não insistir com quem já respondeu.": "取消尚未发生的回访，让 AI 智能体不再打扰已回复的人。",
   "Desmarcar um compromisso": "取消预约",

@@ -58,7 +58,7 @@ export const TOOLS_ESCALACAO = declararTools([
     category: "write",
     rotulo: "Registrar o que aconteceu num chamado",
     explicacao:
-      "Deixa escrito no chamado o que mudou desde que ele foi aberto, para a pessoa que for atender não precisar começar do zero.",
+      "Deixa escrito no chamado o que mudou desde que ele foi aberto e, quando o pedido do cliente muda, atualiza o resumo e o bloqueio do chamado, para a pessoa que for atender não precisar começar do zero.",
     oQueToca: "Chamados para uma pessoa",
     risco: "atencao",
     pacotes: ["escalar"],

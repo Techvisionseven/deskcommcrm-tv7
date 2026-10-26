@@ -1423,6 +1423,12 @@ export const DICIONARIO: Traducoes = {
   "Abra o caso para responder. A IA continua atendendo o cliente enquanto isso.": {
     es: "Abre el caso para responder. La IA sigue atendiendo al cliente mientras tanto.",
   },
+  // A novidade num caso já aberto (`reavisarCasoNaCentral`, via `crm_add_case_note`).
+  "Novidade num caso da IA": { es: "Novedad en un caso de la IA" },
+  "Novidade registrada pela IA": { es: "Novedad registrada por la IA" },
+  "A IA acrescentou um pedido ou uma informação ao caso. Abra o caso para ver e responder.": {
+    es: "La IA agregó una solicitud o una información al caso. Abre el caso para verlo y responder.",
+  },
   "Um atendimento espera decisão da equipe": { es: "Una atención espera la decisión del equipo" },
   "Soltar o horário de um pedido não confirmado após (minutos)": { es: "Liberar el horario de una solicitud no confirmada después de (minutos)" },
   "Vale só para tipos de atendimento que pedem confirmação. Enquanto o pedido espera, o horário fica reservado e ninguém mais o pega; passado o prazo sem decisão, ele volta a ser oferecido. O cliente não é avisado, e o pedido continua na fila.": { es: "Solo aplica a los tipos de cita que requieren confirmación. Mientras la solicitud espera, el horario queda reservado y nadie más puede tomarlo. Si pasa el plazo sin una decisión, el horario vuelve a ofrecerse. El cliente no recibe aviso y la solicitud sigue en la fila." },
@@ -12472,8 +12478,8 @@ export const DICIONARIO: Traducoes = {
   },
   "Criar etapa no funil": { es: "Crear etapa en el embudo" },
   "Criar uma entrada automática de contatos": { es: "Crear una entrada automática de contactos" },
-  "Deixa escrito no chamado o que mudou desde que ele foi aberto, para a pessoa que for atender não precisar começar do zero.": {
-    es: "Deja escrito en el caso lo que cambió desde que se abrió, para que la persona que lo atienda no tenga que empezar de cero.",
+  "Deixa escrito no chamado o que mudou desde que ele foi aberto e, quando o pedido do cliente muda, atualiza o resumo e o bloqueio do chamado, para a pessoa que for atender não precisar começar do zero.": {
+    es: "Deja escrito en el caso lo que cambió desde que se abrió y, cuando cambia la solicitud del cliente, actualiza el resumen y el bloqueo del caso, para que la persona que lo atienda no tenga que empezar de cero.",
   },
   "Desmarca um horário combinado e devolve esse horário para outra pessoa poder pegar, o que não dá para desfazer.": {
     es: "Cancela un horario acordado y lo libera para que otra persona pueda tomarlo. Esto no se puede deshacer.",

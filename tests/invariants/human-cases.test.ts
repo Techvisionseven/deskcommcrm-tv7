@@ -257,6 +257,12 @@ describe("wave 2 — human-cases repositório", () => {
       blocker: "Segundo motivo.",
     });
     expect(second).toMatchObject({ ok: false, error: { code: "case_already_open" } });
+    // O pedido novo vira nota no caso que existe: o modelo precisa do id e do
+    // texto atual para reescrever o topo sem perder o que segue pendente.
+    if (!first.ok || second.ok) throw new Error("pré-condição");
+    expect(second.error.message).toContain(`case_id: ${first.caseId}`);
+    expect(second.error.message).toContain('"Primeiro bloqueio."');
+    expect(second.error.message).toContain("crm_add_case_note");
   });
 
   it("whitelist: openHumanCaseInputSchema rejeita campo extra", () => {

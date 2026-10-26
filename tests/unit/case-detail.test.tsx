@@ -76,6 +76,55 @@ const BASE_CASE = {
 };
 
 describe("CaseDetail", () => {
+  it("pedido novo registrado pela IA aparece no topo, acima do resumo da abertura", () => {
+    const comNota = {
+      ...BASE_CASE,
+      events: [
+        ...BASE_CASE.events,
+        {
+          id: "ev-3",
+          kind: "agent_noted" as const,
+          actor_kind: "agent" as const,
+          actor_user_id: null,
+          human_action: null,
+          body: "Pediu visita na terça 27/10 à noite.",
+          created_at: "2026-07-20T10:10:00.000Z",
+        },
+      ],
+    };
+    useCaseMock.mockReturnValue({ isLoading: false, data: comNota });
+    render(wrap(<CaseDetail caseId="case-1" />));
+
+    const quadro = screen.getByTestId("novidade-da-ia");
+    expect(quadro).toHaveTextContent("Novidade registrada pela IA");
+    expect(quadro).toHaveTextContent("Pediu visita na terça 27/10 à noite.");
+    // Antes do resumo da abertura no DOM: é o primeiro que quem abre o caso lê.
+    const resumo = screen.getByText(BASE_CASE.summary);
+    expect(quadro.compareDocumentPosition(resumo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("caso fechado não mostra a novidade", () => {
+    const fechado = {
+      ...BASE_CASE,
+      status: "resolved" as const,
+      events: [
+        ...BASE_CASE.events,
+        {
+          id: "ev-3",
+          kind: "agent_noted" as const,
+          actor_kind: "agent" as const,
+          actor_user_id: null,
+          human_action: null,
+          body: "Visita confirmada.",
+          created_at: "2026-07-20T10:10:00.000Z",
+        },
+      ],
+    };
+    useCaseMock.mockReturnValue({ isLoading: false, data: fechado });
+    render(wrap(<CaseDetail caseId="case-1" />));
+    expect(screen.queryByTestId("novidade-da-ia")).not.toBeInTheDocument();
+  });
+
   it("estado vazio quando nenhum caso selecionado", () => {
     useCaseMock.mockReturnValue({ isLoading: false, data: undefined });
     render(wrap(<CaseDetail caseId={null} />));

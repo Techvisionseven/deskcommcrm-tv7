@@ -6,7 +6,7 @@ import { formatDistanceToNowStrict } from "date-fns";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCase } from "@/hooks/ai/useCases";
-import { STATUS_BADGE_VARIANT, STATUS_LABEL, caseEventLabel } from "@/lib/ai/case-copy";
+import { STATUS_BADGE_VARIANT, STATUS_LABEL, caseEventLabel, novidadeDaIA } from "@/lib/ai/case-copy";
 import { useT } from "@/hooks/i18n/useT";
 import { CaseChatPanel } from "./CaseChatPanel";
 import { CaseReplyPanel } from "./CaseReplyPanel";
@@ -35,6 +35,8 @@ export function CaseDetail({ caseId }: { caseId: string | null }) {
     );
   }
 
+  const novidade = data.status === "awaiting_human" || data.status === "awaiting_lead" ? novidadeDaIA(data.events) : null;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
       <header className="flex flex-wrap items-center justify-between gap-2">
@@ -56,6 +58,22 @@ export function CaseDetail({ caseId }: { caseId: string | null }) {
           <Badge variant={STATUS_BADGE_VARIANT[data.status]}>{t(STATUS_LABEL[data.status])}</Badge>
         </div>
       </header>
+
+      {/*
+        O resumo e o bloqueio são da ABERTURA. Pedido novo com o caso aberto
+        entra como nota da IA; sem este quadro ele ficava só no pé da linha do
+        tempo, abaixo de um resumo que já não era verdade.
+      */}
+      {novidade ? (
+        <div className="rounded-lg border border-accent bg-accent-soft p-3" data-testid="novidade-da-ia">
+          <p className="text-xs font-medium">
+            {t("Novidade registrada pela IA")}
+            {" · "}
+            {formatDistanceToNowStrict(new Date(novidade.created_at), { addSuffix: true, locale: localeDaData })}
+          </p>
+          <p className="mt-1 text-sm">{novidade.body}</p>
+        </div>
+      ) : null}
 
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="rounded-lg border border-border p-3">
