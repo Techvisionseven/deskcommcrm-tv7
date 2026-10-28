@@ -65,6 +65,14 @@
 # original: o fork não publica release nem carrega as tags novas, e a resposta só
 # existe no repositório de onde a VPS atualiza. Medido num fork: `releases/latest`
 # 404 e nenhuma tag depois da v1.60.0, então a v1.63.0 nem podia ser buscada.
+#
+# Num FORK sem release própria, o `gh release view` pergunta ao fork e volta
+# vazio, e as tags novas também não estão nele — o CI de todo fork reprovava
+# aqui com o baseline verde. Então, sem release no próprio repositório, a
+# pergunta vai ao repositório PAI (`gh repo view`), e a tag é buscada lá. Fork
+# com release própria continua respondendo pela sua.
+# Com `CONFERENCIA_KIT_REPOSITORIO` definida, ela vence: o repositório pai só é
+# perguntado quando a variável não diz de onde vem a resposta.
 set -euo pipefail
 
 CONTAINER="${1:?uso: $0 <container> <banco>}"
@@ -81,8 +89,16 @@ if [ -n "$REPOSITORIO" ]; then
 fi
 
 release="${CONFERENCIA_KIT_RELEASE:-}"
+origem_das_tags="${REPOSITORIO:-origin}"
 if [ -z "$release" ] && [ -n "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
   release="$(cd "$ROOT" && gh release view ${slug:+--repo "$slug"} --json tagName -q .tagName 2>/dev/null || true)"
+  if [ -z "$release" ] && [ -z "$slug" ]; then
+    pai="$(cd "$ROOT" && gh repo view --json parent -q '.parent | select(. != null) | .owner.login + "/" + .name' 2>/dev/null || true)"
+    if [ -n "$pai" ]; then
+      release="$(gh release view -R "$pai" --json tagName -q .tagName 2>/dev/null || true)"
+      [ -n "$release" ] && origem_das_tags="https://github.com/$pai.git"
+    fi
+  fi
 fi
 if [ -z "$release" ]; then
   release="$(cd "$ROOT" && bash -c 'source "$1/_common.sh" >/dev/null 2>&1; ultima_release_estavel' _ "$KIT" || true)"
@@ -104,7 +120,7 @@ update_sh_da() {  # update_sh_da <tag> — caminho de uma cópia do update.sh da
   if ! git -C "$ROOT" rev-parse -q --verify "refs/tags/$1^{commit}" >/dev/null; then
     local profundidade=""
     [ "$(git -C "$ROOT" rev-parse --is-shallow-repository)" = true ] && profundidade="--depth=1"
-    git -C "$ROOT" fetch -q --no-tags $profundidade "${REPOSITORIO:-origin}" "+refs/tags/$1:refs/tags/$1"
+    git -C "$ROOT" fetch -q --no-tags $profundidade "$origem_das_tags" "+refs/tags/$1:refs/tags/$1"
   fi
   git -C "$ROOT" show "$1:hostgator-setup-kit/update.sh" > "$TMP/$1"
   printf '%s' "$TMP/$1"

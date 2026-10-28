@@ -35,6 +35,20 @@ function formatUpdatedAt(iso: string, idioma: string): string {
   });
 }
 
+/**
+ * A política de handoff em palavra de gente, para o cartão da lista (#3104).
+ *
+ * A coluna mostrava o valor CRU do banco (`pause`, `cancel`, `allow`) ao lado
+ * de «Handoff» — com o perfil em espanhol, «Transferencia: pause». O `value`
+ * gravado continua o mesmo; o seletor da barra de publicação mantém as frases
+ * longas dele («Pausar durante handoff»), porque ali há espaço para explicar.
+ */
+const HANDOFF_EM_PALAVRA: Record<string, string> = {
+  pause: "Pausar",
+  cancel: "Cancelar",
+  allow: "Permitir",
+};
+
 export function FlowsList({ initialData, canWrite, surface }: Props) {
   const tagDoIdioma = useTagDeIdioma();
   const t = useT();
@@ -128,7 +142,11 @@ export function FlowsList({ initialData, canWrite, surface }: Props) {
     );
   }
 
+  // Os diálogos ficam no MESMO lugar da árvore nos dois ramos — segundo filho do fragmento.
+  // Dentro da <div> deste ramo, a primeira importação (a lista vai de 0 para 1) remontava o diálogo e o
+  // resultado sumia: o que resolver antes de publicar e o link « Abrir o fluxo » nunca apareciam.
   return (
+    <>
     <div className="flex flex-col gap-4">
       {canWrite && (
         <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
@@ -152,15 +170,17 @@ export function FlowsList({ initialData, canWrite, surface }: Props) {
                 <dl className="grid grid-cols-2 gap-2 pt-1 text-xs">
                   <div>
                     <dt className="text-text-muted">{t("Versão")}</dt>
-                    <dd className="font-mono">{flow.active_version_id ? "publicada" : "—"}</dd>
+                    <dd className="font-mono">{flow.active_version_id ? t("publicada") : "—"}</dd>
                   </div>
                   <div>
-                    <dt className="text-text-muted">Handoff</dt>
-                    <dd className="font-mono">{flow.handoff_policy}</dd>
+                    <dt className="text-text-muted">{t("Handoff")}</dt>
+                    <dd className="font-mono">
+                      {t(HANDOFF_EM_PALAVRA[flow.handoff_policy] ?? flow.handoff_policy)}
+                    </dd>
                   </div>
                 </dl>
                 <p className="mt-auto pt-2 text-xs text-text-muted">
-                  Atualizado em {formatUpdatedAt(flow.updated_at, tagDoIdioma)}
+                  {t("Atualizado em")} {formatUpdatedAt(flow.updated_at, tagDoIdioma)}
                 </p>
               </Link>
               {canWrite && (
@@ -175,8 +195,8 @@ export function FlowsList({ initialData, canWrite, surface }: Props) {
           </li>
         ))}
       </ul>
-
-      {dialogos}
     </div>
+    {dialogos}
+    </>
   );
 }

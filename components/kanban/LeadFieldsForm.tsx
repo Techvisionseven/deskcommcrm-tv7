@@ -2,7 +2,7 @@
 
 import { useActiveOrg } from "@/hooks/auth/AuthProvider";
 import { useT } from "@/hooks/i18n/useT";
-import { useEffect, useState } from "react";
+import { useEffect, useImperativeHandle, useState, type Ref } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 
@@ -18,6 +18,7 @@ import { soChavesAlteradas } from "@/lib/leads/custom-fields-so-diff";
 import { CustomFieldsEditor, type CustomFieldDef } from "@/components/contacts/CustomFieldsEditor";
 import { ContactTagsEditor } from "@/components/inbox/ContactTagsEditor";
 import { EcoDoValor } from "./EcoDoValor";
+import type { CampoConfirmadoDoDocumento } from "./RevisaoDoDocumento";
 
 /**
  * As etiquetas do negócio SAÍRAM deste formulário (#2979): quem as edita é o
@@ -33,6 +34,10 @@ interface FormShape {
   expected_close_date: string;
 }
 
+export interface ControleDosCamposDoNegocio {
+  confirmarCampo: (confirmado: CampoConfirmadoDoDocumento) => void;
+}
+
 interface Props {
   lead: Lead;
   pipelineId: string;
@@ -41,6 +46,8 @@ interface Props {
   onSaved?: () => void;
   /** O dossiê não tem "cancelar"; o diálogo tem. */
   onCancel?: () => void;
+  /** Confirmação externa do próprio card: preserva os outros campos em edição. */
+  controle?: Ref<ControleDosCamposDoNegocio>;
 }
 
 function centsToReais(cents: number | null | undefined): string {
@@ -57,7 +64,7 @@ function centsToReais(cents: number | null | undefined): string {
  * registro justamente de quem o produziu — a funcionalidade que prova "sua ação
  * fica registrada" provaria isso para todo mundo menos para o autor.
  */
-export function LeadFieldsForm({ lead, pipelineId, fieldDefs = [], onSaved, onCancel }: Props) {
+export function LeadFieldsForm({ lead, pipelineId, fieldDefs = [], onSaved, onCancel, controle }: Props) {
   const t = useT();
   const org = useActiveOrg();
   // A moeda do negócio JÁ GRAVADO vence: trocar a moeda da empresa não
@@ -93,11 +100,25 @@ export function LeadFieldsForm({ lead, pipelineId, fieldDefs = [], onSaved, onCa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lead.id]);
 
+  useImperativeHandle(controle, () => ({
+    confirmarCampo(confirmacao) {
+      // A confirmação pode terminar depois de a pessoa abrir outro card.
+      if (confirmacao.leadId !== lead.id) return;
+      const { campo, valor } = confirmacao;
+      // O evento já gravou este valor: atualiza o campo e a régua do diff,
+      // preservando os outros rascunhos. Não remonta o formulário (#2132).
+      setCustomFields((atuais) => ({ ...atuais, [campo]: valor }));
+      setCamposCarregados((atuais) => ({ ...atuais, [campo]: valor }));
+    },
+  }), [lead.id]);
+
   async function onSubmit(values: FormShape) {
     const reais = values.valueReais.trim();
     let valueCents: number | null = null;
     if (reais.length > 0) {
-      valueCents = parseReaisToCents(reais);
+      // A MESMA moeda que o rótulo do campo mostra ao lado («Valor ($)»): é ela
+      // que decide se a vírgula é decimal ou separador de milhar (#3331).
+      valueCents = parseReaisToCents(reais, moedaDoValor);
       if (valueCents === null) {
         form.setError("valueReais", { message: t("Valor inválido") });
         return;
@@ -204,6 +225,7 @@ export function LeadFieldsForm({ lead, pipelineId, fieldDefs = [], onSaved, onCa
               value={customFields}
               onChange={setCustomFields}
               mode="lead"
+              leadId={lead.id}
             />
           </div>
         )}

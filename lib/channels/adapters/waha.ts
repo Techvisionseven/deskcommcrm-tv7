@@ -21,6 +21,7 @@ import {
   parseWahaMessageId,
   wahaEchoExternalIds,
 } from "@/lib/waha/message-id";
+import { consultarNomeDaAgenda } from "@/lib/contacts/nome-da-agenda";
 import { marcarConversaComoLida, resolveWahaChatId } from "@/lib/waha/send";
 import type { FetchedMedia } from "@/lib/messaging/media/types";
 import { DETALHE_CREDENCIAL_RECUSADA } from "../health";
@@ -153,6 +154,25 @@ export const wahaAdapter: ChannelAdapter = {
   },
 
   /**
+   * Agenda do aparelho primeiro (`name`), apelido do perfil se a agenda não
+   * tiver. Transporte ausente é `null` — a varredura carimba sem tratar como
+   * "não existe".
+   */
+  async resolveAddressBookName(input: {
+    sessionRef: string;
+    phone: string | null;
+    lid: string | null;
+  }): Promise<{ agenda: string | null; perfil: string | null } | null> {
+    const client = getWahaClient();
+    if (!client) return null;
+    return consultarNomeDaAgenda(
+      (contactId) => client.getContact(input.sessionRef, contactId),
+      input.phone,
+      input.lid,
+    );
+  },
+
+  /**
    * "digitando…" no aparelho do cliente, antes da 1ª bolha do turno da IA.
    *
    * Transporte não configurado é NOOP, não erro — mesmo critério do `send`
@@ -229,6 +249,24 @@ export const wahaAdapter: ChannelAdapter = {
 
       return { reachable: false, status: null, detail: msg.slice(0, 200) };
     }
+  },
+
+  /**
+   * Uma PÁGINA da agenda do aparelho pareado (`GET /api/contacts/all`) — #2736.
+   *
+   * Só quem conversa com um aparelho de verdade tem esta lista do lado de lá,
+   * então só este adapter implementa o método: quem chama testa a presença
+   * dele em vez de perguntar QUAL provider é. A ordenação estável que faz o
+   * offset andar sem pular nem repetir, e a tolerância de formato, moram no
+   * método do cliente (`listarAgendaDoAparelho`), com o próprio contrato.
+   */
+  async listPhonebook(input: { sessionRef: string; limit: number; offset: number }) {
+    const client = getWahaClient();
+    if (!client) throw new Error("waha_not_configured");
+    return client.listarAgendaDoAparelho(input.sessionRef, {
+      limit: input.limit,
+      offset: input.offset,
+    });
   },
 
   async listGroups(input: { sessionRef: string }) {
