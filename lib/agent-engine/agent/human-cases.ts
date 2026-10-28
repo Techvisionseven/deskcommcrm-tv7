@@ -155,6 +155,96 @@ export type OpenCaseResult =
   | { ok: true; caseId: string }
   | { ok: false; error: { code: string; message: string } };
 
+/** O caso aberto que a recusa devolve ao modelo, para ele acrescentar em vez de abrir outro. */
+export interface CasoAbertoNaRecusa {
+  id: string;
+  title: string;
+  summary: string;
+  blocker: string;
+}
+
+/**
+ * A FRASE AO CLIENTE quando o pedido novo cai num caso que JÁ está aberto (#3097).
+ *
+ * Ela existe porque a alternativa era a IA improvisar — e o que ela improvisava
+ * era "já registrei com a equipe"/"a equipe foi acionada", que é FALSO neste
+ * caminho. Medido no relato do defeito: `agent_noted` não gera `alert_sent` e
+ * não nasce linha em `entregas_de_aviso_de_caso` — a única superfície desta
+ * feature que avisa alguém. O cliente ficava esperando quem nunca foi chamado.
+ *
+ * A frase diz só o que é verdade em QUALQUER caso: o pedido foi anotado na
+ * conversa. Ela não afirma o registro no caso aberto, porque o agente só consegue
+ * registrar quando tem a ferramenta `crm_add_case_note`; sem ela, a frase ainda
+ * seria verdadeira. Também não promete aviso novo, prazo, nem que uma pessoa vai
+ * responder por causa dele.
+ */
+export const FRASE_AO_CLIENTE_EM_PEDIDO_SOBRE_CASO_ABERTO =
+  'anotei seu pedido aqui na nossa conversa; por enquanto não consigo te dar um prazo.';
+
+/**
+ * A RECUSA da guarda de caso aberto — com a instrução que impede a promessa.
+ *
+ * ## Por que INSTRUÇÃO, e não reenvio do aviso (issue #3097)
+ *
+ * O autor aceitava as duas saídas. O reenvio do aviso à equipe (opção a) esbarra
+ * no MESMO controle de repetição do aviso inicial — a `unique (organization_id,
+ * case_id, destino)` de `entregas_de_aviso_de_caso` (migration 0292, replicada
+ * aqui no `reivindicaEntrega` de `lib/escalacao/aviso-ao-suporte.ts`). Com a
+ * entrega do caso já `enviado`, o reenvio cai em `ja_resolvido:enviado`: nenhuma
+ * linha nasce e ninguém é avisado justamente no cenário do relato. Fazer o
+ * segundo pedido avisar exigiria OUTRA chave de entrega — coluna nova, decisão
+ * do mantenedor, e o próprio goal manda preferir a instrução nesse caso.
+ *
+ * ## O que a instrução faz
+ *
+ * Devolve ao agente a verdade do caminho (`ninguém foi avisado agora`), proíbe a
+ * promessa que o relato flagrou ("a equipe foi acionada", "já registrei para a
+ * equipe", prazo, "alguém vai responder") e entrega a frase que o cliente PODE
+ * ouvir — para a mensagem ao cliente mudar junto, sem depender de o modelo
+ * adivinhar o que é honesto dizer.
+ *
+ * O registro do pedido novo no caso aberto é o destino certo quando o agente tem
+ * a ferramenta `crm_add_case_note`: a nota entra na linha do tempo que quem
+ * continuar o caso vai ler. Neste fork a recusa traz o `case_id` e o texto atual
+ * do caso aberto, para a nota reescrever o resumo e o bloqueio sem perder o que
+ * segue pendente (e a ferramenta reavisa a Central). A única ferramenta nativa
+ * que recebe o caso (`provide_case_update`, no caso `awaiting_lead`) trataria o
+ * pedido novo como a resposta que o caso esperava; por isso a instrução veta esse
+ * uso. O registro é condicional, e a frase ao cliente só afirma o registro se ele
+ * aconteceu. O que não pode é o cliente ouvir que alguém foi ACIONADO.
+ *
+ * Pura e exportada de propósito: é o texto exato que o modelo lê no resultado da
+ * tool `open_human_case` (o caminho `if (!res.ok) return res`), e é ele que o
+ * teste de `aviso-de-pedido-novo-no-caso.test.ts` prende.
+ */
+export function recusaDeCasoAberto(aberto?: CasoAbertoNaRecusa): OpenCaseResult {
+  return {
+    ok: false,
+    error: {
+      code: 'case_already_open',
+      message:
+        'já existe um caso humano aberto para esta conversa' +
+        (aberto
+          ? ` (case_id: ${aberto.id}) e só cabe um. Hoje ele diz — título: "${aberto.title}"; ` +
+            `o que o cliente precisa: "${aberto.summary}"; por que a IA travou: "${aberto.blocker}". Não abra outro`
+          : '') +
+        ': a equipe NÃO foi avisada deste pedido novo, e ' +
+        'nada novo saiu para ninguém agora. NÃO diga ao cliente que a equipe foi acionada, avisada ou que o ' +
+        'pedido foi encaminhado, e não prometa prazo nem que alguém vai responder por causa dele. Se você ' +
+        'tiver a ferramenta crm_add_case_note, registre o pedido novo no caso aberto (a nota entra na linha do ' +
+        'tempo que quem continuar o caso vai ler)' +
+        (aberto
+          ? ': chame-a com esse case_id, a nota do que é novo e `summary`/`blocker` reescritos com o quadro atual — ' +
+            'o pedido novo JUNTO com o que continua pendente do anterior. '
+          : '. ') +
+        'NÃO use provide_case_update para isso: ela é só para a ' +
+        'informação que o caso pediu ao cliente. Só diga ao cliente que o pedido ficou registrado no caso se ' +
+        'você registrou de fato. Responda ao cliente apenas neste espírito: ' +
+        `"${FRASE_AO_CLIENTE_EM_PEDIDO_SOBRE_CASO_ABERTO}" Aguarde a resposta do atendente antes de abrir outro caso.`,
+    },
+  };
+}
+
 /**
  * Abre o caso: INSERT agent_cases(status='awaiting_human') + INSERT
  * agent_case_events(kind='opened') em UM statement atômico. A guarda de dedup
@@ -216,35 +306,24 @@ export async function openCase(
 
   const caseId = rows[0]?.case_id;
   if (caseId === undefined) {
-    // Só cabe um caso aberto por conversa. "Aguarde a resposta" era o que esta
-    // mensagem dizia, e o pedido NOVO do cliente (a visita pedida com o caso da
-    // proposta aberto) ficava sem ninguém saber dele. O caminho é acrescentar ao
-    // caso que existe — e para isso o modelo precisa do id dele E do texto atual:
-    // sem o texto, o resumo reescrito descrevia só o pedido novo e apagava do
-    // topo o que o anterior ainda esperava da equipe (medido com o Haiku na
-    // conversa de 26/10: 5 de 7 reescritas perderam a proposta pendente).
-    const { rows: abertos } = await db.query<{ id: string; title: string; summary: string; blocker: string }>(
+    // A recusa é uma INSTRUÇÃO (não só um erro): é o texto que o modelo lê no
+    // resultado da tool, e é ele que impede a promessa de que a equipe foi
+    // acionada quando ninguém foi avisado (#3097).
+    //
+    // Só cabe um caso aberto por conversa, e o pedido NOVO do cliente (a visita
+    // pedida com o caso da proposta aberto) entra nele pela crm_add_case_note —
+    // para isso o modelo precisa do id do caso E do texto atual: sem o texto, o
+    // resumo reescrito descrevia só o pedido novo e apagava do topo o que o
+    // anterior ainda esperava da equipe (medido com o Haiku na conversa de 26/10:
+    // 5 de 7 reescritas perderam a proposta pendente).
+    const { rows: abertos } = await db.query<CasoAbertoNaRecusa>(
       `select id, title, summary, blocker from agent_cases
         where organization_id = $1 and conversation_id = $2 and status = any($3::text[])
         order by created_at desc
         limit 1`,
       [ids.tenantId, ids.conversationId, OPEN_STATUSES],
     );
-    const aberto = abertos[0];
-    return {
-      ok: false,
-      error: {
-        code: 'case_already_open',
-        message:
-          (aberto
-            ? `já existe um caso aberto nesta conversa (case_id: ${aberto.id}) e só cabe um. Hoje ele diz — ` +
-              `título: "${aberto.title}"; o que o cliente precisa: "${aberto.summary}"; por que a IA travou: "${aberto.blocker}". `
-            : 'já existe um caso aberto nesta conversa e só cabe um. ') +
-          'Não abra outro: para um pedido novo ou uma mudança, chame crm_add_case_note com esse case_id, ' +
-          'a nota do que é novo e `summary`/`blocker` reescritos com o quadro atual — o pedido novo JUNTO com o que ' +
-          'continua pendente do anterior (a equipe é avisada). Sem essa ferramenta, aguarde a resposta do atendente.',
-      },
-    };
+    return recusaDeCasoAberto(abertos[0]);
   }
   return { ok: true, caseId };
 }

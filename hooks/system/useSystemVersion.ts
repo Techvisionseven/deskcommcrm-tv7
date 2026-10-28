@@ -16,6 +16,17 @@ export interface SystemVersion {
   has_known_release?: boolean;
   agent_online?: boolean;
   /**
+   * O retrato de `system_version` é VELHO demais para afirmar qualquer coisa
+   * (#3488). `agent_online` responde "posso atualizar sozinho?" com 24h de
+   * paciência; este campo responde "conferi isso agora?" com a régua da
+   * frescura (`RETRATO_VELHO_APOS_MS`). É ele que impede a tela de dizer "é a
+   * mais recente" com um retrato de horas atrás — ausente (resposta antiga)
+   * mantém o comportamento anterior.
+   */
+  agent_stale?: boolean;
+  /** Quando o host falou com o app pela última vez (ISO), para a tela dizer desde quando não sabe. */
+  agent_last_seen_at?: string | null;
+  /**
    * A instalação TEM SMTP usável (host E remetente, a mesma régua do kit).
    * Só chega a quem é dono do servidor (`is_platform_admin`) — é ele quem
    * configura em /admin/email. Fora do servidor único vem sempre `true`: lá o
@@ -50,6 +61,14 @@ export interface SystemVersion {
     to_version: string;
     /** Últimas linhas da saída do update.sh — o diagnóstico da falha. */
     log_tail: string;
+    /** Quando o run fechou (ISO). `null` enquanto ele ainda está em curso. */
+    finished_at?: string | null;
+    /**
+     * A volta foi feita pelo agente, sem ninguém pedir pela tela (#2757). É a
+     * diferença entre "voltei" e "voltou sozinho", e ela é o assunto do aviso
+     * que a tela mostra no desfecho `failed_rolled_back`.
+     */
+    volta_automatica?: boolean;
     /**
      * A falha deste run já foi superada por um deploy posterior (o host reporta
      * uma versão que o run não descreve). A tela deixa de mostrar o aviso dela.

@@ -233,7 +233,9 @@ describe("fiação em inbound-turn.ts", () => {
     const registro = FONTE.indexOf("for (const nome of ['send_message', 'send_template'] as const) {");
     expect(registro).toBeGreaterThan(-1);
     expect(FONTE.slice(registro, registro + 400)).toContain("falaDoTurno.acompanhar(");
-    const entrega = FONTE.indexOf("const tools = wrapToolsWithBreaker(");
+    // Desde a 1.94 o breaker vem embrulhado pelo traço do turno
+    // (`envolverFerramentasComTraco`): a âncora é a chamada do breaker.
+    const entrega = FONTE.indexOf("wrapToolsWithBreaker(previewTools");
     expect(entrega).toBeGreaterThan(registro);
   });
 

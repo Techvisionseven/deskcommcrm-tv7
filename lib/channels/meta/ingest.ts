@@ -26,6 +26,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { audit } from "@/lib/audit";
 import { pausarIaPorAtendimentoManual } from "@/lib/escalacao/atendimento-manual";
 import { estamparAtribuicaoDoContato, metadataDoAnuncio } from "@/lib/leads/atribuicao-de-anuncio";
+import { ancoraCtwaDaMensagem } from "@/lib/leads/prova-meta-lead-submitted";
 import {
   ehNumeroInternoDeAviso,
   registrarMensagemIgnorada,
@@ -288,6 +289,7 @@ export async function ingestMetaInbound(
       media_mime: e.media?.mime ?? null,
       sent_at: e.sentAt.toISOString(),
       metadata: {
+        ...ancoraCtwaDaMensagem(atribuicao),
         ...(e.media ? { meta_media_id: e.media.id, voice: e.media.voice } : {}),
         // Nome original do anexo (#2613) — o cartão do Inbox lê esta chave.
         // Só quando há nome (a Cloud API manda `filename` só em `document`):
@@ -531,13 +533,18 @@ export async function ingestMetaEcho(
  * Contato que a empresa criou ou renomeou no ENDEREÇO do app WhatsApp Business
  * (coexistência), entregue pela Meta no campo `smb_app_state_sync`.
  *
- * O que FAZ: garante que o contato exista no CRM **com o nome que a equipe usa
- * no celular**, pela mesma resolução da recebida e do eco —
- * `findContactByVariants` (variantes do número, senão a mesma pessoa vira dois
- * cadastros) e `fn_upsert_wa_contact`. O `coalesce` dela É a regra do código:
- * preenche `display_name` quando vazio e **nunca sobrescreve** um nome que já
- * existe — quem vence entre o nome do operador no CRM e o do app a issue não
- * prova, e a regra que já existe no repo é não sobrescrever.
+ * O que FAZ: garante que o contato exista no CRM, pela mesma resolução da
+ * recebida e do eco — `findContactByVariants` (variantes do número, senão a
+ * mesma pessoa vira dois cadastros) e `fn_upsert_wa_contact` — e guarda **o
+ * nome que a equipe usa no celular** em `address_book_name`, o campo que SÓ A
+ * EQUIPE vê.
+ *
+ * O nome NÃO vai mais para `display_name` (era o `p_notify` do upsert): é o
+ * rótulo que alguém da empresa escreveu no celular, e `display_name` entra no
+ * `{{nome}}` das campanhas — o apelido interno chegaria ao cliente. Mesma regra
+ * da varredura `contact-names` (decisão do mantenedor no PR #2439). Aqui o app
+ * é a fonte viva da agenda, então o nome novo SOBRESCREVE o anterior: renomear
+ * no celular renomeia no CRM.
  *
  * O que NÃO faz, de propósito:
  *
@@ -588,6 +595,26 @@ export async function ingestMetaAppContactSync(
     return { status: "ignored", reason: "numero_interno_de_aviso" };
   }
 
+  // Titular apagado a pedido (LGPD) não volta pela agenda do app. A anonimização
+  // ZERA o telefone do cadastro (`phone_number = null`), então
+  // `findContactByVariants` não acha a ficha e `fn_upsert_wa_contact` — que casa
+  // contato só por `phone_number`/`wa_lid` — INSERIRIA uma ficha nova com o
+  // número e o nome da agenda. A pergunta vem antes de qualquer escrita, com a
+  // mesma régua do importador de histórico (`lib/channels/historico/rodada.ts`):
+  // na dúvida (erro ou resposta que não é sim/não) NÃO cria — falha fechada.
+  // O evento da agenda não traz LID, então a pergunta é só pelo telefone.
+  const { data: apagado, error: erroApagado } = await admin.rpc(
+    "fn_titular_apagado_a_pedido" as never,
+    { p_org: orgId, p_telefone: canonicalPhoneBR(telefone), p_lid: null } as never,
+  );
+  if (erroApagado || typeof apagado !== "boolean") {
+    return {
+      status: "failed",
+      reason: `titular_apagado: ${erroApagado?.message ?? "resposta sem booleano"}`,
+    };
+  }
+  if (apagado) return { status: "ignored", reason: "titular_apagado_a_pedido" };
+
   const existente = await findContactByVariants(admin, orgId, e.phone);
   const phone = existente?.phone_number
     ? canonicalPhoneBR(existente.phone_number)
@@ -602,11 +629,22 @@ export async function ingestMetaAppContactSync(
       p_lid: null,
       // Mesma grafia do `from`/`to` das mensagens: a identidade wa, não o `+`.
       p_chat_id: e.phone,
-      p_notify: nome,
+      // NUNCA o nome da agenda: `p_notify` vira `display_name`, que o `{{nome}}` das campanhas lê.
+      p_notify: null,
     } as never,
   );
   if (erroContato || !contactId) {
     return { status: "failed", reason: `contato: ${erroContato?.message ?? "sem id"}` };
+  }
+
+  const { error: erroNome } = await admin
+    .from("contacts")
+    .update({ address_book_name: nome.slice(0, 200) })
+    .eq("id", contactId as string)
+    .eq("organization_id", orgId)
+    .eq("is_anonymized", false);
+  if (erroNome) {
+    return { status: "failed", reason: `nome_da_agenda: ${erroNome.message}` };
   }
 
   return { status: "synced", contactId: contactId as string };

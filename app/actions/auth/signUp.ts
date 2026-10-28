@@ -53,13 +53,19 @@ export type SignUpResult =
        * anti-enumeração abaixo. Os dois convivem sem se confundir: a recusa por
        * política é decidida ANTES de tocar no GoTrue, então numa instalação
        * fechada quem chega sem convite nunca chega a saber se o e-mail existe.
+       *
+       * `email_indisponivel`: o provedor de auth não conseguiu mandar o e-mail
+       * de confirmação — é a instalação sem e-mail configurado no serviço de
+       * login, não um soluço. Tentar de novo nunca funciona; quem resolve é
+       * quem administra.
        */
       error:
         | "validation_error"
         | "rate_limited"
         | "signup_failed"
         | "somente_convite"
-        | "conta_ja_existe";
+        | "conta_ja_existe"
+        | "email_indisponivel";
       details?: Record<string, unknown>;
     };
 
@@ -197,6 +203,7 @@ export async function signUp(
       });
       if (criada.motivo === "conta_ja_existe") return { ok: false, error: "conta_ja_existe" };
       if (criada.motivo === "rate_limited") return { ok: false, error: "rate_limited" };
+      if (criada.motivo === "email_de_confirmacao_falhou") return { ok: false, error: "email_indisponivel" };
       return { ok: false, error: "signup_failed" };
     }
 
@@ -282,6 +289,11 @@ export async function signUp(
       ip,
       userAgent,
     });
+    // Medido numa VPS v1.85.0: GoTrue sem SMTP devolve 500 "Error sending
+    // confirmation email", e a tela mandava "Tente novamente" — seis vezes na
+    // trilha, nenhuma podia dar certo. Não fura a anti-enumeração: conta que já
+    // existe recebe sucesso ofuscado sem e-mail, então nunca chega aqui.
+    if (/error sending/i.test(error.message)) return { ok: false, error: "email_indisponivel" };
     return { ok: false, error: "signup_failed" };
   }
 

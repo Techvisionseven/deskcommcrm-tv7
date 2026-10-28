@@ -116,6 +116,19 @@ describe("signUp — a tela precisa saber se a sessão já veio aberta", () => {
 
     expect(res).toEqual({ ok: false, error: "signup_failed" });
   });
+
+  it("GoTrue sem SMTP: \"Error sending confirmation email\" vira `email_indisponivel`, não \"tente novamente\"", async () => {
+    // A forma medida numa VPS v1.85.0, com o GoTrue apontado para o supabase-mail.
+    signUpDoProvedor.mockResolvedValue({
+      data: { user: null, session: null },
+      error: { message: "Error sending confirmation email", status: 500 },
+    });
+
+    const { signUp } = await import("./signUp");
+    const res = await signUp(entrada());
+
+    expect(res).toEqual({ ok: false, error: "email_indisponivel" });
+  });
 });
 
 /**
@@ -394,6 +407,19 @@ describe("signUp — convite com o cadastro público do GoTrue fechado (#1653)",
     expect(res).toEqual({ ok: false, error: "somente_convite" });
     expect(signUpDoProvedor).not.toHaveBeenCalled();
     expect(admin.createUser).not.toHaveBeenCalled();
+  });
+
+  it("e-mail de confirmação que não sai → `email_indisponivel`, como no caminho de sempre", async () => {
+    goTrueCom(true);
+    admin.createUser.mockResolvedValue({ data: { user: { id: "u-10" } }, error: null });
+    admin.deleteUser.mockResolvedValue({ error: null });
+    resend.mockResolvedValue({ error: { message: "Error sending confirmation email", status: 500 } });
+    const { token, entrada: corpo } = await conviteValido();
+
+    const { signUp } = await import("./signUp");
+    const res = await signUp(corpo, token);
+
+    expect(res).toEqual({ ok: false, error: "email_indisponivel" });
   });
 
   it("conta já existe → `conta_ja_existe`, o mesmo código de antes", async () => {
