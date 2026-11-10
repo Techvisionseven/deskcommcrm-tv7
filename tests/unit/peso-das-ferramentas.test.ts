@@ -113,7 +113,7 @@ const TETO: Readonly<Record<string, { tokens: number; motivo: string }>> = {
   "crm_cancel_followup": { tokens: 254, motivo: BASE },
   "crm_close_demand": { tokens: 244, motivo: BASE },
   "crm_propose_reactivation": { tokens: 204, motivo: BASE },
-  "crm_add_case_note": { tokens: 216, motivo: BASE },
+  "crm_add_case_note": { tokens: 490, motivo: "+274 do conserto do fork (o caso da IA acompanha a conversa): só cabe um caso aberto por conversa, então a nota ganhou title/summary/blocker reescritos e a descrição diz quando mandá-los — sem isso o topo do caso segue descrevendo o pedido antigo" },
   "crm_close_human_case": { tokens: 246, motivo: BASE },
   "crm_resume_ai_attendance": { tokens: 228, motivo: BASE },
   "crm_draft_proposal": { tokens: 1059, motivo: BASE },
@@ -139,7 +139,7 @@ const TETO: Readonly<Record<string, { tokens: number; motivo: string }>> = {
 
 // 29952 até 2026-11-05; +142 com `ler_documento` (#4133), que só é montada no
 // modo `leitura_direta` — nunca junto de `search_knowledge`.
-const TETO_TOTAL = 30094;
+const TETO_TOTAL = 30368;
 
 const VARIANTE = "schedule_followup (com negócio)";
 
