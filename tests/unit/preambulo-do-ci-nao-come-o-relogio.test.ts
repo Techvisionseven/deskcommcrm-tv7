@@ -72,12 +72,15 @@ const TETOS: Record<string, { minutos: number; razao: string }> = {
   // lê o desfecho de `needs`. O teto que denuncia a suíte crescendo vive na perna
   // que a roda.
   "ci.yml::invariants-majors": {
-    minutos: 30,
+    minutos: 40,
     razao:
       "a perna deixou de ser UMA passada: agora é `test:db` + `test:db:update`, e cada uma sobe " +
-      "Postgres e aplica o baseline (p90 medido de uma passada: 325s). O 30 é DECLARADO, não " +
-      "medido — não há Docker onde esta matriz foi escrita; mantido em 20, a perna morreria por " +
-      "relógio no meio da segunda passada",
+      "Postgres e aplica o baseline. FORK (Techvisionseven): 40, e não os 30 do original, porque " +
+      "aqui a perna roda no `ubuntu-latest`, e não no executor próprio. MEDIDO em 10/11/2026 " +
+      "no ubuntu-latest: seis pernas verdes da main do original levaram de 25m45s a 29m52s; no " +
+      "PR #17 do fork, a pg17 passou com 19 s de folga (test:db 29m07s) e a pg15 foi cancelada " +
+      "aos 30 min, ainda na primeira passada. Com 30, o teto deixava de ser guarda de " +
+      "travamento e passava a decidir sozinho se o PR fica verde",
   },
 };
 
