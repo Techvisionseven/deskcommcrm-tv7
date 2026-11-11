@@ -72,12 +72,15 @@ const TETOS: Record<string, { minutos: number; razao: string }> = {
   // lê o desfecho de `needs`. O teto que denuncia a suíte crescendo vive na perna
   // que a roda.
   "ci.yml::invariants-majors": {
-    minutos: 30,
+    minutos: 40,
     razao:
       "a perna deixou de ser UMA passada: agora é `test:db` + `test:db:update`, e cada uma sobe " +
-      "Postgres e aplica o baseline (p90 medido de uma passada: 325s). O 30 é DECLARADO, não " +
-      "medido — não há Docker onde esta matriz foi escrita; mantido em 20, a perna morreria por " +
-      "relógio no meio da segunda passada",
+      "Postgres e aplica o baseline. FORK (Techvisionseven): 40, e não os 30 do original, porque " +
+      "aqui a perna roda no `ubuntu-latest`, e não no executor próprio. MEDIDO em 10/11/2026 " +
+      "no ubuntu-latest: seis pernas verdes da main do original levaram de 25m45s a 29m52s; no " +
+      "PR #17 do fork, a pg17 passou com 19 s de folga (test:db 29m07s) e a pg15 foi cancelada " +
+      "aos 30 min, ainda na primeira passada. Com 30, o teto deixava de ser guarda de " +
+      "travamento e passava a decidir sozinho se o PR fica verde",
   },
 };
 
@@ -249,7 +252,7 @@ describe("o preâmbulo do CI não come o orçamento dos testes", () => {
   });
 
   it("o orçamento vale para TODAS as partes da matrix, não só para uma", () => {
-    // `verify-parte` é uma `matrix` (7 partes desde 23/10/2026), e o
+    // `verify-parte` é uma `matrix` (8 partes desde 03/11/2026), e o
     // `ORCAMENTO_MIN` vive num passo ÚNICO que todas as partes executam. Os passos vizinhos (`Cercas`,
     // `Typecheck`, `Lint`, `Kit self-host`) são todos `if: matrix.parte == N` —
     // então pôr um `if:` de parte neste aqui é uma edição de uma linha, natural
@@ -305,8 +308,9 @@ describe("o preâmbulo do CI não come o orçamento dos testes", () => {
     // Mexer na divisão (reequilibrar passos, criar a parte 3) tem dois erros
     // VERDES: `--shard=N/3` com matrix [1, 2] deixa um terço da suíte sem rodar,
     // e `if: matrix.parte == 3` com matrix [1, 2] deixa o passo sem parte.
-    // Desde 08/10/2026 há parte SEM unit (a última — 4 até 23/10/2026, hoje 7: cercas + kit), excluída por
-    // `if: matrix.parte != 7` no passo de unit — então o N do shard é o número de
+    // Desde 08/10/2026 há parte SEM unit (a última — 4 até 23/10/2026, 7 até 03/11/2026; hoje 7 e 8:
+    // cercas + as duas fatias do kit), excluídas por
+    // `if: matrix.parte != 7 && matrix.parte != 8` no passo de unit — então o N do shard é o número de
     // partes que RODAM unit, não o tamanho da matrix. Os dois erros verdes novos:
     // tirar a exclusão (a parte 7 roda `--shard=7/6`, que o vitest recusa ou
     // duplica) e excluir uma parte do meio (um sexto da suíte sem rodar).
